@@ -275,6 +275,20 @@ export type AgentKitMessage =
       stop_reason?: "tool" | "stop";
     }
   | {
+      role: "assistant";
+      type: "reasoning";
+      /** Concatenated reasoning text. */
+      content: string;
+      /** Signature of the primary reasoning block (Anthropic thinking continuity). */
+      signature?: string;
+      /** Structured reasoning blocks, preserving per-block signatures. */
+      details?: Array<
+        | { type: "text"; text: string; signature?: string }
+        | { type: "redacted"; data: string }
+      >;
+      stop_reason?: "tool" | "stop";
+    }
+  | {
       role: "user" | "assistant";
       type: "tool_call";
       tools: Array<{

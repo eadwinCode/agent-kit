@@ -76,6 +76,9 @@ export const formatMessagesToAgentKitHistory = <
         });
       }
     } else if (msg.role === "assistant") {
+      // Note: reasoning parts are intentionally NOT reconstructed into history.
+      // Thinking blocks are ephemeral per-turn (Anthropic does not expect a prior
+      // turn's thinking replayed in a later turn), so we only send text + tools.
       // For assistant messages, extract text parts first
       const textParts = msg.parts.filter((p) => p.type === "text");
       if (textParts.length > 0) {
