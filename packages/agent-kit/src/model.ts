@@ -1,38 +1,42 @@
-import { type AiAdapter } from "@inngest/ai";
-import { adapters } from "./adapters";
+import { generateText, type LanguageModel } from "ai";
+import {
+  messagesToCoreMessages,
+  resultToMessages,
+  toolsToAiTools,
+  mapToolChoice,
+  toSerializableResult,
+  type SerializableResult,
+} from "./converters";
 import { type Message } from "./types";
 import { type Tool } from "./tool";
 import { getStepTools } from "./util";
 
-export const createAgenticModelFromAiAdapter = <
-  TAiAdapter extends AiAdapter.Any,
->(
-  adapter: TAiAdapter
-): AgenticModel<TAiAdapter> => {
-  const opts = adapters[adapter.format as AiAdapter.Format];
+export interface AgenticModelOptions {
+  /**
+   * Controls Anthropic prompt caching (ephemeral `cacheControl` breakpoints on
+   * the system message and the last tool).
+   *
+   * - `undefined` / `"auto"` (default): enabled only for Anthropic models,
+   *   detected from the model's `provider` id. Other providers are untouched.
+   * - `true` / `false`: force caching on/off regardless of provider.
+   */
+  cacheControl?: boolean | "auto";
+}
 
-  return new AgenticModel({
-    model: adapter,
-    requestParser:
-      opts.request as unknown as AgenticModel.RequestParser<TAiAdapter>,
-    responseParser:
-      opts.response as unknown as AgenticModel.ResponseParser<TAiAdapter>,
-  });
+export const createAgenticModelFromLanguageModel = (
+  model: LanguageModel,
+  options: AgenticModelOptions = {}
+): AgenticModel => {
+  return new AgenticModel(model, options);
 };
 
-export class AgenticModel<TAiAdapter extends AiAdapter.Any> {
-  #model: TAiAdapter;
-  requestParser: AgenticModel.RequestParser<TAiAdapter>;
-  responseParser: AgenticModel.ResponseParser<TAiAdapter>;
+export class AgenticModel {
+  #model: LanguageModel;
+  #cacheControl: boolean;
 
-  constructor({
-    model,
-    requestParser,
-    responseParser,
-  }: AgenticModel.Constructor<TAiAdapter>) {
+  constructor(model: LanguageModel, options: AgenticModelOptions = {}) {
     this.#model = model;
-    this.requestParser = requestParser;
-    this.responseParser = responseParser;
+    this.#cacheControl = resolveCacheControl(model, options.cacheControl);
   }
 
   async infer(
@@ -41,89 +45,65 @@ export class AgenticModel<TAiAdapter extends AiAdapter.Any> {
     tools: Tool.Any[],
     tool_choice: Tool.Choice
   ): Promise<AgenticModel.InferenceResponse> {
-    // TODO: Implement true token-by-token streaming from LLM providers
-    // Currently using completed response chunking for streaming simulation
-    // Future enhancement: Process real-time token streams from OpenAI/Anthropic/etc.
-    const body = this.requestParser(this.#model, input, tools, tool_choice);
-    let result: AiAdapter.Input<TAiAdapter>;
+    const convertOpts = { cacheControl: this.#cacheControl };
+    const messages = messagesToCoreMessages(input, convertOpts);
+    const aiTools =
+      tools.length > 0 ? toolsToAiTools(tools, convertOpts) : undefined;
+
+    const doInference = async (): Promise<SerializableResult> => {
+      const result = await generateText({
+        model: this.#model,
+        messages,
+        tools: aiTools,
+        toolChoice: aiTools ? mapToolChoice(tool_choice) : undefined,
+      });
+      // Return only serializable fields for step.run() compatibility. This
+      // carries usage, Anthropic cache tokens, and reasoning so the consumer
+      // can bill and render them (see toSerializableResult).
+      return toSerializableResult(result);
+    };
 
     const step = await getStepTools();
+    const result: SerializableResult = step
+      ? await step.run(stepID, doInference)
+      : await doInference();
 
-    if (step) {
-      result = (await step.ai.infer(stepID, {
-        model: this.#model,
-        body,
-      })) as AiAdapter.Input<TAiAdapter>;
-    } else {
-      // Allow the model to mutate options and body for this call
-      const modelCopy = { ...this.#model };
-      this.#model.onCall?.(modelCopy, body);
-
-      const url = new URL(modelCopy.url || "");
-
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-
-      // Make sure we handle every known format in `@inngest/ai`.
-      const formatHandlers: Record<AiAdapter.Format, () => void> = {
-        "openai-chat": () => {
-          headers["Authorization"] = `Bearer ${modelCopy.authKey}`;
-        },
-        "azure-openai": () => {
-          headers["api-key"] = modelCopy.authKey;
-        },
-        anthropic: () => {
-          headers["x-api-key"] = modelCopy.authKey;
-          headers["anthropic-version"] = "2023-06-01";
-        },
-        gemini: () => {},
-        grok: () => {},
-      };
-
-      formatHandlers[modelCopy.format as AiAdapter.Format]();
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-      result = await (
-        await fetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-        })
-      ).json();
-    }
-
-    return { output: this.responseParser(result), raw: result };
+    return { output: resultToMessages(result), raw: result };
   }
 }
 
+/**
+ * Resolve whether to apply Anthropic prompt caching. `"auto"` (the default)
+ * enables it only for Anthropic models so other providers never receive the
+ * provider-specific markers.
+ */
+function resolveCacheControl(
+  model: LanguageModel,
+  setting?: boolean | "auto"
+): boolean {
+  if (setting === true || setting === false) {
+    return setting;
+  }
+  return isAnthropicModel(model);
+}
+
+function isAnthropicModel(model: LanguageModel): boolean {
+  // `model` may be a string id (resolved via the global provider registry) or a
+  // model instance; detect Anthropic from whichever is available.
+  const provider = typeof model === "string" ? model : (model.provider ?? "");
+  return provider.toLowerCase().includes("anthropic");
+}
+
 export namespace AgenticModel {
-  export type Any = AgenticModel<AiAdapter.Any>;
+  export type Any = AgenticModel;
 
   /**
    * InferenceResponse is the response from a model for an inference request.
    * This contains parsed messages and the raw result, with the type of the raw
-   * result depending on the model's API repsonse.
+   * result depending on the model's API response.
    */
   export type InferenceResponse<T = unknown> = {
     output: Message[];
     raw: T;
   };
-
-  export interface Constructor<TAiAdapter extends AiAdapter.Any> {
-    model: TAiAdapter;
-    requestParser: RequestParser<TAiAdapter>;
-    responseParser: ResponseParser<TAiAdapter>;
-  }
-
-  export type RequestParser<TAiAdapter extends AiAdapter.Any> = (
-    model: TAiAdapter,
-    state: Message[],
-    tools: Tool.Any[],
-    tool_choice: Tool.Choice
-  ) => AiAdapter.Input<TAiAdapter>;
-
-  export type ResponseParser<TAiAdapter extends AiAdapter.Any> = (
-    output: AiAdapter.Output<TAiAdapter>
-  ) => Message[];
 }

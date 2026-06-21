@@ -38,13 +38,48 @@ export interface UserMessage {
 export interface TextMessage {
   type: "text";
   role: "system" | "user" | "assistant";
-  content: string | Array<TextContent>;
+  content: string | Array<TextContent | ImageContent>;
   // Anthropic:
   // stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | null;
   // OpenAI:
   // finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'function_call' | null;
   stop_reason?: "tool" | "stop";
 }
+
+/**
+ * ReasoningMessage represents an assistant "thinking" / reasoning turn emitted by
+ * models that expose chain-of-thought (e.g. Anthropic extended thinking, OpenAI
+ * reasoning models).
+ *
+ * It is kept as a first-class message so that:
+ *   1. consumers can render the model's reasoning, and
+ *   2. it round-trips back to the provider. Anthropic in particular requires the
+ *      original thinking block (with its `signature`) to be replayed *before* the
+ *      tool-use block within the same assistant turn, otherwise a follow-up
+ *      tool-result request is rejected.
+ *
+ * `content` is the concatenated reasoning text (convenient for rendering).
+ * `details` carries the structured blocks (text + signature, or redacted data)
+ * exactly as returned by the model so signatures survive the round-trip.
+ */
+export interface ReasoningMessage {
+  type: "reasoning";
+  role: "assistant";
+  content: string;
+  /** Signature of the primary reasoning block, if the provider returned one. */
+  signature?: string;
+  /** Full structured reasoning blocks, preserved for provider round-tripping. */
+  details?: ReasoningDetail[];
+  stop_reason?: "tool" | "stop";
+}
+
+/**
+ * ReasoningDetail mirrors the AI SDK `ReasoningDetail` shape: either a thinking
+ * block (text, optionally signed) or a redacted thinking block (opaque data).
+ */
+export type ReasoningDetail =
+  | { type: "text"; text: string; signature?: string }
+  | { type: "redacted"; data: string };
 
 /**
  * ToolCallMessage represents a message for a tool call.
@@ -68,22 +103,22 @@ export interface ToolResultMessage {
   stop_reason: "tool";
 }
 
-/**
- * ReasoningMessage represents reasoning or thinking content from a model,
- * such as OpenAI's reasoning_content or Anthropic's thinking blocks.
- */
-export interface ReasoningMessage {
-  type: "reasoning";
-  role: "assistant";
-  content: string;
-  signature?: string; // Anthropic thinking block signature
-}
-
 // Message content.
 
 export interface TextContent {
   type: "text";
   text: string;
+}
+
+/**
+ * ImageContent represents an image part within a message (e.g. a user-supplied
+ * image) so vision-capable models can see it. `image` is either an http(s)/data
+ * URL or a raw base64 string (in which case set `mimeType`).
+ */
+export interface ImageContent {
+  type: "image";
+  image: string;
+  mimeType?: string;
 }
 
 export interface ToolMessage {
