@@ -1,4 +1,4 @@
-import { generateText, type LanguageModelV1 } from "ai";
+import { generateText, type LanguageModel } from "ai";
 import {
   messagesToCoreMessages,
   resultToMessages,
@@ -24,17 +24,17 @@ export interface AgenticModelOptions {
 }
 
 export const createAgenticModelFromLanguageModel = (
-  model: LanguageModelV1,
+  model: LanguageModel,
   options: AgenticModelOptions = {}
 ): AgenticModel => {
   return new AgenticModel(model, options);
 };
 
 export class AgenticModel {
-  #model: LanguageModelV1;
+  #model: LanguageModel;
   #cacheControl: boolean;
 
-  constructor(model: LanguageModelV1, options: AgenticModelOptions = {}) {
+  constructor(model: LanguageModel, options: AgenticModelOptions = {}) {
     this.#model = model;
     this.#cacheControl = resolveCacheControl(model, options.cacheControl);
   }
@@ -78,7 +78,7 @@ export class AgenticModel {
  * provider-specific markers.
  */
 function resolveCacheControl(
-  model: LanguageModelV1,
+  model: LanguageModel,
   setting?: boolean | "auto"
 ): boolean {
   if (setting === true || setting === false) {
@@ -87,8 +87,11 @@ function resolveCacheControl(
   return isAnthropicModel(model);
 }
 
-function isAnthropicModel(model: LanguageModelV1): boolean {
-  return (model.provider ?? "").toLowerCase().includes("anthropic");
+function isAnthropicModel(model: LanguageModel): boolean {
+  // `model` may be a string id (resolved via the global provider registry) or a
+  // model instance; detect Anthropic from whichever is available.
+  const provider = typeof model === "string" ? model : (model.provider ?? "");
+  return provider.toLowerCase().includes("anthropic");
 }
 
 export namespace AgenticModel {
