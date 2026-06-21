@@ -1,26 +1,42 @@
-import { generateText, type LanguageModelV1 } from "ai";
+import { generateText, type LanguageModel } from "ai";
 import {
   messagesToCoreMessages,
   resultToMessages,
   toolsToAiTools,
   mapToolChoice,
+  toSerializableResult,
   type SerializableResult,
 } from "./converters";
 import { type Message } from "./types";
 import { type Tool } from "./tool";
 import { getStepTools } from "./util";
 
+export interface AgenticModelOptions {
+  /**
+   * Controls Anthropic prompt caching (ephemeral `cacheControl` breakpoints on
+   * the system message and the last tool).
+   *
+   * - `undefined` / `"auto"` (default): enabled only for Anthropic models,
+   *   detected from the model's `provider` id. Other providers are untouched.
+   * - `true` / `false`: force caching on/off regardless of provider.
+   */
+  cacheControl?: boolean | "auto";
+}
+
 export const createAgenticModelFromLanguageModel = (
-  model: LanguageModelV1
+  model: LanguageModel,
+  options: AgenticModelOptions = {}
 ): AgenticModel => {
-  return new AgenticModel(model);
+  return new AgenticModel(model, options);
 };
 
 export class AgenticModel {
-  #model: LanguageModelV1;
+  #model: LanguageModel;
+  #cacheControl: boolean;
 
-  constructor(model: LanguageModelV1) {
+  constructor(model: LanguageModel, options: AgenticModelOptions = {}) {
     this.#model = model;
+    this.#cacheControl = resolveCacheControl(model, options.cacheControl);
   }
 
   async infer(
@@ -29,8 +45,10 @@ export class AgenticModel {
     tools: Tool.Any[],
     tool_choice: Tool.Choice
   ): Promise<AgenticModel.InferenceResponse> {
-    const messages = messagesToCoreMessages(input);
-    const aiTools = tools.length > 0 ? toolsToAiTools(tools) : undefined;
+    const convertOpts = { cacheControl: this.#cacheControl };
+    const messages = messagesToCoreMessages(input, convertOpts);
+    const aiTools =
+      tools.length > 0 ? toolsToAiTools(tools, convertOpts) : undefined;
 
     const doInference = async (): Promise<SerializableResult> => {
       const result = await generateText({
@@ -39,16 +57,10 @@ export class AgenticModel {
         tools: aiTools,
         toolChoice: aiTools ? mapToolChoice(tool_choice) : undefined,
       });
-      // Return only serializable fields for step.run() compatibility
-      return {
-        text: result.text,
-        toolCalls: result.toolCalls.map((tc) => ({
-          toolCallId: tc.toolCallId,
-          toolName: tc.toolName,
-          args: tc.args as Record<string, unknown>,
-        })),
-        finishReason: result.finishReason,
-      };
+      // Return only serializable fields for step.run() compatibility. This
+      // carries usage, Anthropic cache tokens, and reasoning so the consumer
+      // can bill and render them (see toSerializableResult).
+      return toSerializableResult(result);
     };
 
     const step = await getStepTools();
@@ -58,6 +70,28 @@ export class AgenticModel {
 
     return { output: resultToMessages(result), raw: result };
   }
+}
+
+/**
+ * Resolve whether to apply Anthropic prompt caching. `"auto"` (the default)
+ * enables it only for Anthropic models so other providers never receive the
+ * provider-specific markers.
+ */
+function resolveCacheControl(
+  model: LanguageModel,
+  setting?: boolean | "auto"
+): boolean {
+  if (setting === true || setting === false) {
+    return setting;
+  }
+  return isAnthropicModel(model);
+}
+
+function isAnthropicModel(model: LanguageModel): boolean {
+  // `model` may be a string id (resolved via the global provider registry) or a
+  // model instance; detect Anthropic from whichever is available.
+  const provider = typeof model === "string" ? model : (model.provider ?? "");
+  return provider.toLowerCase().includes("anthropic");
 }
 
 export namespace AgenticModel {

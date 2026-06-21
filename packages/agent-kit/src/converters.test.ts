@@ -5,11 +5,27 @@ import {
   messagesToCoreMessages,
   resultToMessages,
   toolsToAiTools,
+  toSerializableResult,
   mapToolChoice,
   type SerializableResult,
 } from "./converters";
 import type { Message } from "./types";
 import type { Tool } from "./tool";
+
+const EPHEMERAL = { anthropic: { cacheControl: { type: "ephemeral" } } };
+
+/** Extract the underlying JSON schema from an AI SDK `jsonSchema()` wrapper. */
+function rawSchema(parameters: unknown): {
+  required?: string[];
+  properties?: Record<string, unknown>;
+} {
+  return (parameters as { jsonSchema: Record<string, unknown> }).jsonSchema;
+}
+
+/** First content part of a ModelMessage with array content (test-only cast). */
+function firstPart(msg: unknown): Record<string, unknown> {
+  return (msg as { content: Array<Record<string, unknown>> }).content[0]!;
+}
 
 describe("messagesToCoreMessages", () => {
   it("converts a system text message", () => {
@@ -82,7 +98,7 @@ describe("messagesToCoreMessages", () => {
             type: "tool-call",
             toolCallId: "call_1",
             toolName: "get_weather",
-            args: { city: "London" },
+            input: { city: "London" },
           },
         ],
       },
@@ -132,7 +148,7 @@ describe("messagesToCoreMessages", () => {
             type: "tool-result",
             toolCallId: "call_1",
             toolName: "get_weather",
-            result: { temperature: 20 },
+            output: { type: "json", value: { temperature: 20 } },
           },
         ],
       },
@@ -298,8 +314,8 @@ describe("toolsToAiTools", () => {
     const result = toolsToAiTools(tools);
     expect(result).toHaveProperty("get_weather");
     expect(result["get_weather"]!.description).toBe("Get weather for a city");
-    // The parameters should be a JSON schema wrapper
-    expect(result["get_weather"]!.parameters).toBeDefined();
+    // The input schema should be a JSON schema wrapper
+    expect(result["get_weather"]!.inputSchema).toBeDefined();
   });
 
   it("converts a tool without parameters to empty object schema", () => {
@@ -312,7 +328,7 @@ describe("toolsToAiTools", () => {
     ];
     const result = toolsToAiTools(tools);
     expect(result).toHaveProperty("ping");
-    expect(result["ping"]!.parameters).toBeDefined();
+    expect(result["ping"]!.inputSchema).toBeDefined();
   });
 
   it("converts multiple tools", () => {
@@ -361,5 +377,472 @@ describe("mapToolChoice", () => {
       type: "tool",
       toolName: "my_custom_tool",
     });
+  });
+});
+
+describe("messagesToCoreMessages — vision / images", () => {
+  it("converts user image content parts into AI SDK image parts", () => {
+    const messages: Message[] = [
+      {
+        type: "text",
+        role: "user",
+        content: [
+          { type: "text", text: "What is this?" },
+          { type: "image", image: "https://example.com/cat.png" },
+        ],
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is this?" },
+          { type: "image", image: "https://example.com/cat.png" },
+        ],
+      },
+    ]);
+  });
+
+  it("passes a user image mediaType through", () => {
+    const messages: Message[] = [
+      {
+        type: "text",
+        role: "user",
+        content: [
+          { type: "image", image: "BASE64DATA", mimeType: "image/jpeg" },
+        ],
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(result[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "image", image: "BASE64DATA", mediaType: "image/jpeg" },
+      ],
+    });
+  });
+
+  it("converts an Anthropic-native base64 image in a tool result into content output", () => {
+    const messages: Message[] = [
+      {
+        type: "tool_result",
+        role: "tool_result",
+        tool: { type: "tool", id: "c1", name: "screenshot", input: {} },
+        content: [
+          { type: "text", text: '{"ok":true}' },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "AAAA" },
+          },
+        ],
+        stop_reason: "tool",
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    const part = firstPart(result[0]);
+    expect(part.type).toBe("tool-result");
+    expect(part.output).toEqual({
+      type: "content",
+      value: [
+        { type: "text", text: '{"ok":true}' },
+        { type: "image-data", data: "AAAA", mediaType: "image/png" },
+      ],
+    });
+  });
+
+  it("converts an AI SDK-shaped image in a tool result into content output", () => {
+    const messages: Message[] = [
+      {
+        type: "tool_result",
+        role: "tool_result",
+        tool: { type: "tool", id: "c1", name: "screenshot", input: {} },
+        content: [{ type: "image", data: "BBBB", mediaType: "image/jpeg" }],
+        stop_reason: "tool",
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    const part = firstPart(result[0]);
+    expect(part.output).toEqual({
+      type: "content",
+      value: [{ type: "image-data", data: "BBBB", mediaType: "image/jpeg" }],
+    });
+  });
+
+  it("passes a URL-only tool-result image through as an image-url part", () => {
+    const messages: Message[] = [
+      {
+        type: "tool_result",
+        role: "tool_result",
+        tool: { type: "tool", id: "c1", name: "screenshot", input: {} },
+        content: [
+          { type: "text", text: "see image" },
+          {
+            type: "image",
+            source: { type: "url", url: "https://example.com/x.png" },
+          },
+        ],
+        stop_reason: "tool",
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    const part = firstPart(result[0]);
+    // v6 tool-result content supports image URLs directly (no base64 needed).
+    expect(part.output).toEqual({
+      type: "content",
+      value: [
+        { type: "text", text: "see image" },
+        { type: "image-url", url: "https://example.com/x.png" },
+      ],
+    });
+  });
+
+  it("emits text output for a string tool result (no multipart)", () => {
+    const messages: Message[] = [
+      {
+        type: "tool_result",
+        role: "tool_result",
+        tool: { type: "tool", id: "c1", name: "get_weather", input: {} },
+        content: "Sunny, 75F",
+        stop_reason: "tool",
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    const part = firstPart(result[0]);
+    expect(part.output).toEqual({ type: "text", value: "Sunny, 75F" });
+  });
+});
+
+describe("messagesToCoreMessages — reasoning round-trip", () => {
+  it("converts a reasoning message with details into assistant reasoning parts", () => {
+    const messages: Message[] = [
+      {
+        type: "reasoning",
+        role: "assistant",
+        content: "thinking",
+        signature: "sig",
+        details: [{ type: "text", text: "thinking", signature: "sig" }],
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "thinking",
+            providerOptions: { anthropic: { signature: "sig" } },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("converts redacted reasoning details", () => {
+    const messages: Message[] = [
+      {
+        type: "reasoning",
+        role: "assistant",
+        content: "",
+        details: [{ type: "redacted", data: "opaque" }],
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "",
+            providerOptions: { anthropic: { redactedData: "opaque" } },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("falls back to flat content + signature when there are no details", () => {
+    const messages: Message[] = [
+      {
+        type: "reasoning",
+        role: "assistant",
+        content: "hmm",
+        signature: "s2",
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "hmm",
+            providerOptions: { anthropic: { signature: "s2" } },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("drops an empty reasoning message", () => {
+    const messages: Message[] = [
+      { type: "reasoning", role: "assistant", content: "" },
+    ];
+    expect(messagesToCoreMessages(messages)).toEqual([]);
+  });
+
+  it("orders reasoning before tool-call within an assistant turn", () => {
+    const messages: Message[] = [
+      {
+        type: "reasoning",
+        role: "assistant",
+        content: "plan",
+        details: [{ type: "text", text: "plan", signature: "sig" }],
+      },
+      {
+        type: "tool_call",
+        role: "assistant",
+        stop_reason: "tool",
+        tools: [{ type: "tool", id: "c1", name: "search", input: { q: "x" } }],
+      },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(result).toHaveLength(2);
+    expect(firstPart(result[0]).type).toBe("reasoning");
+    expect(firstPart(result[1]).type).toBe("tool-call");
+  });
+});
+
+describe("resultToMessages — reasoning", () => {
+  it("emits a reasoning message before the text message", () => {
+    const result: SerializableResult = {
+      text: "The answer is 42.",
+      toolCalls: [],
+      finishReason: "stop",
+      reasoning: "because reasons",
+      reasoningDetails: [
+        { type: "text", text: "because reasons", signature: "sig" },
+      ],
+    };
+    const messages = resultToMessages(result);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]!.type).toBe("reasoning");
+    if (messages[0]!.type === "reasoning") {
+      expect(messages[0]!.content).toBe("because reasons");
+      expect(messages[0]!.signature).toBe("sig");
+      expect(messages[0]!.details).toEqual([
+        { type: "text", text: "because reasons", signature: "sig" },
+      ]);
+    }
+    expect(messages[1]!.type).toBe("text");
+  });
+
+  it("orders reasoning → text → tool_call", () => {
+    const result: SerializableResult = {
+      text: "Let me look.",
+      toolCalls: [{ toolCallId: "c1", toolName: "search", args: { q: "x" } }],
+      finishReason: "tool-calls",
+      reasoning: "I should search",
+    };
+    const messages = resultToMessages(result);
+    expect(messages.map((m) => m.type)).toEqual([
+      "reasoning",
+      "text",
+      "tool_call",
+    ]);
+  });
+
+  it("does not emit a reasoning message when there is no reasoning", () => {
+    const result: SerializableResult = {
+      text: "hi",
+      toolCalls: [],
+      finishReason: "stop",
+    };
+    const messages = resultToMessages(result);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.type).toBe("text");
+  });
+});
+
+describe("messagesToCoreMessages / toolsToAiTools — cache control", () => {
+  it("marks the system message when cacheControl is enabled", () => {
+    const messages: Message[] = [
+      { type: "text", role: "system", content: "sys" },
+      { type: "text", role: "user", content: "hi" },
+    ];
+    const result = messagesToCoreMessages(messages, { cacheControl: true });
+    expect(
+      (result[0] as { providerOptions?: unknown }).providerOptions
+    ).toEqual(EPHEMERAL);
+    expect(
+      (result[1] as { providerOptions?: unknown }).providerOptions
+    ).toBeUndefined();
+  });
+
+  it("does not mark the system message when cacheControl is off", () => {
+    const messages: Message[] = [
+      { type: "text", role: "system", content: "sys" },
+    ];
+    const result = messagesToCoreMessages(messages);
+    expect(
+      (result[0] as { providerOptions?: unknown }).providerOptions
+    ).toBeUndefined();
+  });
+
+  it("marks the last tool when cacheControl is enabled", () => {
+    const tools: Tool.Any[] = [
+      {
+        name: "tool_a",
+        description: "A",
+        parameters: z.object({ x: z.number() }),
+        handler: async () => {},
+      },
+      {
+        name: "tool_b",
+        description: "B",
+        parameters: z.object({ y: z.string() }),
+        handler: async () => {},
+      },
+    ];
+    const result = toolsToAiTools(tools, { cacheControl: true });
+    expect(
+      (result["tool_b"] as { providerOptions?: unknown }).providerOptions
+    ).toEqual(EPHEMERAL);
+    expect(
+      (result["tool_a"] as { providerOptions?: unknown }).providerOptions
+    ).toBeUndefined();
+  });
+});
+
+describe("toolsToAiTools — OpenAI optional params (no forced strict)", () => {
+  it("keeps optional parameters out of the JSON schema `required` list", () => {
+    const tools: Tool.Any[] = [
+      {
+        name: "read_file",
+        description: "Read a file",
+        parameters: z.object({
+          path: z.string(),
+          limit: z.number().optional(),
+        }),
+        handler: async () => "",
+      },
+    ];
+    const result = toolsToAiTools(tools);
+    const schema = rawSchema(result["read_file"]!.inputSchema);
+    // Optional `limit` must NOT be required — strict mode would 400 otherwise.
+    expect(schema.required).toEqual(["path"]);
+    expect(schema.properties).toHaveProperty("limit");
+  });
+
+  it("does not force `strict: true` on tools with parameters", () => {
+    const tools: Tool.Any[] = [
+      {
+        name: "with_params",
+        description: "x",
+        parameters: z.object({ a: z.string() }),
+        handler: async () => {},
+      },
+    ];
+    const result = toolsToAiTools(tools);
+    expect(
+      (result["with_params"] as { strict?: unknown }).strict
+    ).toBeUndefined();
+  });
+});
+
+describe("toSerializableResult", () => {
+  const base = {
+    text: "hi",
+    toolCalls: [],
+    finishReason: "stop",
+  };
+
+  it("normalizes usage to snake_case input/output/total", () => {
+    const out = toSerializableResult({
+      ...base,
+      usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+    });
+    expect(out.usage).toEqual({
+      input_tokens: 100,
+      output_tokens: 20,
+      total_tokens: 120,
+    });
+  });
+
+  it("uses the non-cache breakdown for input_tokens (no double count)", () => {
+    // v6 usage.inputTokens is the cache-INCLUSIVE total; the breakdown carries
+    // the non-cache and cache buckets separately.
+    const out = toSerializableResult({
+      ...base,
+      usage: {
+        inputTokens: 950,
+        outputTokens: 5,
+        totalTokens: 955,
+        inputTokenDetails: {
+          noCacheTokens: 40,
+          cacheReadTokens: 900,
+          cacheWriteTokens: 10,
+        },
+      },
+    });
+    expect(out.usage).toEqual({
+      input_tokens: 40,
+      output_tokens: 5,
+      total_tokens: 955,
+      cache_creation_input_tokens: 10,
+      cache_read_input_tokens: 900,
+    });
+  });
+
+  it("backs non-cache input out of the total when no breakdown is given", () => {
+    const out = toSerializableResult({
+      ...base,
+      usage: { inputTokens: 1000, outputTokens: 5, totalTokens: 1005 },
+      providerMetadata: {
+        anthropic: {
+          cacheCreationInputTokens: 200,
+          cacheReadInputTokens: 600,
+        },
+      },
+    });
+    // 1000 total input − 600 read − 200 write = 200 non-cache.
+    expect(out.usage).toEqual({
+      input_tokens: 200,
+      output_tokens: 5,
+      total_tokens: 1005,
+      cache_creation_input_tokens: 200,
+      cache_read_input_tokens: 600,
+    });
+  });
+
+  it("carries reasoning text and signed reasoning details", () => {
+    const out = toSerializableResult({
+      ...base,
+      reasoningText: "because",
+      reasoning: [
+        {
+          type: "reasoning",
+          text: "because",
+          providerOptions: { anthropic: { signature: "s" } },
+        },
+      ],
+    });
+    expect(out.reasoning).toBe("because");
+    expect(out.reasoningDetails).toEqual([
+      { type: "text", text: "because", signature: "s" },
+    ]);
+  });
+
+  it("omits usage entirely when neither usage nor cache tokens are present", () => {
+    const out = toSerializableResult({ ...base });
+    expect(out.usage).toBeUndefined();
+  });
+
+  it("omits empty reasoning", () => {
+    const out = toSerializableResult({ ...base, reasoningText: "   " });
+    expect(out.reasoning).toBeUndefined();
   });
 });
