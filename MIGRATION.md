@@ -230,19 +230,33 @@ either way. No behavioral regression for Clevix.
    - delete the `patchedDependencies` entry (and the `@inngest/agent-kit@0.13.2`
      pin) from `package.json`.
 
-2. **Point at the fork.** Two options:
+2. **Point at the fork.** Pick one:
 
-   - **Pack a tarball** (good for CI / reproducible installs):
-     ```bash
-     # in this repo
-     cd packages/agent-kit && pnpm build && pnpm pack
-     # -> inngest-agent-kit-0.13.3-alpha.1.tgz
-     ```
-     Then in Clevix `package.json`:
+   - **Install from GitHub (recommended).** The repo publishes a prebuilt
+     `release` branch carrying the package's `dist/` at the repo root, so it
+     installs directly — no subdir path, no build-on-install:
      ```jsonc
+     // Clevix package.json
      "dependencies": {
-       "@inngest/agent-kit": "file:../agent-kit/packages/agent-kit/inngest-agent-kit-0.13.3-alpha.1.tgz"
+       "@inngest/agent-kit": "github:eadwinCode/agent-kit#release"
      }
+     ```
+     ```bash
+     pnpm add github:eadwinCode/agent-kit#release
+     ```
+     For a reproducible/pinned install, use the release commit SHA instead of the
+     moving branch name: `github:eadwinCode/agent-kit#<sha>`.
+
+     > Why a branch and not plain `github:eadwinCode/agent-kit`? The package lives
+     > in the `packages/agent-kit` subdir and gitignores `dist/`, so a root install
+     > would get the workspace root with no build output. The `release` branch is
+     > regenerated from `main` with `scripts/publish-github-release.sh` after any
+     > change you want consumers to pick up.
+
+   - **Pack a tarball** (good for air-gapped CI):
+     ```bash
+     cd packages/agent-kit && pnpm build && pnpm pack
+     # -> inngest-agent-kit-0.13.3-alpha.1.tgz  →  "file:…/inngest-agent-kit-….tgz"
      ```
 
    - **Workspace link** (good for local iteration): add this repo's
