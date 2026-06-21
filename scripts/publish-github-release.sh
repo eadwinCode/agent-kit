@@ -27,6 +27,9 @@ echo "==> Building @inngest/agent-kit"
 ( cd "$PKG" && pnpm build )
 
 echo "==> Rebuilding orphan branch '$BRANCH' with the prebuilt package at root"
+# Drop any stale local branch so the orphan checkout is clean on re-runs
+# (origin/$BRANCH is the source of truth and is force-pushed below).
+git branch -D "$BRANCH" 2>/dev/null || true
 git worktree add --detach "$WT" HEAD >/dev/null
 (
   cd "$WT"
@@ -50,4 +53,5 @@ git worktree add --detach "$WT" HEAD >/dev/null
 )
 
 git worktree remove --force "$WT"
+git branch -D "$BRANCH" 2>/dev/null || true
 echo "==> Done. Install with: pnpm add github:eadwinCode/agent-kit#${BRANCH}"
