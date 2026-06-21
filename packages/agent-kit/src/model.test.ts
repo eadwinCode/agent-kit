@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/require-await */
 import { describe, it, expect } from "vitest";
 import { z } from "zod";
-import type { LanguageModelV1, LanguageModelV1CallOptions } from "ai";
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import { AgenticModel, createAgenticModelFromLanguageModel } from "./model";
 import type { SerializableResult } from "./converters";
 import type { Message } from "./types";
@@ -20,8 +20,8 @@ const WEATHER_TOOL: Tool.Any = {
   handler: async () => "sunny",
 };
 
-/** Pull the system message out of a captured LanguageModelV1 prompt. */
-function systemPromptMessage(options: LanguageModelV1CallOptions) {
+/** Pull the system message out of a captured LanguageModelV3 prompt. */
+function systemPromptMessage(options: LanguageModelV3CallOptions) {
   return options.prompt.find((m) => m.role === "system");
 }
 
@@ -154,27 +154,13 @@ describe("AgenticModel", () => {
     ).rejects.toBeInstanceOf(RateLimitError);
   });
 
-  it("does not pass toolChoice when no tools are provided", async () => {
-    let capturedOptions: Record<string, unknown> | undefined;
-    const model: LanguageModelV1 = {
-      specificationVersion: "v1",
-      provider: "mock",
-      modelId: "mock-model",
-      defaultObjectGenerationMode: "json",
-      doGenerate: async (options) => {
-        capturedOptions = options as unknown as Record<string, unknown>;
-        return {
-          text: "response",
-          toolCalls: [],
-          finishReason: "stop" as const,
-          usage: { promptTokens: 0, completionTokens: 0 },
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
+  it("does not pass tools/toolChoice when no tools are provided", async () => {
+    let captured: LanguageModelV3CallOptions | undefined;
+    const model = createMockModel({
+      onGenerate: (o) => {
+        captured = o;
       },
-      doStream: async () => {
-        throw new Error("Not implemented");
-      },
-    };
+    });
     const agentic = new AgenticModel(model);
 
     await agentic.infer(
@@ -184,8 +170,10 @@ describe("AgenticModel", () => {
       "any"
     );
 
-    // When no tools are provided, tools and toolChoice should not be set
-    expect(capturedOptions).toBeDefined();
+    // When no tools are provided, neither tools nor toolChoice should be set.
+    expect(captured).toBeDefined();
+    expect(captured?.tools ?? []).toEqual([]);
+    expect(captured?.toolChoice).toBeUndefined();
   });
 });
 
@@ -193,7 +181,7 @@ describe("AgenticModel inference metadata (usage / cache / reasoning)", () => {
   it("carries token usage through infer() into raw", async () => {
     const model = createMockModel({
       text: "Hi",
-      usage: { promptTokens: 120, completionTokens: 34 },
+      usage: { inputTokens: 120, outputTokens: 34 },
     });
     const agentic = new AgenticModel(model);
 
@@ -211,12 +199,12 @@ describe("AgenticModel inference metadata (usage / cache / reasoning)", () => {
     const model = createMockModel({
       text: "Hi",
       provider: "anthropic.messages",
-      usage: { promptTokens: 50, completionTokens: 10 },
-      providerMetadata: {
-        anthropic: {
-          cacheCreationInputTokens: 200,
-          cacheReadInputTokens: 1800,
-        },
+      // v6 reports cache tokens in the standardized usage breakdown.
+      usage: {
+        inputTokens: 50, // non-cache prompt tokens
+        outputTokens: 10,
+        cacheReadTokens: 1800,
+        cacheWriteTokens: 200,
       },
     });
     const agentic = new AgenticModel(model);
@@ -225,11 +213,11 @@ describe("AgenticModel inference metadata (usage / cache / reasoning)", () => {
     const raw = result.raw as SerializableResult;
 
     // input_tokens stays the non-cache count so a cache-aware biller can add the
-    // cache buckets without double-counting.
+    // cache buckets without double-counting. total includes cache (provider total).
     expect(raw.usage).toEqual({
       input_tokens: 50,
       output_tokens: 10,
-      total_tokens: 60,
+      total_tokens: 2060,
       cache_creation_input_tokens: 200,
       cache_read_input_tokens: 1800,
     });
@@ -238,9 +226,7 @@ describe("AgenticModel inference metadata (usage / cache / reasoning)", () => {
   it("carries reasoning through infer() into raw and output", async () => {
     const model = createMockModel({
       text: "The answer is 42.",
-      reasoning: [
-        { type: "text", text: "Let me think about this.", signature: "sig-1" },
-      ],
+      reasoning: [{ text: "Let me think about this.", signature: "sig-1" }],
     });
     const agentic = new AgenticModel(model);
 
@@ -265,7 +251,7 @@ describe("AgenticModel inference metadata (usage / cache / reasoning)", () => {
   it("omits cache fields when the provider reports no cache usage", async () => {
     const model = createMockModel({
       text: "Hi",
-      usage: { promptTokens: 5, completionTokens: 5 },
+      usage: { inputTokens: 5, outputTokens: 5 },
     });
     const agentic = new AgenticModel(model);
 
@@ -279,7 +265,7 @@ describe("AgenticModel inference metadata (usage / cache / reasoning)", () => {
 
 describe("AgenticModel Anthropic prompt caching", () => {
   it("auto-applies cache control to the system message for Anthropic models", async () => {
-    let captured: LanguageModelV1CallOptions | undefined;
+    let captured: LanguageModelV3CallOptions | undefined;
     const model = createMockModel({
       provider: "anthropic.messages",
       onGenerate: (o) => {
@@ -291,13 +277,13 @@ describe("AgenticModel Anthropic prompt caching", () => {
     await agentic.infer("s", SYSTEM_AND_USER, [WEATHER_TOOL], "auto");
 
     const system = systemPromptMessage(captured!);
-    expect(system?.providerMetadata?.anthropic?.cacheControl).toEqual({
+    expect(system?.providerOptions?.anthropic?.cacheControl).toEqual({
       type: "ephemeral",
     });
   });
 
   it("does NOT apply cache control for non-Anthropic models", async () => {
-    let captured: LanguageModelV1CallOptions | undefined;
+    let captured: LanguageModelV3CallOptions | undefined;
     const model = createMockModel({
       provider: "openai.chat",
       onGenerate: (o) => {
@@ -309,11 +295,11 @@ describe("AgenticModel Anthropic prompt caching", () => {
     await agentic.infer("s", SYSTEM_AND_USER, [WEATHER_TOOL], "auto");
 
     const system = systemPromptMessage(captured!);
-    expect(system?.providerMetadata?.anthropic?.cacheControl).toBeUndefined();
+    expect(system?.providerOptions?.anthropic?.cacheControl).toBeUndefined();
   });
 
   it("honors an explicit cacheControl override on a non-Anthropic model", async () => {
-    let captured: LanguageModelV1CallOptions | undefined;
+    let captured: LanguageModelV3CallOptions | undefined;
     const model = createMockModel({
       provider: "openai.chat",
       onGenerate: (o) => {
@@ -325,7 +311,7 @@ describe("AgenticModel Anthropic prompt caching", () => {
     await agentic.infer("s", SYSTEM_AND_USER, [WEATHER_TOOL], "auto");
 
     const system = systemPromptMessage(captured!);
-    expect(system?.providerMetadata?.anthropic?.cacheControl).toEqual({
+    expect(system?.providerOptions?.anthropic?.cacheControl).toEqual({
       type: "ephemeral",
     });
   });

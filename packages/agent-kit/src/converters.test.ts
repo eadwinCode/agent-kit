@@ -22,7 +22,7 @@ function rawSchema(parameters: unknown): {
   return (parameters as { jsonSchema: Record<string, unknown> }).jsonSchema;
 }
 
-/** First content part of a CoreMessage with array content (test-only cast). */
+/** First content part of a ModelMessage with array content (test-only cast). */
 function firstPart(msg: unknown): Record<string, unknown> {
   return (msg as { content: Array<Record<string, unknown>> }).content[0]!;
 }
@@ -98,7 +98,7 @@ describe("messagesToCoreMessages", () => {
             type: "tool-call",
             toolCallId: "call_1",
             toolName: "get_weather",
-            args: { city: "London" },
+            input: { city: "London" },
           },
         ],
       },
@@ -148,7 +148,7 @@ describe("messagesToCoreMessages", () => {
             type: "tool-result",
             toolCallId: "call_1",
             toolName: "get_weather",
-            result: { temperature: 20 },
+            output: { type: "json", value: { temperature: 20 } },
           },
         ],
       },
@@ -314,8 +314,8 @@ describe("toolsToAiTools", () => {
     const result = toolsToAiTools(tools);
     expect(result).toHaveProperty("get_weather");
     expect(result["get_weather"]!.description).toBe("Get weather for a city");
-    // The parameters should be a JSON schema wrapper
-    expect(result["get_weather"]!.parameters).toBeDefined();
+    // The input schema should be a JSON schema wrapper
+    expect(result["get_weather"]!.inputSchema).toBeDefined();
   });
 
   it("converts a tool without parameters to empty object schema", () => {
@@ -328,7 +328,7 @@ describe("toolsToAiTools", () => {
     ];
     const result = toolsToAiTools(tools);
     expect(result).toHaveProperty("ping");
-    expect(result["ping"]!.parameters).toBeDefined();
+    expect(result["ping"]!.inputSchema).toBeDefined();
   });
 
   it("converts multiple tools", () => {
@@ -404,7 +404,7 @@ describe("messagesToCoreMessages — vision / images", () => {
     ]);
   });
 
-  it("passes a user image mimeType through", () => {
+  it("passes a user image mediaType through", () => {
     const messages: Message[] = [
       {
         type: "text",
@@ -417,11 +417,13 @@ describe("messagesToCoreMessages — vision / images", () => {
     const result = messagesToCoreMessages(messages);
     expect(result[0]).toEqual({
       role: "user",
-      content: [{ type: "image", image: "BASE64DATA", mimeType: "image/jpeg" }],
+      content: [
+        { type: "image", image: "BASE64DATA", mediaType: "image/jpeg" },
+      ],
     });
   });
 
-  it("converts an Anthropic-native base64 image in a tool result into multipart content", () => {
+  it("converts an Anthropic-native base64 image in a tool result into content output", () => {
     const messages: Message[] = [
       {
         type: "tool_result",
@@ -440,30 +442,34 @@ describe("messagesToCoreMessages — vision / images", () => {
     const result = messagesToCoreMessages(messages);
     const part = firstPart(result[0]);
     expect(part.type).toBe("tool-result");
-    expect(part.experimental_content).toEqual([
-      { type: "text", text: '{"ok":true}' },
-      { type: "image", data: "AAAA", mimeType: "image/png" },
-    ]);
+    expect(part.output).toEqual({
+      type: "content",
+      value: [
+        { type: "text", text: '{"ok":true}' },
+        { type: "image-data", data: "AAAA", mediaType: "image/png" },
+      ],
+    });
   });
 
-  it("converts an AI SDK-shaped image in a tool result into multipart content", () => {
+  it("converts an AI SDK-shaped image in a tool result into content output", () => {
     const messages: Message[] = [
       {
         type: "tool_result",
         role: "tool_result",
         tool: { type: "tool", id: "c1", name: "screenshot", input: {} },
-        content: [{ type: "image", data: "BBBB", mimeType: "image/jpeg" }],
+        content: [{ type: "image", data: "BBBB", mediaType: "image/jpeg" }],
         stop_reason: "tool",
       },
     ];
     const result = messagesToCoreMessages(messages);
     const part = firstPart(result[0]);
-    expect(part.experimental_content).toEqual([
-      { type: "image", data: "BBBB", mimeType: "image/jpeg" },
-    ]);
+    expect(part.output).toEqual({
+      type: "content",
+      value: [{ type: "image-data", data: "BBBB", mediaType: "image/jpeg" }],
+    });
   });
 
-  it("surfaces a URL-only tool-result image as text (base64-only AI SDK part)", () => {
+  it("passes a URL-only tool-result image through as an image-url part", () => {
     const messages: Message[] = [
       {
         type: "tool_result",
@@ -481,15 +487,17 @@ describe("messagesToCoreMessages — vision / images", () => {
     ];
     const result = messagesToCoreMessages(messages);
     const part = firstPart(result[0]);
-    // No embeddable image → no multipart content; URL is not silently dropped
-    // because the original `result` still carries the blocks.
-    expect(part.experimental_content).toBeUndefined();
-    expect(part.result).toEqual(
-      messages[0]!.type === "tool_result" ? messages[0]!.content : undefined
-    );
+    // v6 tool-result content supports image URLs directly (no base64 needed).
+    expect(part.output).toEqual({
+      type: "content",
+      value: [
+        { type: "text", text: "see image" },
+        { type: "image-url", url: "https://example.com/x.png" },
+      ],
+    });
   });
 
-  it("leaves string tool-result content unchanged (no multipart)", () => {
+  it("emits text output for a string tool result (no multipart)", () => {
     const messages: Message[] = [
       {
         type: "tool_result",
@@ -501,8 +509,7 @@ describe("messagesToCoreMessages — vision / images", () => {
     ];
     const result = messagesToCoreMessages(messages);
     const part = firstPart(result[0]);
-    expect(part.result).toBe("Sunny, 75F");
-    expect(part.experimental_content).toBeUndefined();
+    expect(part.output).toEqual({ type: "text", value: "Sunny, 75F" });
   });
 });
 
@@ -521,7 +528,13 @@ describe("messagesToCoreMessages — reasoning round-trip", () => {
     expect(result).toEqual([
       {
         role: "assistant",
-        content: [{ type: "reasoning", text: "thinking", signature: "sig" }],
+        content: [
+          {
+            type: "reasoning",
+            text: "thinking",
+            providerOptions: { anthropic: { signature: "sig" } },
+          },
+        ],
       },
     ]);
   });
@@ -539,7 +552,13 @@ describe("messagesToCoreMessages — reasoning round-trip", () => {
     expect(result).toEqual([
       {
         role: "assistant",
-        content: [{ type: "redacted-reasoning", data: "opaque" }],
+        content: [
+          {
+            type: "reasoning",
+            text: "",
+            providerOptions: { anthropic: { redactedData: "opaque" } },
+          },
+        ],
       },
     ]);
   });
@@ -557,7 +576,13 @@ describe("messagesToCoreMessages — reasoning round-trip", () => {
     expect(result).toEqual([
       {
         role: "assistant",
-        content: [{ type: "reasoning", text: "hmm", signature: "s2" }],
+        content: [
+          {
+            type: "reasoning",
+            text: "hmm",
+            providerOptions: { anthropic: { signature: "s2" } },
+          },
+        ],
       },
     ]);
   });
@@ -706,7 +731,7 @@ describe("toolsToAiTools — OpenAI optional params (no forced strict)", () => {
       },
     ];
     const result = toolsToAiTools(tools);
-    const schema = rawSchema(result["read_file"]!.parameters);
+    const schema = rawSchema(result["read_file"]!.inputSchema);
     // Optional `limit` must NOT be required — strict mode would 400 otherwise.
     expect(schema.required).toEqual(["path"]);
     expect(schema.properties).toHaveProperty("limit");
@@ -738,7 +763,7 @@ describe("toSerializableResult", () => {
   it("normalizes usage to snake_case input/output/total", () => {
     const out = toSerializableResult({
       ...base,
-      usage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 },
+      usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
     });
     expect(out.usage).toEqual({
       input_tokens: 100,
@@ -747,42 +772,63 @@ describe("toSerializableResult", () => {
     });
   });
 
-  it("extracts Anthropic cache tokens separately (no double count)", () => {
+  it("uses the non-cache breakdown for input_tokens (no double count)", () => {
+    // v6 usage.inputTokens is the cache-INCLUSIVE total; the breakdown carries
+    // the non-cache and cache buckets separately.
     const out = toSerializableResult({
       ...base,
-      usage: { promptTokens: 40, completionTokens: 5, totalTokens: 45 },
-      providerMetadata: {
-        anthropic: {
-          cacheCreationInputTokens: 10,
-          cacheReadInputTokens: 900,
+      usage: {
+        inputTokens: 950,
+        outputTokens: 5,
+        totalTokens: 955,
+        inputTokenDetails: {
+          noCacheTokens: 40,
+          cacheReadTokens: 900,
+          cacheWriteTokens: 10,
         },
       },
     });
     expect(out.usage).toEqual({
       input_tokens: 40,
       output_tokens: 5,
-      total_tokens: 45,
+      total_tokens: 955,
       cache_creation_input_tokens: 10,
       cache_read_input_tokens: 900,
     });
   });
 
-  it("falls back to experimental_providerMetadata for cache tokens", () => {
+  it("backs non-cache input out of the total when no breakdown is given", () => {
     const out = toSerializableResult({
       ...base,
-      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-      experimental_providerMetadata: {
-        anthropic: { cacheReadInputTokens: 7 },
+      usage: { inputTokens: 1000, outputTokens: 5, totalTokens: 1005 },
+      providerMetadata: {
+        anthropic: {
+          cacheCreationInputTokens: 200,
+          cacheReadInputTokens: 600,
+        },
       },
     });
-    expect(out.usage?.cache_read_input_tokens).toBe(7);
+    // 1000 total input − 600 read − 200 write = 200 non-cache.
+    expect(out.usage).toEqual({
+      input_tokens: 200,
+      output_tokens: 5,
+      total_tokens: 1005,
+      cache_creation_input_tokens: 200,
+      cache_read_input_tokens: 600,
+    });
   });
 
-  it("carries reasoning and reasoningDetails", () => {
+  it("carries reasoning text and signed reasoning details", () => {
     const out = toSerializableResult({
       ...base,
-      reasoning: "because",
-      reasoningDetails: [{ type: "text", text: "because", signature: "s" }],
+      reasoningText: "because",
+      reasoning: [
+        {
+          type: "reasoning",
+          text: "because",
+          providerOptions: { anthropic: { signature: "s" } },
+        },
+      ],
     });
     expect(out.reasoning).toBe("because");
     expect(out.reasoningDetails).toEqual([
@@ -796,7 +842,7 @@ describe("toSerializableResult", () => {
   });
 
   it("omits empty reasoning", () => {
-    const out = toSerializableResult({ ...base, reasoning: "   " });
+    const out = toSerializableResult({ ...base, reasoningText: "   " });
     expect(out.reasoning).toBeUndefined();
   });
 });

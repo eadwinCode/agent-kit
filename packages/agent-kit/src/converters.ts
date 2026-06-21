@@ -1,15 +1,18 @@
 /**
  * Converters between internal Message/Tool types and the Vercel AI SDK types.
  *
+ * Targets the AI SDK v6 model interface: `ModelMessage` / `Tool` / `ToolResultOutput`.
+ *
  * @module
  */
 import {
   jsonSchema,
-  type CoreMessage,
-  type CoreTool,
+  type JSONValue,
   type ImagePart,
+  type ModelMessage,
   type ProviderMetadata,
   type TextPart,
+  type Tool,
   type ToolResultPart,
 } from "ai";
 import { z } from "zod";
@@ -22,15 +25,27 @@ import {
   type ToolCallMessage,
   type ToolMessage,
 } from "./types";
-import { type Tool } from "./tool";
+import { type Tool as AgentKitTool } from "./tool";
 
 /** Anthropic ephemeral cache breakpoint marker (provider-specific metadata). */
 const ANTHROPIC_CACHE_CONTROL: ProviderMetadata = {
   anthropic: { cacheControl: { type: "ephemeral" } },
 };
 
-/** Multi-part tool-result content accepted by the AI SDK (text/image blocks). */
-type ToolResultContent = NonNullable<ToolResultPart["experimental_content"]>;
+/** Tool-result output shape accepted by the AI SDK (text / json / content). */
+type ToolResultOutput = ToolResultPart["output"];
+/** The `value` of a multi-part (`type: "content"`) tool result. */
+type ToolResultContentValue = Extract<
+  ToolResultOutput,
+  { type: "content" }
+>["value"];
+
+/** Assistant reasoning part as accepted by the AI SDK v6 message format. */
+type ReasoningContentPart = {
+  type: "reasoning";
+  text: string;
+  providerOptions?: ProviderMetadata;
+};
 
 /**
  * Options shared by the message/tool converters.
@@ -46,18 +61,18 @@ export interface ConvertOptions {
 }
 
 /**
- * Convert internal Message[] to AI SDK CoreMessage[].
+ * Convert internal Message[] to AI SDK ModelMessage[].
  */
 export function messagesToCoreMessages(
   messages: Message[],
   opts: ConvertOptions = {}
-): CoreMessage[] {
-  const result: CoreMessage[] = [];
+): ModelMessage[] {
+  const result: ModelMessage[] = [];
 
   for (const msg of messages) {
     switch (msg.type) {
       case "text": {
-        result.push(textMessageToCoreMessage(msg));
+        result.push(textMessageToModelMessage(msg));
         break;
       }
       case "reasoning": {
@@ -77,25 +92,21 @@ export function messagesToCoreMessages(
             type: "tool-call" as const,
             toolCallId: tool.id,
             toolName: tool.name,
-            args: tool.input,
+            input: tool.input,
           })),
         });
         break;
       }
       case "tool_result": {
         // Convert to tool message with tool-result part. When the result carries
-        // image content (e.g. a screenshot tool), also attach multi-part content
-        // so a vision-capable model can actually see the image.
+        // image content (e.g. a screenshot tool), emit multi-part `content`
+        // output so a vision-capable model can actually see the image.
         const part: ToolResultPart = {
           type: "tool-result",
           toolCallId: msg.tool.id,
           toolName: msg.tool.name,
-          result: msg.content,
+          output: toToolResultOutput(msg.content),
         };
-        const multipart = toToolResultContent(msg.content);
-        if (multipart) {
-          part.experimental_content = multipart;
-        }
         result.push({ role: "tool", content: [part] });
         break;
       }
@@ -110,11 +121,11 @@ export function messagesToCoreMessages(
 }
 
 /**
- * Convert a single internal text message to a CoreMessage. User messages with
+ * Convert a single internal text message to a ModelMessage. User messages with
  * image parts emit structured `UserContent` (text + image parts); everything
  * else collapses to a joined string, preserving prior behaviour.
  */
-function textMessageToCoreMessage(msg: TextMessage): CoreMessage {
+function textMessageToModelMessage(msg: TextMessage): ModelMessage {
   if (
     typeof msg.content !== "string" &&
     msg.role === "user" &&
@@ -137,7 +148,7 @@ function textMessageToCoreMessage(msg: TextMessage): CoreMessage {
 
 function imageContentToImagePart(c: ImageContent): ImagePart {
   return c.mimeType
-    ? { type: "image", image: c.image, mimeType: c.mimeType }
+    ? { type: "image", image: c.image, mediaType: c.mimeType }
     : { type: "image", image: c.image };
 }
 
@@ -145,26 +156,36 @@ function imageContentToImagePart(c: ImageContent): ImagePart {
  * Convert a reasoning message back into assistant reasoning parts. Prefers the
  * structured `details` (which preserve per-block signatures Anthropic needs to
  * replay a thinking block before a tool-use block); falls back to the flat text.
+ * In v6 the signature travels in `providerOptions.anthropic.signature`.
  */
 function reasoningMessageToParts(
   msg: ReasoningMessage
-): Array<
-  | { type: "reasoning"; text: string; signature?: string }
-  | { type: "redacted-reasoning"; data: string }
-> {
+): ReasoningContentPart[] {
   if (msg.details && msg.details.length > 0) {
     return msg.details.map((d) =>
       d.type === "redacted"
-        ? { type: "redacted-reasoning", data: d.data }
+        ? {
+            type: "reasoning",
+            text: "",
+            providerOptions: { anthropic: { redactedData: d.data } },
+          }
         : d.signature
-          ? { type: "reasoning", text: d.text, signature: d.signature }
+          ? {
+              type: "reasoning",
+              text: d.text,
+              providerOptions: { anthropic: { signature: d.signature } },
+            }
           : { type: "reasoning", text: d.text }
     );
   }
   if (msg.content && msg.content.length > 0) {
     return [
       msg.signature
-        ? { type: "reasoning", text: msg.content, signature: msg.signature }
+        ? {
+            type: "reasoning",
+            text: msg.content,
+            providerOptions: { anthropic: { signature: msg.signature } },
+          }
         : { type: "reasoning", text: msg.content },
     ];
   }
@@ -172,18 +193,35 @@ function reasoningMessageToParts(
 }
 
 /**
- * Build multi-part tool-result content from an array of content blocks when at
- * least one image is present. Returns undefined for plain (string / non-image)
- * results so the existing `result` field is used unchanged.
+ * Build the AI SDK tool-result output from internal tool content:
+ *  - a string  → `{ type: "text" }`
+ *  - an array carrying image blocks → `{ type: "content" }` multi-part output so
+ *    a vision model can see the image(s)
+ *  - anything else → `{ type: "json" }`
  *
- * Recognises both AI SDK image blocks (`{ data, mimeType }`) and Anthropic-native
- * blocks (`{ source: { type, data/url, media_type } }`), plus a generic
+ * Recognises AI SDK image blocks (`{ data, mediaType }`), Anthropic-native blocks
+ * (`{ source: { type, data/url, media_type } }`), and a generic
  * `{ image: <url|base64|dataURL> }` shape.
  */
-function toToolResultContent(content: unknown): ToolResultContent | undefined {
+function toToolResultOutput(content: unknown): ToolResultOutput {
+  if (typeof content === "string") {
+    return { type: "text", value: content };
+  }
+
+  const multipart = toToolResultContentValue(content);
+  if (multipart) {
+    return { type: "content", value: multipart };
+  }
+
+  return { type: "json", value: content as JSONValue };
+}
+
+function toToolResultContentValue(
+  content: unknown
+): ToolResultContentValue | undefined {
   if (!Array.isArray(content)) return undefined;
 
-  const parts: ToolResultContent = [];
+  const parts: ToolResultContentValue = [];
   let hasImage = false;
 
   for (const block of content) {
@@ -202,13 +240,15 @@ function toToolResultContent(content: unknown): ToolResultContent | undefined {
       const img = extractImage(b);
       if (img) {
         if (img.kind === "data") {
-          parts.push({ type: "image", data: img.data, mimeType: img.mimeType });
-          hasImage = true;
+          parts.push({
+            type: "image-data",
+            data: img.data,
+            mediaType: img.mediaType,
+          });
         } else {
-          // The AI SDK tool-result image part is base64-only — surface a URL as
-          // text rather than dropping it so the model still gets the reference.
-          parts.push({ type: "text", text: img.url });
+          parts.push({ type: "image-url", url: img.url });
         }
+        hasImage = true;
         continue;
       }
     }
@@ -221,7 +261,7 @@ function toToolResultContent(content: unknown): ToolResultContent | undefined {
 }
 
 type ExtractedImage =
-  | { kind: "data"; data: string; mimeType: string }
+  | { kind: "data"; data: string; mediaType: string }
   | { kind: "url"; url: string };
 
 function extractImage(b: Record<string, unknown>): ExtractedImage | undefined {
@@ -232,7 +272,7 @@ function extractImage(b: Record<string, unknown>): ExtractedImage | undefined {
       return {
         kind: "data",
         data: source.data,
-        mimeType:
+        mediaType:
           typeof source.media_type === "string"
             ? source.media_type
             : "image/png",
@@ -242,33 +282,35 @@ function extractImage(b: Record<string, unknown>): ExtractedImage | undefined {
       return { kind: "url", url: source.url };
     }
   }
-  // AI SDK tool-result image: { data, mimeType }
+  // AI SDK image block: { data, mediaType } (also tolerate legacy mimeType)
   if (typeof b.data === "string") {
+    const mediaType = b.mediaType ?? b.mimeType;
     return {
       kind: "data",
       data: b.data,
-      mimeType: typeof b.mimeType === "string" ? b.mimeType : "image/png",
+      mediaType: typeof mediaType === "string" ? mediaType : "image/png",
     };
   }
-  // Generic: { image: <url | base64 | dataURL>, mimeType? }
+  // Generic: { image: <url | base64 | dataURL>, mediaType? }
   if (typeof b.image === "string") {
+    const mediaType = b.mediaType ?? b.mimeType;
     return parseImageString(
       b.image,
-      typeof b.mimeType === "string" ? b.mimeType : undefined
+      typeof mediaType === "string" ? mediaType : undefined
     );
   }
   return undefined;
 }
 
-function parseImageString(s: string, mimeType?: string): ExtractedImage {
+function parseImageString(s: string, mediaType?: string): ExtractedImage {
   const dataUrl = /^data:([^;]+);base64,([\s\S]*)$/.exec(s);
   if (dataUrl) {
-    return { kind: "data", data: dataUrl[2]!, mimeType: dataUrl[1]! };
+    return { kind: "data", data: dataUrl[2]!, mediaType: dataUrl[1]! };
   }
   if (/^https?:\/\//i.test(s)) {
     return { kind: "url", url: s };
   }
-  return { kind: "data", data: s, mimeType: mimeType ?? "image/png" };
+  return { kind: "data", data: s, mediaType: mediaType ?? "image/png" };
 }
 
 /**
@@ -277,7 +319,7 @@ function parseImageString(s: string, mimeType?: string): ExtractedImage {
  * whole prefix up to that block — so marking the system message caches the tool
  * definitions + system prompt together.
  */
-function applySystemCacheControl(messages: CoreMessage[]): void {
+function applySystemCacheControl(messages: ModelMessage[]): void {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
     if (m.role === "system") {
@@ -303,10 +345,10 @@ export interface SerializableResult {
   finishReason: string;
   /**
    * Token usage, normalised across providers and safe to serialise across
-   * `step.run()`. Field names mirror the Anthropic API (`input_tokens` excludes
-   * cache tokens); OpenAI's prompt/completion counts map onto the same fields.
-   * Cache buckets are kept separate so cache-aware billing can add them in
-   * explicitly without double-counting.
+   * `step.run()`. Field names mirror the Anthropic API: `input_tokens` is the
+   * NON-cache prompt count (the AI SDK v6 `usage.inputTokens` total includes
+   * cache, so we read `inputTokenDetails.noCacheTokens`); the cache buckets are
+   * kept separate so cache-aware billing can add them in without double-counting.
    */
   usage?: SerializableUsage;
   /** Concatenated reasoning text, when the model exposes chain-of-thought. */
@@ -324,22 +366,32 @@ export interface SerializableUsage {
 }
 
 /**
- * Structural subset of the AI SDK `generateText` result that we read from.
+ * Structural subset of the AI SDK v6 `generateText` result that we read from.
  * Declared locally so the converter is independent of the exact SDK result type.
  */
 export interface AiResultLike {
   text: string;
-  toolCalls: Array<{ toolCallId: string; toolName: string; args: unknown }>;
+  toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }>;
   finishReason: string;
   usage?: {
-    promptTokens?: number;
-    completionTokens?: number;
+    inputTokens?: number;
+    outputTokens?: number;
     totalTokens?: number;
+    cachedInputTokens?: number;
+    inputTokenDetails?: {
+      noCacheTokens?: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    };
   };
   providerMetadata?: ProviderMetadata;
-  experimental_providerMetadata?: ProviderMetadata;
-  reasoning?: string;
-  reasoningDetails?: ReasoningDetail[];
+  reasoning?: Array<{
+    type: "reasoning";
+    text: string;
+    providerOptions?: ProviderMetadata;
+    providerMetadata?: ProviderMetadata;
+  }>;
+  reasoningText?: string;
 }
 
 /**
@@ -354,7 +406,7 @@ export function toSerializableResult(result: AiResultLike): SerializableResult {
     toolCalls: result.toolCalls.map((tc) => ({
       toolCallId: tc.toolCallId,
       toolName: tc.toolName,
-      args: tc.args as Record<string, unknown>,
+      args: tc.input as Record<string, unknown>,
     })),
     finishReason: result.finishReason,
   };
@@ -362,35 +414,67 @@ export function toSerializableResult(result: AiResultLike): SerializableResult {
   const usage = extractUsage(result);
   if (usage) out.usage = usage;
 
-  if (result.reasoning && result.reasoning.trim() !== "") {
-    out.reasoning = result.reasoning;
+  if (result.reasoningText && result.reasoningText.trim() !== "") {
+    out.reasoning = result.reasoningText;
   }
-  if (result.reasoningDetails && result.reasoningDetails.length > 0) {
-    out.reasoningDetails = result.reasoningDetails;
+  const details = reasoningPartsToDetails(result.reasoning);
+  if (details.length > 0) {
+    out.reasoningDetails = details;
   }
 
   return out;
 }
 
+function reasoningPartsToDetails(
+  parts: AiResultLike["reasoning"]
+): ReasoningDetail[] {
+  if (!parts || parts.length === 0) return [];
+  return parts.map((p): ReasoningDetail => {
+    const meta = (p.providerOptions ?? p.providerMetadata)?.anthropic as
+      | Record<string, unknown>
+      | undefined;
+    const signature = meta?.signature;
+    return typeof signature === "string" && signature !== ""
+      ? { type: "text", text: p.text, signature }
+      : { type: "text", text: p.text };
+  });
+}
+
 function extractUsage(result: AiResultLike): SerializableUsage | undefined {
   const u = result.usage;
-  const anthropic = (
-    result.providerMetadata ?? result.experimental_providerMetadata
-  )?.anthropic as Record<string, unknown> | undefined;
-  const cacheCreation = numberOrUndefined(anthropic?.cacheCreationInputTokens);
-  const cacheRead = numberOrUndefined(anthropic?.cacheReadInputTokens);
+  const details = u?.inputTokenDetails;
+  const anthropic = result.providerMetadata?.anthropic as
+    | Record<string, unknown>
+    | undefined;
 
-  if (!u && cacheCreation === undefined && cacheRead === undefined) {
+  const cacheRead = firstNumber(
+    details?.cacheReadTokens,
+    u?.cachedInputTokens,
+    anthropic?.cacheReadInputTokens
+  );
+  const cacheWrite = firstNumber(
+    details?.cacheWriteTokens,
+    anthropic?.cacheCreationInputTokens
+  );
+
+  // `input_tokens` is the NON-cache prompt count. Prefer the standardised
+  // breakdown; otherwise back it out of the (cache-inclusive) total.
+  let inputNonCache = numberOrUndefined(details?.noCacheTokens);
+  if (inputNonCache === undefined && u?.inputTokens !== undefined) {
+    inputNonCache = u.inputTokens - (cacheRead ?? 0) - (cacheWrite ?? 0);
+  }
+
+  if (!u && cacheRead === undefined && cacheWrite === undefined) {
     return undefined;
   }
 
   const usage: SerializableUsage = {
-    input_tokens: numberOrZero(u?.promptTokens),
-    output_tokens: numberOrZero(u?.completionTokens),
+    input_tokens: inputNonCache ?? 0,
+    output_tokens: numberOrZero(u?.outputTokens),
     total_tokens: numberOrZero(u?.totalTokens),
   };
-  if (cacheCreation !== undefined) {
-    usage.cache_creation_input_tokens = cacheCreation;
+  if (cacheWrite !== undefined) {
+    usage.cache_creation_input_tokens = cacheWrite;
   }
   if (cacheRead !== undefined) {
     usage.cache_read_input_tokens = cacheRead;
@@ -404,6 +488,14 @@ function numberOrZero(v: unknown): number {
 
 function numberOrUndefined(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const v of values) {
+    const n = numberOrUndefined(v);
+    if (n !== undefined) return n;
+  }
+  return undefined;
 }
 
 /**
@@ -510,16 +602,16 @@ function reasoningResultToMessage(
  * agent's own invokeTools method after inference.
  */
 export function toolsToAiTools(
-  tools: Tool.Any[],
+  tools: AgentKitTool.Any[],
   opts: ConvertOptions = {}
-): Record<string, CoreTool> {
-  const result: Record<string, CoreTool> = {};
+): Record<string, Tool> {
+  const result: Record<string, Tool> = {};
 
   for (const tool of tools) {
-    let parameters: CoreTool["parameters"];
+    let inputSchema: Tool["inputSchema"];
     if (tool.parameters) {
       try {
-        parameters = jsonSchema(
+        inputSchema = jsonSchema(
           z.toJSONSchema(tool.parameters, { target: "draft-7" }) as Parameters<
             typeof jsonSchema
           >[0]
@@ -528,29 +620,26 @@ export function toolsToAiTools(
         // Fallback for schemas that z.toJSONSchema() cannot handle (e.g. Zod v3
         // schemas from MCP's JSON-Schema-to-Zod converter). Use an open object
         // schema so the tool is still callable.
-        parameters = jsonSchema({ type: "object", properties: {} });
+        inputSchema = jsonSchema({ type: "object", properties: {} });
       }
     } else {
-      parameters = jsonSchema({ type: "object", properties: {} });
+      inputSchema = jsonSchema({ type: "object", properties: {} });
     }
 
     result[tool.name] = {
       description: tool.description,
-      parameters,
+      inputSchema,
     };
   }
 
   if (opts.cacheControl) {
     // Mark the last tool as a cache breakpoint so the (static) tool-definition
-    // block caches as a prefix. The AI SDK v4 `Tool` type has no `providerOptions`
-    // field, so this is attached best-effort for providers that read it; on v4 the
-    // system-message breakpoint already caches the tool prefix.
+    // block caches as a prefix (a separate breakpoint from the system message).
+    // AI SDK v6 tools carry `providerOptions` through to the provider.
     const names = Object.keys(result);
     const last = names[names.length - 1];
     if (last) {
-      (
-        result[last] as CoreTool & { providerOptions?: ProviderMetadata }
-      ).providerOptions = ANTHROPIC_CACHE_CONTROL;
+      result[last]!.providerOptions = ANTHROPIC_CACHE_CONTROL;
     }
   }
 
@@ -561,7 +650,7 @@ export function toolsToAiTools(
  * Map internal Tool.Choice to AI SDK toolChoice format.
  */
 export function mapToolChoice(
-  choice: Tool.Choice
+  choice: AgentKitTool.Choice
 ): "auto" | "required" | { type: "tool"; toolName: string } {
   switch (choice) {
     case "auto":

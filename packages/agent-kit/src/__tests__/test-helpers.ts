@@ -1,16 +1,19 @@
 /* eslint-disable @typescript-eslint/require-await */
+import { MockLanguageModelV3 } from "ai/test";
 import type {
-  LanguageModelV1,
-  LanguageModelV1CallOptions,
-  LanguageModelV1ProviderMetadata,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3Content,
+  SharedV3ProviderMetadata,
 } from "@ai-sdk/provider";
 
-type MockReasoning =
-  | string
-  | Array<
-      | { type: "text"; text: string; signature?: string }
-      | { type: "redacted"; data: string }
-    >;
+/** Simplified usage knobs; `inputTokens` is the NON-cache prompt count. */
+export interface MockUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
 
 export interface MockModelOptions {
   text?: string;
@@ -24,37 +27,30 @@ export interface MockModelOptions {
    *  Anthropic-only behaviour such as auto cache control. */
   provider?: string;
   /** Token usage returned by the model (defaults to all-zero). */
-  usage?: { promptTokens: number; completionTokens: number };
-  /** Provider-specific metadata, e.g. `{ anthropic: { cacheReadInputTokens } }`. */
-  providerMetadata?: LanguageModelV1ProviderMetadata;
-  /** Reasoning the model "emitted" (string or structured blocks). */
-  reasoning?: MockReasoning;
+  usage?: MockUsage;
+  /** Provider-specific metadata, e.g. `{ anthropic: { ... } }`. */
+  providerMetadata?: SharedV3ProviderMetadata;
+  /** Reasoning the model "emitted" — text, or blocks with optional signatures. */
+  reasoning?: string | Array<{ text: string; signature?: string }>;
   /** Invoked with the raw call options on every doGenerate (test inspection). */
-  onGenerate?: (options: LanguageModelV1CallOptions) => void;
-  /** If provided, called with the prompt to decide the response dynamically. */
-  handler?: (prompt: unknown) => {
-    text?: string;
-    toolCalls?: Array<{
-      toolCallType: "function";
-      toolCallId: string;
-      toolName: string;
-      args: string;
-    }>;
-    finishReason: "stop" | "tool-calls";
-  };
+  onGenerate?: (options: LanguageModelV3CallOptions) => void;
 }
 
 /**
- * Create a mock LanguageModelV1 for testing.
- * By default returns a text response. Can return tool calls or throw errors.
+ * Create a mock LanguageModelV3 (AI SDK v6) for testing.
+ * By default returns a text response. Can return tool calls, reasoning, usage,
+ * provider metadata, or throw errors.
  */
-export function createMockModel(opts?: MockModelOptions): LanguageModelV1 {
-  const usage = opts?.usage ?? { promptTokens: 0, completionTokens: 0 };
-  return {
-    specificationVersion: "v1",
+export function createMockModel(opts?: MockModelOptions): LanguageModelV3 {
+  const inputNonCache = opts?.usage?.inputTokens ?? 0;
+  const cacheRead = opts?.usage?.cacheReadTokens;
+  const cacheWrite = opts?.usage?.cacheWriteTokens;
+  const inputTotal = inputNonCache + (cacheRead ?? 0) + (cacheWrite ?? 0);
+  const outputTokens = opts?.usage?.outputTokens ?? 0;
+
+  return new MockLanguageModelV3({
     provider: opts?.provider ?? "mock",
     modelId: "mock-model",
-    defaultObjectGenerationMode: "json",
     doGenerate: async (options) => {
       opts?.onGenerate?.(options);
 
@@ -62,37 +58,63 @@ export function createMockModel(opts?: MockModelOptions): LanguageModelV1 {
         throw opts.error;
       }
 
-      if (opts?.handler) {
-        const result = opts.handler(options.prompt);
-        return {
-          text: result.text ?? "",
-          toolCalls: result.toolCalls ?? [],
-          finishReason: result.finishReason,
-          usage,
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
+      const toolCalls = opts?.toolCalls ?? [];
+      const content: LanguageModelV3Content[] = [];
+
+      // Reasoning first (mirrors a real thinking-then-answer turn).
+      if (opts?.reasoning) {
+        const blocks =
+          typeof opts.reasoning === "string"
+            ? [{ text: opts.reasoning }]
+            : opts.reasoning;
+        for (const b of blocks) {
+          content.push({
+            type: "reasoning",
+            text: b.text,
+            ...(b.signature
+              ? { providerMetadata: { anthropic: { signature: b.signature } } }
+              : {}),
+          });
+        }
       }
 
-      const toolCalls = (opts?.toolCalls ?? []).map((tc) => ({
-        toolCallType: "function" as const,
-        toolCallId: tc.toolCallId,
-        toolName: tc.toolName,
-        args: JSON.stringify(tc.args),
-      }));
+      const text =
+        opts?.text ?? (toolCalls.length === 0 ? "Mock response" : "");
+      if (text) {
+        content.push({ type: "text", text });
+      }
 
+      for (const tc of toolCalls) {
+        content.push({
+          type: "tool-call",
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          input: JSON.stringify(tc.args),
+        });
+      }
+
+      const unified = toolCalls.length > 0 ? "tool-calls" : "stop";
       return {
-        text: opts?.text ?? (toolCalls.length === 0 ? "Mock response" : ""),
-        toolCalls,
-        finishReason:
-          toolCalls.length > 0 ? ("tool-calls" as const) : ("stop" as const),
-        usage,
-        reasoning: opts?.reasoning,
-        providerMetadata: opts?.providerMetadata,
-        rawCall: { rawPrompt: null, rawSettings: {} },
+        content,
+        finishReason: { unified, raw: unified } as const,
+        usage: {
+          inputTokens: {
+            total: inputTotal,
+            noCache: inputNonCache,
+            cacheRead,
+            cacheWrite,
+          },
+          outputTokens: {
+            total: outputTokens,
+            text: outputTokens,
+            reasoning: undefined,
+          },
+        },
+        ...(opts?.providerMetadata
+          ? { providerMetadata: opts.providerMetadata }
+          : {}),
+        warnings: [],
       };
     },
-    doStream: async () => {
-      throw new Error("Not implemented");
-    },
-  };
+  });
 }

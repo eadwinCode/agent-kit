@@ -1,13 +1,20 @@
-# Migration: consuming the Vercel-AI-SDK fork of `@inngest/agent-kit`
+# Migration: consuming the Vercel-AI-SDK (v6) fork of `@inngest/agent-kit`
 
 This fork (`@inngest/agent-kit@0.13.3-alpha.1`, branch `task/ai-sdk-refactor`) has
-moved off `@inngest/ai` onto the **Vercel AI SDK** (`ai` v4). Inference now runs
+moved off `@inngest/ai` onto the **Vercel AI SDK v6** (`ai@^6`). Inference runs
 `generateText()` inside `step.run()`, and `src/converters.ts` translates between
-agent-kit `Message[]` and Vercel `CoreMessage[]`.
+agent-kit `Message[]` and the AI SDK `ModelMessage[]` / `Tool` / `ToolResultOutput`
+types.
 
-It folds in everything the downstream **Clevix Studio** project was carrying as a
+It folds in everything the downstream **Clevix Studio** project carried as a
 hand-applied bun patch (`patches/@inngest%2Fagent-kit@0.13.2.patch`), so Clevix can
 consume the fork directly and **delete the patch**.
+
+> **Already on v6.** A previous cut of this fork targeted `ai@4`
+> (`LanguageModelV1`), which forced consumers onto the v4-compatible provider
+> majors. This cut targets **`ai@6` / `LanguageModelV3`**, matching the versions
+> Clevix already resolves (`ai@6`, `@ai-sdk/anthropic@3`, `@ai-sdk/openai@3`) — so
+> there is **no AI SDK version pin to manage** anymore.
 
 ---
 
@@ -16,21 +23,14 @@ consume the fork directly and **delete the patch**.
 Old (`@inngest/ai`): you built a provider adapter with `anthropic()` / `openai()`
 and passed it as `model`.
 
-New: you build a Vercel **`LanguageModelV1`** and pass it as `model`. The agent
-wraps it internally via `createAgenticModelFromLanguageModel(model)`.
+New: you build a Vercel **`LanguageModel`** (an `@ai-sdk/*` model instance) and pass
+it as `model`. The agent wraps it internally via
+`createAgenticModelFromLanguageModel(model)`.
 
-### ⚠️ AI SDK version compatibility
+### Versions
 
-The fork is built against **`ai` v4** and expects a **`LanguageModelV1`**.
-
-- Providers: use the v4-compatible majors — **`@ai-sdk/anthropic@^1`** and
-  **`@ai-sdk/openai@^1`** (these export `LanguageModelV1`).
-- `@ai-sdk/anthropic@^3` / `@ai-sdk/openai@^2` (the `ai` v5/v6 line) export
-  `LanguageModelV2` and will **not** type-check or run against this fork.
-
-Clevix currently resolves `ai@6` + `@ai-sdk/anthropic@3` for other code paths.
-Pin the v4-compatible providers for the agent-kit path (a dedup/alias or a
-separate dependency entry), or align the whole app to `ai@4`.
+- `ai@^6`, `@ai-sdk/anthropic@^3`, `@ai-sdk/openai@^3` — exactly what Clevix
+  already has. No pinning, no dedupe needed.
 
 ### Before → after (Clevix `packages/ai/src/agentkit/model.ts`)
 
@@ -49,7 +49,7 @@ return anthropic({
 ```
 
 ```ts
-// AFTER — Vercel LanguageModelV1; per-request settings baked in with middleware
+// AFTER — Vercel LanguageModel; per-request settings baked in with middleware
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { wrapLanguageModel, defaultSettingsMiddleware } from "ai";
@@ -63,9 +63,9 @@ const model = wrapLanguageModel({
   model: anthropic(config.model),
   middleware: defaultSettingsMiddleware({
     settings: {
-      maxTokens: 16384,
-      // Anthropic extended thinking — providerMetadata at the V1 call layer:
-      providerMetadata: {
+      maxOutputTokens: 16384, // NB: renamed from maxTokens in v5+
+      // Anthropic extended thinking via provider options:
+      providerOptions: {
         anthropic: { thinking: { type: "enabled", budgetTokens: 8000 } },
       },
       // temperature: config.temperature,   // omit when thinking is on
@@ -80,9 +80,9 @@ createAgent({ name: "clevix-designer", system, model, tools });
 Notes:
 - `wrapLanguageModel` preserves the wrapped model's `provider`/`modelId`, so the
   automatic Anthropic cache detection (below) still fires through the wrap.
-- OpenAI reasoning effort → `settings.providerMetadata.openai.reasoningEffort`.
-- Anthropic **requires** `max_tokens`; if you don't set it the provider falls back
-  to its own default (4096). Set it explicitly to keep the 8k/16k behavior.
+- OpenAI reasoning effort → `settings.providerOptions.openai.reasoningEffort`.
+- Anthropic **requires** a max-tokens value; if you don't set `maxOutputTokens` the
+  provider falls back to its own default. Set it explicitly to keep 8k/16k.
 
 `createAgenticModelFromLanguageModel(model, options?)` also accepts
 `{ cacheControl?: boolean | "auto" }` if you construct the agentic model directly
@@ -101,11 +101,11 @@ Notes:
   "toolCalls": [...],
   "finishReason": "stop",
   "usage": {
-    "input_tokens": 1200,            // = AI SDK promptTokens; EXCLUDES cache tokens
-    "output_tokens": 340,            // = completionTokens
-    "total_tokens": 1540,
-    "cache_creation_input_tokens": 800,   // present only for Anthropic w/ caching
-    "cache_read_input_tokens": 16000      // present only for Anthropic w/ caching
+    "input_tokens": 50,             // NON-cache prompt tokens
+    "output_tokens": 12,
+    "total_tokens": 892,            // provider total (includes cache)
+    "cache_creation_input_tokens": 30,    // Anthropic, when caching is active
+    "cache_read_input_tokens": 800
   },
   "reasoning": "…thinking text…",        // present only when the model reasons
   "reasoningDetails": [ { "type": "text", "text": "…", "signature": "…" } ]
@@ -123,9 +123,12 @@ const inputTokens =
 const outputTokens = u.output_tokens ?? u.completion_tokens ?? 0;
 ```
 
-`input_tokens` is the **non-cache** prompt count (matching the Anthropic API and
-`ai`-v4 `promptTokens` semantics), so adding the cache buckets does **not**
-double-count. No change to `billing.ts` is required.
+⚠️ **v6 usage subtlety (handled in the fork):** the AI SDK v6 `usage.inputTokens`
+is the **cache-inclusive total**. To keep Clevix's "add the buckets" math correct,
+the fork maps `input_tokens` from the **non-cache** breakdown
+(`usage.inputTokenDetails.noCacheTokens`), not the total — so cache tokens are never
+double-counted. No change to `billing.ts` is required. (`total_tokens` is the
+cache-inclusive grand total and is informational; Clevix doesn't use it.)
 
 ---
 
@@ -140,8 +143,8 @@ double-count. No change to `billing.ts` is required.
 
 - It is emitted **before** the text / tool-call messages within a turn. Anthropic
   requires the thinking block to precede the tool-use block, and the converter
-  replays it (with signatures) so multi-step tool use with extended thinking keeps
-  working.
+  replays it (the signature travels in `providerOptions.anthropic.signature`) so
+  multi-step tool use with extended thinking keeps working.
 - Clevix's `history-prune.ts` already passes non-`tool_call` messages through
   untouched, so persistence/replay is unaffected. Render the `reasoning` message
   in the UI if you want to surface chain-of-thought.
@@ -153,18 +156,18 @@ longer a hand-rolled response parser to crash on thinking blocks.
 
 ## 4. Vision / images in tool results (and user messages)
 
-`messagesToCoreMessages` converts image content into Vercel image parts:
+`messagesToCoreMessages` converts image content into AI SDK v6 parts:
 
 - **User messages**: an image content part
   `{ type: "image", image: <url|base64|dataURL>, mimeType? }` becomes an AI SDK
-  `ImagePart`.
+  `ImagePart` (`mimeType` is mapped to v6's `mediaType`).
 - **Tool results**: when `ToolResultMessage.content` is an array of blocks and at
-  least one is an image, the converter attaches AI SDK multi-part
-  `experimental_content` so a vision model can see it. It accepts the
-  **Anthropic-native** shape your `imageToolResultContent()` already emits —
-  `{ type: "image", source: { type: "base64", media_type, data } }` — as well as
-  the AI SDK shape `{ type: "image", data, mimeType }`. URL-only images are
-  surfaced as text (the AI SDK tool-result image part is base64-only).
+  least one is an image, the converter emits a v6 `{ type: "content" }` tool-result
+  output with `image-data` (base64) or `image-url` parts so a vision model can see
+  it. It accepts the **Anthropic-native** shape your `imageToolResultContent()`
+  already emits — `{ type: "image", source: { type: "base64"|"url", … } }` — as
+  well as the AI SDK `{ type: "image", data, mediaType }` shape. (v6 supports image
+  URLs in tool results directly, so URL images are no longer downgraded to text.)
 
 So `vision.ts` / `imageToolResultContent()` keep working as-is; the bun patch's
 "forward array content verbatim" hack is no longer needed.
@@ -174,19 +177,21 @@ So `vision.ts` / `imageToolResultContent()` keep working as-is; the bun patch's
 ## 5. Anthropic prompt caching (replaces the patch's cache_control edits)
 
 Caching is **auto-enabled for Anthropic models** (detected from the model's
-`provider` id) and **off for everyone else** — safe to leave on:
+`provider` id, e.g. `"anthropic.messages"`) and **off for everyone else** — safe to
+leave on:
 
 - The **system message** is marked with `providerOptions.anthropic.cacheControl =
-  { type: "ephemeral" }`. Because Anthropic orders a request as
-  `[tools, system, messages]`, this caches the **tool definitions + system
-  prompt** as one prefix.
-- The **last tool** is also marked, best-effort. ⚠️ Caveat: the `ai` v4 `Tool`
-  type has no `providerOptions`, so v4 cannot carry a tool-level breakpoint to the
-  provider — the system-message breakpoint already caches the tool prefix, so this
-  is effectively a single breakpoint on v4. (The marker is there for forward
-  compatibility with providers/SDKs that read it.)
+  { type: "ephemeral" }`. Anthropic orders a request as `[tools, system, messages]`,
+  so this caches the tool definitions + system prompt prefix.
+- The **last tool** is *also* marked. Unlike the old `ai@4` cut, **v6 tool
+  definitions carry `providerOptions` through to the provider**, so this is a real
+  second cache breakpoint (the static tool block caches independently of the
+  per-project system tail).
 
-Cache read/creation tokens flow back through §2's `usage` for cache-aware billing.
+Both breakpoints are verified end-to-end against the real `@ai-sdk/anthropic`
+provider (`src/__tests__/anthropic-integration.test.ts`): the request body carries
+`cache_control` on the system block and the last tool. Cache read/creation tokens
+flow back through §2's `usage`.
 
 Override if needed:
 
@@ -214,9 +219,7 @@ optional. The patch's `strict: false` default is no longer needed.
 durable and replay-safe. `step.ai.infer` (from `@inngest/ai`) was removed and is
 **not** reintroduced: it requires the provider-specific raw request/response shape
 this fork no longer builds, and Clevix sets `retries: 0` and bills from the result
-either way. No behavioral regression for Clevix. If a future need for
-`step.ai.infer` semantics appears (e.g. provider-native offloading), revisit then —
-there is no current blocker.
+either way. No behavioral regression for Clevix.
 
 ---
 
@@ -243,15 +246,23 @@ there is no current blocker.
      ```
 
    - **Workspace link** (good for local iteration): add this repo's
-     `packages/agent-kit` to the Clevix pnpm workspace (or
-     `pnpm add @inngest/agent-kit@file:<path-to>/packages/agent-kit`) and let pnpm
-     symlink it.
+     `packages/agent-kit` to the Clevix pnpm workspace, or
+     `pnpm add @inngest/agent-kit@file:<path-to>/packages/agent-kit`.
 
-3. **Pin v4-compatible AI SDK providers** (see §1) and build:
+3. Install & build — no AI SDK version changes are needed (Clevix is already on
+   `ai@6`):
    ```bash
    pnpm install && pnpm -w build
    ```
 
-4. Sanity-check: one chat turn should now (a) record non-zero token usage with
-   cache reads, (b) keep optional-param tools working on OpenAI, (c) show images
-   from image tools, and (d) preserve reasoning across tool-use turns.
+4. Sanity-check one chat turn: (a) non-zero token usage with cache reads, (b)
+   optional-param tools still work on OpenAI, (c) images from image tools are
+   visible to the model, (d) reasoning is preserved across tool-use turns.
+
+### Minor: a benign v6 warning
+
+The agent-kit design sends the system prompt as a `role: "system"` message. AI SDK
+v6 logs an advisory ("System messages in the prompt … use the system option")
+on each call. It is harmless (the system block, with its cache_control, is still
+sent correctly); suppress it with `allowSystemInMessages: true` on the
+`generateText` call if the log noise is unwanted.
