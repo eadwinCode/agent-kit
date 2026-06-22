@@ -293,7 +293,88 @@ call** (`maxIterPerRun: 1`). Total inferences per `network.run` is therefore
 > inferences. It does not — the network passes `maxIterPerRun: 1` to the agent.
 > You can size `network.maxIter` purely as the per-turn inference ceiling.
 
-## 9. Consuming the fork & dropping the patch
+## 9. Durable persistence & deterministic step ids (Inngest replay safety)
+
+Inngest re-executes the function body across step boundaries; completed `step.run`s
+are returned from memory **by id**, so every step id must be identical on every
+re-execution. A step id derived from `AgentResult.checksum` is **not** stable —
+the checksum embeds `createdAt`, which is regenerated on each replay — and Inngest
+fails with `Could not find step "<hash>" to run; timed out (foundSteps: [])`.
+
+### Results are persisted incrementally (survives mid-run failure)
+
+`network.run` now calls `history.appendResults` **after each agent result is
+produced**, not only once at the end of the loop. So a mid-run failure — a thrown
+error, or a hard abort (cancel via `cancelOn`, step-overflow, timeout/OOM) — leaves
+**every completed inference on disk**. On reload the user sees the partial answer
+they watched stream in, not just their own message.
+
+Each incremental save is wrapped by the fork in a single `step.run` under a
+**deterministic id** — the network iteration counter
+(`agent-kit/history/append-results/<n>`), never a checksum/timestamp/UUID. Two
+consequences for `HistoryConfig.appendResults`:
+
+- It is invoked with **`step: undefined`** — the fork already owns the durable
+  boundary, so the hook body runs inline (opening a nested `step.run` inside it
+  would break Inngest). Do your DB write directly; do **not** wrap it in
+  `step.run` and do **not** key anything on `result.checksum`.
+- It may be called **more than once** for the same result (incrementally, then the
+  end-of-run backstop, or on retry). Keep it **idempotent** (e.g. upsert / dedupe
+  by a stable key). `checksum` is fine as a *content* dedupe key in your DB; just
+  never use it as a *step* id.
+
+Consumers can now delete their own rescue workarounds (a parent-side `catch` that
+re-saves `state.results`, or an `onFinish` that persists per result) — the fork
+covers the thrown-error case durably and the hard-abort case via the incremental
+saves already on disk.
+
+### Long-running tool handlers MUST checkpoint their own work
+
+AgentKit executes tool handlers **inline** (not inside a `step.run`) on purpose,
+so a handler can use step tools itself (`step.waitForEvent` for HITL, `step.run`
+for MCP/DB work, `step.invoke` for sub-functions). The fork passes a usable step
+to every handler as `opts.step`.
+
+This is a **consumer-usage contract**, and it is *not* something the fork can fix
+generically: blanket-wrapping every handler in one `step.run` would (a) break
+handlers that use step tools (nested steps), and (b) not even help multi-minute
+work, since a single step still runs within one request's execution window.
+
+> If a tool handler does substantial async work (e.g. a multi-LLM-call subagent
+> loop) **inline**, it runs *between* the parent's inference steps; the request
+> times out waiting for the next step report and the retry comes back with
+> `foundSteps: []`.
+
+A handler that does long/multi-call work **must** make each unit its own durable
+step (deterministic id, no timestamp), or run as a separate function:
+
+```ts
+createTool({
+  name: "task",
+  parameters: z.object({ goal: z.string() }),
+  handler: async ({ goal }, { step }) => {
+    // ✅ each LLM call is a durable checkpoint < the request window, so the work
+    //    spans multiple requests and never blocks one past its timeout.
+    let i = 0;
+    for (const sub of plan(goal)) {
+      await step!.run(`task/subcall/${i++}`, () => generateText({ /* … */ }));
+    }
+    // ✅ or hand the whole subagent off to its own Inngest function:
+    // return step!.invoke("task/subagent", { function: subagentFn, data: { goal } });
+  },
+});
+```
+
+```ts
+// ❌ blocks the parent's step graph → "Could not find step …; foundSteps: []"
+handler: async ({ goal }) => runSubagentLoopInline(goal), // many LLM calls, no step.run
+```
+
+Step ids inside handlers follow the same rule as everywhere else: derive them from
+a **deterministic counter / index**, never from `Date.now()`, a random id, a UUID,
+or `AgentResult.checksum`.
+
+## 10. Consuming the fork & dropping the patch
 
 1. **Remove the patch** from Clevix:
    - delete `patches/@inngest%2Fagent-kit@0.13.2.patch`

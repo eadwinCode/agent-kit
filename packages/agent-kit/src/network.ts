@@ -8,8 +8,10 @@ import type { AgentResult, Message, UserMessage } from "./types";
 import { type MaybePromise } from "./util";
 import {
   type HistoryConfig,
+  incrementalAppendStepId,
   initializeThread,
   loadThreadFromStorage,
+  persistResults,
   saveThreadToStorage,
 } from "./history";
 import {
@@ -715,6 +717,23 @@ export class NetworkRun<T extends StateData> extends Network<T> {
 
         // Ensure that we store the call network history.
         this.state.appendResult(call);
+
+        // Persist this result the moment it's produced, so a mid-run failure or
+        // hard abort (cancel/overflow/timeout) still leaves every completed
+        // inference on disk — not just the once-at-the-end save below. The step
+        // id is the iteration counter (replay-stable), NEVER result.checksum
+        // (which embeds a regenerated timestamp). Idempotent: the end-of-run
+        // save and the consumer's own dedupe make re-writes no-ops.
+        await persistResults(
+          {
+            state: this.state,
+            history: this.history,
+            input: inputContent,
+            network: this,
+          },
+          [call],
+          incrementalAppendStepId(this._counter)
+        );
 
         // Here we face a problem: what's the definition of done?   An agent may
         // have just been called with part of the information to solve an input.

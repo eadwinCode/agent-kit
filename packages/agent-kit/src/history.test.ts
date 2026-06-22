@@ -565,7 +565,7 @@ describe("History Module", () => {
       expect(mockHistoryConfig.appendResults).toHaveBeenCalledWith({
         state: mockState,
         network: mockNetwork,
-        step: expect.any(Object),
+        step: undefined,
         newResults: [newResult1, newResult2],
         input: "test input",
         threadId: mockState.threadId,
@@ -590,14 +590,9 @@ describe("History Module", () => {
 
       await saveThreadToStorage(config);
 
-      expect(mockHistoryConfig.appendResults).toHaveBeenCalledWith({
-        state: mockState,
-        network: mockNetwork,
-        step: expect.any(Object),
-        newResults: [],
-        input: "test input",
-        threadId: mockState.threadId,
-      });
+      // With no new results there is nothing to persist, so appendResults is
+      // skipped entirely (avoids an empty, no-op durable step).
+      expect(mockHistoryConfig.appendResults).not.toHaveBeenCalled();
     });
 
     /**
@@ -624,7 +619,7 @@ describe("History Module", () => {
       expect(mockHistoryConfig.appendResults).toHaveBeenCalledWith({
         state: mockState,
         network: mockNetwork,
-        step: expect.any(Object),
+        step: undefined,
         newResults: allResults,
         input: "test input",
         threadId: mockState.threadId,
@@ -703,7 +698,7 @@ describe("History Module", () => {
       expect(mockHistoryConfig.appendResults).toHaveBeenCalledWith({
         state: mockState,
         network: mockNetwork,
-        step: expect.any(Object),
+        step: undefined,
         newResults: [newResult],
         input: "Hello",
         threadId: mockState.threadId,
@@ -774,7 +769,7 @@ describe("History Module", () => {
       expect(mockHistoryConfig.appendResults).toHaveBeenCalledWith({
         state: mockState,
         network: mockNetwork,
-        step: expect.any(Object),
+        step: undefined,
         newResults: [newResult],
         input: "How are you?",
         threadId: mockState.threadId,
@@ -949,7 +944,7 @@ describe("History Module", () => {
       expect(mockHistoryConfig.appendResults).toHaveBeenCalledWith({
         state: mockState,
         network: mockNetwork,
-        step: expect.any(Object),
+        step: undefined,
         newResults: largeResultArray.slice(500),
         input: "test input",
         threadId: mockState.threadId,
