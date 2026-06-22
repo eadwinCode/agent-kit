@@ -1,0 +1,5 @@
+---
+"@inngest/agent-kit": patch
+---
+
+Make tool execution durable by default under Inngest. When a tool runs inside an Inngest step, AgentKit now wraps the handler in a single `step.run` under a deterministic, replay-stable id (`<agent>/tool/<name>/<n>`), so non-idempotent side effects (`edit_file`, `mv`/`rm`/`cp`, paid image/video tools) execute exactly once across replays instead of re-firing on every re-execution. State mutations made inside a wrapped handler are snapshotted and re-applied outside the step on every execution, so state-mutating tools keep working unchanged. Tools that drive their own step tooling (`step.waitForEvent`/`step.invoke`/their own `step.run`, e.g. a `task` subagent), or idempotent large-output reads (screenshots), opt out with `manualStep: true` and run inline with the live `step`. MCP tools are now wrapped by the framework (fixing a same-tool-called-twice step-id collision); `select_agent`/`done`/Inngest-function tools are marked `manualStep` internally. Consumers should delete any manual per-tool / `task` `step.run` wrapping — see MIGRATION.md §9.

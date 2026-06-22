@@ -163,6 +163,48 @@ export class State<T extends StateData> {
   }
 
   /**
+   * Monotonic counter for AgentKit's durable tool-step ids.
+   *
+   * It is intentionally NOT copied by {@link clone}, so every `network.run`
+   * (which clones the template state once per Inngest execution) starts again at
+   * 0. Because memoized inferences replay the same tool calls in the same order,
+   * the Nth wrapped tool call in a run always receives the same index across
+   * replays — giving each tool a deterministic, replay-stable `step.run` id
+   * without resorting to a checksum/timestamp/uuid.
+   */
+  #durableToolCallIndex = 0;
+
+  /**
+   * Returns the next durable tool-call index for this run (see
+   * {@link #durableToolCallIndex}). Used only by the network to build
+   * replay-stable tool-step ids; not part of the public data model.
+   */
+  nextDurableToolCallIndex(): number {
+    return this.#durableToolCallIndex++;
+  }
+
+  /**
+   * Re-applies a typed-data snapshot captured INSIDE a durable tool step.
+   *
+   * A tool that mutates `state.data` does so inside its memoized `step.run`; on
+   * replay that body is skipped, so the live mutation is absent. The network
+   * memoizes the post-handler data snapshot and calls this OUTSIDE the step on
+   * every execution to restore it. Mutates the existing `data` object in place
+   * (full replace: keys absent from `data` are removed) so references stay valid
+   * and the proxy keeps intercepting writes.
+   */
+  importData(data: T): void {
+    const target = this.data as Record<string, unknown>;
+    const next = (data ?? {}) as Record<string, unknown>;
+    for (const key of Object.keys(target)) {
+      if (!(key in next)) {
+        delete target[key];
+      }
+    }
+    Object.assign(target, next);
+  }
+
+  /**
    * clone allows you to safely clone the state.
    */
   clone() {

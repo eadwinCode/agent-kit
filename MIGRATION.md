@@ -328,33 +328,73 @@ re-saves `state.results`, or an `onFinish` that persists per result) — the for
 covers the thrown-error case durably and the hard-abort case via the incremental
 saves already on disk.
 
-### Long-running tool handlers MUST checkpoint their own work
+### Tool execution is durable by default (NEW in `0.13.3-alpha.4`)
 
-AgentKit executes tool handlers **inline** (not inside a `step.run`) on purpose,
-so a handler can use step tools itself (`step.waitForEvent` for HITL, `step.run`
-for MCP/DB work, `step.invoke` for sub-functions). The fork passes a usable step
-to every handler as `opts.step`.
+> **Reverses the previous guidance in this section.** Earlier alphas ran every
+> tool handler **inline** and told you to wrap your own side effects. The fork
+> now wraps each tool call for you. If you added per-tool `step.run` wrapping in
+> your adapter (or a `task`-tool wrap), **delete it** — see the migration below.
 
-This is a **consumer-usage contract**, and it is *not* something the fork can fix
-generically: blanket-wrapping every handler in one `step.run` would (a) break
-handlers that use step tools (nested steps), and (b) not even help multi-minute
-work, since a single step still runs within one request's execution window.
+**The bug.** Inngest re-executes the function body on every step boundary;
+completed steps replay from memory while inline code re-runs. A tool handler that
+ran **inline** therefore re-fired its side effect **once per replay**:
 
-> If a tool handler does substantial async work (e.g. a multi-LLM-call subagent
-> loop) **inline**, it runs *between* the parent's inference steps; the request
-> times out waiting for the next step report and the retry comes back with
-> `foundSteps: []`.
+- `edit_file` applied the edit on the first replay, then later replays failed
+  "string not found" (the original text was already gone) — and that **failed**
+  result was handed to the model, which then "saw" the edit as un-applied.
+- `mv` / `rm` / `cp` succeeded once, then errored ("source not found").
+- paid image/video tools **re-billed** and produced non-deterministic output on
+  each replay.
 
-A handler that does long/multi-call work **must** make each unit its own durable
-step (deterministic id, no timestamp), or run as a separate function:
+(Idempotent reads — `read_file`, `grep`, `screenshot` — re-firing was harmless,
+which is why this hid for so long.)
+
+**The fix.** When a tool runs inside Inngest, AgentKit now wraps the handler in
+**one durable `step.run`** under a deterministic, replay-stable id
+(`<agent>/tool/<name>/<n>`, where `<n>` is a per-run counter in tool-call order —
+never a checksum/timestamp/uuid). The side effect runs **exactly once**; every
+replay returns the memoized result. In an Inngest trace each tool call is now a
+single `tool` step span; a single-use tool stays at `…/0` across dozens of
+replays.
+
+Two things AgentKit handles **for you** so the wrap is transparent:
+
+- **State mutations are preserved.** A tool whose primary effect is mutating
+  `network.state.data` (design-questions, copy-suggestions, plan snapshots,
+  `__stopReason`) keeps working with **no change**. The mutation happens inside
+  the memoized step, so AgentKit snapshots the post-handler state into the step
+  output and **re-applies it outside the step on every execution** (including
+  replays, where the body is skipped). Your state delta is never lost to
+  memoization. (Corollary: `state.data` you mutate from a tool must be
+  JSON-serializable — it already had to be, to persist.)
+- **In-tool live streaming still fires once.** Progress you `publish()` from
+  inside a handler via `@inngest/realtime` still reaches the client exactly once.
+  The realtime middleware publishes un-stepped while executing inside a step
+  (`store.executingStep ? action() : step.run(...)`), so in-tool publishes fire
+  during the real execution and do **not** re-fire on replay (the memoized body
+  doesn't run). Bonus: they no longer each cost their own step.
+
+#### Opt out with `manualStep: true` when the handler drives its own steps
+
+A wrapped handler is a **leaf**: it receives `opts.step: undefined` (it is already
+inside a step; a nested `step.run` would break Inngest). Set `manualStep: true` to
+**skip the wrap** — the handler then runs inline with the **live** `opts.step` and
+owns its own durability. Use it when the handler:
+
+- uses step tooling itself — `step.waitForEvent` (HITL), `step.invoke`
+  (sub-functions), or its own `step.run` checkpoints; **or**
+- runs **long / multi-call** work (a subagent loop). A single `step.run` must
+  finish within one request's execution window, so multi-minute work must
+  checkpoint itself across requests, exactly as before; **or**
+- is an idempotent **large-output read** (e.g. a base64 screenshot) you don't
+  want occupying step state — see the budget note below.
 
 ```ts
 createTool({
   name: "task",
   parameters: z.object({ goal: z.string() }),
+  manualStep: true, // ← this handler opens its own steps; don't wrap it
   handler: async ({ goal }, { step }) => {
-    // ✅ each LLM call is a durable checkpoint < the request window, so the work
-    //    spans multiple requests and never blocks one past its timeout.
     let i = 0;
     for (const sub of plan(goal)) {
       await step!.run(`task/subcall/${i++}`, () => generateText({ /* … */ }));
@@ -366,13 +406,67 @@ createTool({
 ```
 
 ```ts
-// ❌ blocks the parent's step graph → "Could not find step …; foundSteps: []"
-handler: async ({ goal }) => runSubagentLoopInline(goal), // many LLM calls, no step.run
+// ❌ a long multi-LLM-call loop WITHOUT manualStep is now wrapped in ONE step →
+//    it runs inline within that single step and blocks the request past its
+//    timeout ("Could not find step …; foundSteps: []"). Set manualStep: true.
+createTool({ name: "task", handler: async ({ goal }) => runSubagentLoopInline(goal) });
 ```
 
-Step ids inside handlers follow the same rule as everywhere else: derive them from
-a **deterministic counter / index**, never from `Date.now()`, a random id, a UUID,
-or `AgentResult.checksum`.
+AgentKit's built-in tools are already handled: `select_agent` / `done` (pure
+routing primitives) and Inngest-function tools (`createTool` from an
+`InngestFunction`, which call `step.invoke`) are marked `manualStep` internally;
+**MCP tools are wrapped** by the framework (the old self-wrap keyed the step on
+the tool name alone and collided when one MCP tool was called twice).
+
+#### Migration: delete your manual tool/`task` step-wrapping
+
+If your consuming app wrapped tool work itself — the common adapter pattern
+
+```ts
+// BEFORE (consumer adapter): a per-tool / task-tool durable wrap
+let invocation = 0;
+handler: async (input, { step }) => {
+  const id = `tool/${name}/${invocation++}`;       // or `task/${name}/${n}`
+  const run = async () => doTheToolWork(input);
+  return step ? await step.run(id, run) : await run();
+};
+```
+
+then, on `0.13.3-alpha.4`:
+
+- **Self-contained tools (most of them):** **delete the wrap** and return the
+  work directly. AgentKit now provides the durable boundary and the deterministic
+  id. (If you leave the wrap in place it still *works* — AgentKit passes such a
+  handler `step: undefined`, so it takes the `await run()` branch inside
+  AgentKit's own step — but it's dead code; remove it.)
+  ```ts
+  // AFTER
+  handler: async (input) => doTheToolWork(input),
+  ```
+- **`task` / subagent tools and HITL tools** (anything that calls
+  `step.run` / `step.invoke` / `step.waitForEvent` itself): add
+  `manualStep: true` and **keep** your `step.run` checkpoints. They now run inline
+  with the live step, uncontested by an outer wrap.
+- You can also drop any adapter-side `step` plumbing that existed only to feed
+  that wrap.
+
+Step ids you create inside a `manualStep` handler follow the same rule as
+everywhere else: derive them from a **deterministic counter / index**, never from
+`Date.now()`, a random id, a UUID, or `AgentResult.checksum`.
+
+#### Step budget (the 4MB / 1000-step limits)
+
+Each wrapped tool call is **+1 step** (against Inngest's 1000-step/function cap)
+and its result lands in step state (all step outputs **share a ~4MB-per-run**
+budget). Tool counts are minor next to streaming publishes (see §8), but two
+things to know:
+
+- AgentKit only stores a state snapshot in the step output **when the tool
+  actually mutated `state.data`**, so non-state tools stay lean.
+- A large base64 **screenshot/image read** stored in step state can eat a big
+  slice of the 4MB run total. Mark such idempotent reads `manualStep: true`:
+  re-running a read on replay is only wasted latency (not a correctness or
+  billing bug), and its output never occupies step state.
 
 ## 10. Consuming the fork & dropping the patch
 

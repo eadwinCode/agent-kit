@@ -8,7 +8,12 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { z } from "zod";
-import { createAgent, createNetwork, createTool } from "../index";
+import {
+  createAgent,
+  createNetwork,
+  createTool,
+  type NetworkRun,
+} from "../index";
 import {
   persistResults,
   incrementalAppendStepId,
@@ -221,6 +226,10 @@ describe("Bug 2 — tool handler async work via step.run is replay-safe", () => 
       name: "subagent",
       description: "does multi-step async work durably",
       parameters: z.object({}),
+      // Opt out of the automatic durable wrap: this handler opens its OWN steps,
+      // which cannot be nested inside a framework `step.run`. `manualStep` keeps
+      // it inline with the live `opts.step` so it owns its durability.
+      manualStep: true,
       handler: async (_input, { step }) => {
         // Long/multi-call work: each unit is its own durable step with a
         // DETERMINISTIC id (the consumer contract). Replay finds each in cache.
@@ -274,5 +283,221 @@ describe("Bug 2 — tool handler async work via step.run is replay-safe", () => 
     await makeRun().run("hi", { state: createState({}) });
     expect(rec.ids).toEqual(idsRun1);
     expect(rec.executed).toEqual([]);
+  });
+});
+
+describe("Bug 3 — tool side effects are durable (exactly-once across replays)", () => {
+  // Typed view of the {data}/{error} the first tool produced (keeps lint happy).
+  const toolOutput = (net: NetworkRun<any>) =>
+    net.state.results[0]?.toolCalls[0]?.content as {
+      data?: unknown;
+      error?: unknown;
+    };
+
+  // A non-idempotent tool whose handler is registered with the agent named "a".
+  const makeEditRun = (cache: Map<string, unknown>, onApply: () => string) => {
+    const editTool = createTool({
+      name: "edit_file",
+      description: "applies an edit (non-idempotent)",
+      parameters: z.object({}),
+      handler: async () => onApply(),
+    });
+    const model = createMockModel({
+      toolCalls: [{ toolCallId: "c1", toolName: "edit_file", args: {} }],
+    });
+    const agent = createAgent({
+      name: "a",
+      system: "s",
+      model,
+      tools: [editTool],
+    });
+    return createNetwork({
+      name: "n",
+      agents: [agent],
+      defaultModel: model,
+      maxIter: 1,
+      router: () => agent,
+    });
+  };
+
+  it("wraps each tool call in ONE deterministic step and runs the side effect once", async () => {
+    const cache = new Map<string, unknown>();
+    const rec = makeReplayStep(cache);
+    let sideEffects = 0;
+
+    mockedGetStepTools.mockResolvedValue(rec.step as any);
+    const r1 = await makeEditRun(cache, () => {
+      sideEffects++;
+      return "applied";
+    }).run("hi", { state: createState({}) });
+
+    // The handler ran exactly once, inside its own replay-stable step span…
+    expect(sideEffects).toBe(1);
+    expect(rec.ids).toContain("a/tool/edit_file/0");
+    // …and the model received the real result (not a re-fire error).
+    expect(toolOutput(r1)?.data).toBe("applied");
+
+    // Replay: same memoized cache, fresh state. The side effect must NOT re-fire.
+    rec.reset();
+    const r2 = await makeEditRun(cache, () => {
+      sideEffects++;
+      return "applied";
+    }).run("hi", { state: createState({}) });
+
+    expect(sideEffects).toBe(1); // exactly once across original + replay
+    expect(rec.executed).toEqual([]); // clean replay: nothing re-executed
+    expect(toolOutput(r2)?.data).toBe("applied");
+  });
+
+  it("returns the first result on replay even when a re-run would fail (the 'string not found' regression)", async () => {
+    const cache = new Map<string, unknown>();
+    const rec = makeReplayStep(cache);
+    let calls = 0;
+    const onApply = () => {
+      calls++;
+      if (calls > 1) {
+        // The exact symptom from the bug report: the original text is gone, so a
+        // second apply throws — and the *failed* result used to reach the model.
+        throw new Error("Edit 1/1: string not found");
+      }
+      return "edit applied";
+    };
+
+    mockedGetStepTools.mockResolvedValue(rec.step as any);
+    const r1 = await makeEditRun(cache, onApply).run("hi", {
+      state: createState({}),
+    });
+    expect(toolOutput(r1)?.data).toBe("edit applied");
+
+    // Replay: the memoized step returns the first success; the throwing body
+    // never runs again, so the model never sees "string not found".
+    rec.reset();
+    const r2 = await makeEditRun(cache, onApply).run("hi", {
+      state: createState({}),
+    });
+    expect(calls).toBe(1);
+    const content = toolOutput(r2);
+    expect(content?.data).toBe("edit applied");
+    expect(content?.error).toBeUndefined();
+  });
+
+  it("re-applies a wrapped tool's network.state mutation on replay (body skipped)", async () => {
+    const cache = new Map<string, unknown>();
+    const rec = makeReplayStep(cache);
+    let bodyRuns = 0;
+
+    const makeRun = () => {
+      const stateTool = createTool({
+        name: "set_plan",
+        description: "writes to network.state.data (primary effect)",
+        parameters: z.object({}),
+        handler: async (_input, { network }) => {
+          bodyRuns++;
+          network.state.data.plan = "step-1";
+          return "ok";
+        },
+      });
+      const model = createMockModel({
+        toolCalls: [{ toolCallId: "c1", toolName: "set_plan", args: {} }],
+      });
+      const agent = createAgent({
+        name: "a",
+        system: "s",
+        model,
+        tools: [stateTool],
+      });
+      return createNetwork({
+        name: "n",
+        agents: [agent],
+        defaultModel: model,
+        maxIter: 1,
+        router: () => agent,
+      });
+    };
+
+    mockedGetStepTools.mockResolvedValue(rec.step as any);
+    const r1 = await makeRun().run("hi", { state: createState({}) });
+    expect(bodyRuns).toBe(1);
+    expect(r1.state.data.plan).toBe("step-1");
+
+    // Replay: fresh state + same cache. The body must NOT re-run, yet the state
+    // delta is restored from the memoized step payload (req. #2 — mutations are
+    // not lost to memoization).
+    rec.reset();
+    const r2 = await makeRun().run("hi", { state: createState({}) });
+    expect(bodyRuns).toBe(1);
+    expect(rec.executed).toEqual([]);
+    expect(r2.state.data.plan).toBe("step-1");
+  });
+
+  it("runs a manualStep tool inline with the LIVE step (not framework-wrapped)", async () => {
+    const rec = makeReplayStep();
+    let seenStep: unknown = "sentinel";
+
+    const manualTool = createTool({
+      name: "hitl",
+      description: "manages its own steps",
+      parameters: z.object({}),
+      manualStep: true,
+      handler: async (_input, { step }) => {
+        seenStep = step;
+        // It opens its own checkpoint — only possible with a live step (would be
+        // undefined if the framework had wrapped this handler).
+        return await step!.run("hitl/inner", async () => "done");
+      },
+    });
+    const model = createMockModel({
+      toolCalls: [{ toolCallId: "c1", toolName: "hitl", args: {} }],
+    });
+    const agent = createAgent({
+      name: "a",
+      system: "s",
+      model,
+      tools: [manualTool],
+    });
+    const network = createNetwork({
+      name: "n",
+      agents: [agent],
+      defaultModel: model,
+      maxIter: 1,
+      router: () => agent,
+    });
+
+    mockedGetStepTools.mockResolvedValue(rec.step as any);
+    const r = await network.run("hi", { state: createState({}) });
+
+    expect(seenStep).toBe(rec.step); // got the live step
+    expect(rec.ids).toContain("hitl/inner"); // its own checkpoint ran
+    expect(rec.ids).not.toContain("a/tool/hitl/0"); // NOT framework-wrapped
+    expect(toolOutput(r)?.data).toBe("done");
+  });
+
+  it("falls back to inline execution when there is no step (non-Inngest) without crashing", async () => {
+    mockedGetStepTools.mockResolvedValue(undefined as any);
+    let ran = 0;
+    const tool = createTool({
+      name: "noop2",
+      description: "x",
+      parameters: z.object({}),
+      handler: async () => {
+        ran++;
+        return "ok";
+      },
+    });
+    const model = createMockModel({
+      toolCalls: [{ toolCallId: "c1", toolName: "noop2", args: {} }],
+    });
+    const agent = createAgent({ name: "a", system: "s", model, tools: [tool] });
+    const network = createNetwork({
+      name: "n",
+      agents: [agent],
+      defaultModel: model,
+      maxIter: 1,
+      router: () => agent,
+    });
+
+    const r = await network.run("hi", { state: createState({}) });
+    expect(ran).toBe(1);
+    expect(toolOutput(r)?.data).toBe("ok");
   });
 });
