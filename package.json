@@ -1,0 +1,66 @@
+{
+  "name": "@inngest/agent-kit",
+  "version": "0.13.3-alpha.4",
+  "description": "AgentKit is a framework for creating and orchestrating AI agents and AI workflows",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {},
+  "files": [
+    "dist"
+  ],
+  "homepage": "https://github.com/inngest/agent-kit",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inngest/agent-kit.git"
+  },
+  "keywords": [
+    "inngest",
+    "agent",
+    "ai"
+  ],
+  "author": "Inngest Inc. <hello@inngest.com>",
+  "license": "Apache-2.0",
+  "typings": "dist/index.d.ts",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js",
+      "require": "./dist/server.cjs"
+    }
+  },
+  "dependencies": {
+    "@dmitryrechkin/json-schema-to-zod": "^1.0.0",
+    "ai": "^6.0.0",
+    "@modelcontextprotocol/sdk": "^1.11.2",
+    "eventsource": "^3.0.2",
+    "express": "^4.21.1",
+    "xxhashjs": "^0.2.2"
+  },
+  "peerDependencies": {
+    "inngest": ">=3.43.1",
+    "zod": ">=4 <5"
+  },
+  "packageManager": "pnpm@9.14.2",
+  "pnpm": {
+    "overrides": {
+      "esbuild@<=0.24.2": ">=0.25.0",
+      "vite@>=5.0.0 <5.4.15": ">=5.4.15",
+      "vite@>=5.0.0 <5.4.16": ">=5.4.16",
+      "vite@>=5.0.0 <5.4.18": ">=5.4.18",
+      "vite@>=5.0.0 <=5.4.18": ">=5.4.19",
+      "vite@>=5.0.0 <5.4.17": ">=5.4.17",
+      "brace-expansion@>=1.0.0 <=1.1.11": ">=1.1.12",
+      "brace-expansion@>=2.0.0 <=2.0.1": ">=2.0.2",
+      "@eslint/plugin-kit@<0.3.4": ">=0.3.4"
+    }
+  }
+}

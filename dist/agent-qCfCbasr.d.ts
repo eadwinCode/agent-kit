@@ -1,0 +1,1598 @@
+import { LanguageModel } from 'ai';
+import { InngestFunction, GetStepTools, Inngest } from 'inngest';
+import { ZodType, z, output } from 'zod';
+import { AsyncContext } from 'inngest/experimental';
+import { StreamableHTTPReconnectionOptions } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+
+type Message = TextMessage | ToolCallMessage | ToolResultMessage | ReasoningMessage;
+/**
+ * UserMessage represents a rich message object from a client that can contain
+ * not just the message content but also client-side state, timestamps, and
+ * optional system prompts for a single turn.
+ */
+interface UserMessage {
+    /** The canonical, client-generated unique identifier for the message. */
+    id: string;
+    /** The text content of the user's message. */
+    content: string;
+    /** The role is always 'user' to accurately represent the source. */
+    role: "user";
+    /** Optional, client-provided state snapshot to be persisted. */
+    state?: Record<string, unknown>;
+    /** Optional, client-provided timestamp for optimistic UI ordering. */
+    clientTimestamp?: Date | string;
+    /** Optional, one-time system prompt to prepend for this specific turn. */
+    systemPrompt?: string;
+}
+/**
+ * TextMessage represents plain text messages in the chat history, eg. the user's prompt or
+ * an assistant's reply.
+ */
+interface TextMessage {
+    type: "text";
+    role: "system" | "user" | "assistant";
+    content: string | Array<TextContent | ImageContent>;
+    stop_reason?: "tool" | "stop";
+}
+/**
+ * ReasoningMessage represents an assistant "thinking" / reasoning turn emitted by
+ * models that expose chain-of-thought (e.g. Anthropic extended thinking, OpenAI
+ * reasoning models).
+ *
+ * It is kept as a first-class message so that:
+ *   1. consumers can render the model's reasoning, and
+ *   2. it round-trips back to the provider. Anthropic in particular requires the
+ *      original thinking block (with its `signature`) to be replayed *before* the
+ *      tool-use block within the same assistant turn, otherwise a follow-up
+ *      tool-result request is rejected.
+ *
+ * `content` is the concatenated reasoning text (convenient for rendering).
+ * `details` carries the structured blocks (text + signature, or redacted data)
+ * exactly as returned by the model so signatures survive the round-trip.
+ */
+interface ReasoningMessage {
+    type: "reasoning";
+    role: "assistant";
+    content: string;
+    /** Signature of the primary reasoning block, if the provider returned one. */
+    signature?: string;
+    /** Full structured reasoning blocks, preserved for provider round-tripping. */
+    details?: ReasoningDetail[];
+    stop_reason?: "tool" | "stop";
+}
+/**
+ * ReasoningDetail mirrors the AI SDK `ReasoningDetail` shape: either a thinking
+ * block (text, optionally signed) or a redacted thinking block (opaque data).
+ */
+type ReasoningDetail = {
+    type: "text";
+    text: string;
+    signature?: string;
+} | {
+    type: "redacted";
+    data: string;
+};
+/**
+ * ToolCallMessage represents a message for a tool call.
+ */
+interface ToolCallMessage {
+    type: "tool_call";
+    role: "user" | "assistant";
+    tools: ToolMessage[];
+    stop_reason: "tool";
+}
+/**
+ * ToolResultMessage represents the output of a tool call.
+ */
+interface ToolResultMessage {
+    type: "tool_result";
+    role: "tool_result";
+    tool: ToolMessage;
+    content: unknown;
+    stop_reason: "tool";
+}
+interface TextContent {
+    type: "text";
+    text: string;
+}
+/**
+ * ImageContent represents an image part within a message (e.g. a user-supplied
+ * image) so vision-capable models can see it. `image` is either an http(s)/data
+ * URL or a raw base64 string (in which case set `mimeType`).
+ */
+interface ImageContent {
+    type: "image";
+    image: string;
+    mimeType?: string;
+}
+interface ToolMessage {
+    type: "tool";
+    id: string;
+    name: string;
+    input: Record<string, unknown>;
+}
+/**
+ * AgentResult represents a single iteration of an agent call in the router
+ * loop.  This includes the input prompt, the resulting messages, and any
+ * tool call results.
+ *
+ * This is used in several ways:
+ *
+ *   1. To track the results of a given agent, including output and tool results.
+ *   2. To construct chat history for each agent call in a network loop.
+ *   3. To track what was sent to a given agent at any time.
+ *
+ *
+ * ## Chat history and agent inputs in Networks.
+ *
+ * Networks call agents in a loop.  Each iteration of the loop adds to conversation
+ * history.
+ *
+ * We construct the agent input by:
+ *
+ *   1. Taking the system prompt from an agent
+ *   2. Adding the user request as a message
+ *   3. If provided, adding the agent's assistant message.
+ *
+ * These two or three messages are ALWAYS the start of an agent's request:
+ * [system, input, ?assistant].
+ *
+ * We then iterate through the state's AgentResult objects, adding the output
+ * and tool calls from each result to chat history.
+ *
+ */
+declare class AgentResult {
+    #private;
+    /**
+     * agentName represents the name of the agent which created this result.
+     */
+    agentName: string;
+    /**
+     * output represents the parsed output from the inference call.  This may be blank
+     * if the agent responds with tool calls only.
+     */
+    output: Message[];
+    /**
+     * toolCalls represents output from any tools called by the agent.
+     */
+    toolCalls: ToolResultMessage[];
+    /**
+     * createdAt represents when this message was created.
+     */
+    createdAt: Date;
+    /**
+     * prompt represents the input instructions - without any additional history
+     * - as created by the agent.  This includes the system prompt, the user input,
+     * and any initial agent assistant message.
+     *
+     * This is ONLY used for tracking and debugging purposes, and is entirely optional.
+     * It is not used to construct messages for future calls, and only serves to see
+     * what was sent to the agent in this specific request.
+     */
+    prompt?: Message[] | undefined;
+    /**
+     * history represents the history sent to the inference call, appended to the
+     * prompt to form a complete conversation log.
+     *
+     * This is ONLY used for tracking and debugging purposes, and is entirely optional.
+     * It is not used to construct messages for future calls, and only serves to see
+     * what was sent to the agent in this specific request.
+     */
+    history?: Message[] | undefined;
+    /**
+     * raw represents the raw API response from the call.  This is a JSON
+     * string, and the format depends on the agent's model.
+     */
+    raw?: string | undefined;
+    /**
+     * id represents the unique identifier for this agent result.
+     * This is used for persistence and message identification.
+     */
+    id?: string | undefined;
+    constructor(
+    /**
+     * agentName represents the name of the agent which created this result.
+     */
+    agentName: string, 
+    /**
+     * output represents the parsed output from the inference call.  This may be blank
+     * if the agent responds with tool calls only.
+     */
+    output: Message[], 
+    /**
+     * toolCalls represents output from any tools called by the agent.
+     */
+    toolCalls: ToolResultMessage[], 
+    /**
+     * createdAt represents when this message was created.
+     */
+    createdAt: Date, 
+    /**
+     * prompt represents the input instructions - without any additional history
+     * - as created by the agent.  This includes the system prompt, the user input,
+     * and any initial agent assistant message.
+     *
+     * This is ONLY used for tracking and debugging purposes, and is entirely optional.
+     * It is not used to construct messages for future calls, and only serves to see
+     * what was sent to the agent in this specific request.
+     */
+    prompt?: Message[] | undefined, 
+    /**
+     * history represents the history sent to the inference call, appended to the
+     * prompt to form a complete conversation log.
+     *
+     * This is ONLY used for tracking and debugging purposes, and is entirely optional.
+     * It is not used to construct messages for future calls, and only serves to see
+     * what was sent to the agent in this specific request.
+     */
+    history?: Message[] | undefined, 
+    /**
+     * raw represents the raw API response from the call.  This is a JSON
+     * string, and the format depends on the agent's model.
+     */
+    raw?: string | undefined, 
+    /**
+     * id represents the unique identifier for this agent result.
+     * This is used for persistence and message identification.
+     */
+    id?: string | undefined);
+    /**
+     * export returns all fields necessary to store the AgentResult for future use.
+     */
+    export(): {
+        agentName: string;
+        output: Message[];
+        toolCalls: ToolResultMessage[];
+        createdAt: Date;
+        checksum: string;
+    };
+    /**
+     * checksum is a unique ID for this result.
+     *
+     * It is generated by taking a checksum of the message output and the created at date.
+     * This allows you to dedupe items when saving conversation history.
+     */
+    get checksum(): string;
+}
+
+type StateData = Record<string, any>;
+/**
+ * createState creates new state for a given network.  You can add any
+ * initial state data for routing, plus provide an object of previous
+ * AgentResult objects or conversation history within Message.
+ *
+ * To store chat history, we strongly recommend serializing and storing
+ * the list of AgentResult items from state after each network run.
+ *
+ * You can then load and pass those messages into this constructor to
+ * create conversational memory.
+ *
+ * You can optionally pass a list of Message types in this constructor.
+ * Any messages in this State will always be added after the system and
+ * user prompt.
+ */
+declare const createState: <T extends StateData>(initialState?: T, opts?: Omit<State.Constructor<T>, "data">) => State<T>;
+/**
+ * State stores state (history) for a given network of agents.  The state
+ * includes a stack of all AgentResult items and strongly-typed data
+ * modified via tool calls.
+ *
+ * From this, the chat history can be reconstructed (and manipulated) for each
+ * subsequent agentic call.
+ */
+declare class State<T extends StateData> {
+    #private;
+    data: T;
+    threadId?: string;
+    private _data;
+    /**
+     * _results stores all agent results.  This is internal and is used to
+     * track each call made in the network loop.
+     */
+    private _results;
+    /**
+     * _messages stores a linear history of ALL messages from the current
+     * network.  You can seed this with initial messages to create conversation
+     * history.
+     */
+    private _messages;
+    constructor({ data, messages, threadId, results, }?: State.Constructor<T>);
+    /**
+     * Results returns a new array containing all past inference results in the
+     * network. This array is safe to modify.
+     */
+    get results(): AgentResult[];
+    /**
+     * Replaces all results with the provided array
+     * used when loading initial results from history.get()
+     */
+    setResults(results: AgentResult[]): void;
+    /**
+     * Returns a slice of results from the given start index
+     * used when saving results to a database via history.appendResults()
+     */
+    getResultsFrom(startIndex: number): AgentResult[];
+    /**
+     * Messages returns a new array containing all initial messages that were
+     * provided to the constructor. This array is safe to modify.
+     */
+    get messages(): Message[];
+    /**
+     * formatHistory returns the memory used for agentic calls based off of prior
+     * agentic calls.
+     *
+     * This is used to format the current State as a conversation log when
+     * calling an individual agent.
+     *
+     */
+    formatHistory(formatter?: (r: AgentResult) => Message[]): Message[];
+    /**
+     * appendResult appends a given result to the current state.  This
+     * is called by the network after each iteration.
+     */
+    appendResult(call: AgentResult): void;
+    /**
+     * Returns the next durable tool-call index for this run (see
+     * {@link #durableToolCallIndex}). Used only by the network to build
+     * replay-stable tool-step ids; not part of the public data model.
+     */
+    nextDurableToolCallIndex(): number;
+    /**
+     * Re-applies a typed-data snapshot captured INSIDE a durable tool step.
+     *
+     * A tool that mutates `state.data` does so inside its memoized `step.run`; on
+     * replay that body is skipped, so the live mutation is absent. The network
+     * memoizes the post-handler data snapshot and calls this OUTSIDE the step on
+     * every execution to restore it. Mutates the existing `data` object in place
+     * (full replace: keys absent from `data` are removed) so references stay valid
+     * and the proxy keeps intercepting writes.
+     */
+    importData(data: T): void;
+    /**
+     * clone allows you to safely clone the state.
+     */
+    clone(): State<T>;
+    /**
+     * @deprecated Fully type state instead of using the KV.
+     */
+    kv: {
+        set: <T = any>(key: string, value: T) => void;
+        get: <T = any>(key: string) => T | undefined;
+        delete: (key: string) => boolean;
+        has: (key: string) => boolean;
+        all: () => Record<string, unknown>;
+    };
+}
+declare namespace State {
+    type Constructor<T extends StateData> = {
+        /**
+         * Data represents initial typed data
+         */
+        data?: T;
+        /**
+         * Results represents any previous AgentResult entries for
+         * conversation history and memory.
+         */
+        results?: AgentResult[];
+        /**
+         * Messages allows you to pas custom messages which will be appended
+         * after the system and user message to each agent.
+         */
+        messages?: Message[];
+        /**
+         * threadId is the unique identifier for a conversation thread.
+         */
+        threadId?: string;
+    };
+}
+
+type MaybePromise<T> = T | Promise<T>;
+/**
+ * AnyZodType is a type alias for any Zod type.
+ *
+ * It specifically matches the typing used for the OpenAI JSON schema typings,
+ * which do not use the standardized `z.ZodTypeAny` type.
+ *
+ * Not that using this type directly can break between any versions of Zod
+ * (including minor and patch versions). It may be pertinent to maintain a
+ * custom type which matches many versions in the future.
+ */
+type AnyZodType = ZodType;
+/**
+ * Given an unknown value, return a string representation of the error if it is
+ * an error, otherwise return the stringified value.
+ */
+declare const stringifyError: (e: unknown) => string;
+/**
+ * Attempts to retrieve the step tools from the async context.
+ */
+declare const getStepTools: () => Promise<AsyncContext["ctx"]["step"] | undefined>;
+declare const isInngestFn: (fn: unknown) => fn is InngestFunction.Any;
+declare const getInngestFnInput: (fn: InngestFunction.Any) => AnyZodType | undefined;
+
+/**
+ * History configuration for managing conversation history in agents and networks.
+ *
+ * Provides hooks for creating threads, loading existing conversation history,
+ * and persisting new results to storage. This enables persistent conversations
+ * that can span multiple runs while maintaining context.
+ *
+ * @example
+ * ```typescript
+ * const history: HistoryConfig<MyStateType> = {
+ *   createThread: async ({ state, input }) => {
+ *     const threadId = await db.createThread(state.userId);
+ *     return { threadId };
+ *   },
+ *   get: async ({ threadId }) => {
+ *     return await db.getMessages(threadId);
+ *   },
+ *   appendResults: async ({ threadId, newResults, userMessage }) => {
+ *     // Save user message first (if provided)
+ *     if (userMessage) {
+ *       await db.saveUserMessage(threadId, userMessage);
+ *     }
+ *     // Then save agent results
+ *     await db.saveMessages(threadId, newResults);
+ *   }
+ * };
+ * ```
+ */
+interface HistoryConfig<T extends StateData> {
+    /**
+     * createThread is called to create a new conversation thread if no
+     * threadId is present in the state. It should return the new threadId.
+     *
+     * This hook is called during the initialization phase before any agents run,
+     * allowing you to create a new conversation thread in your database and
+     * return its identifier.
+     *
+     * @param ctx - Context containing state, input, and execution tools
+     * @returns Promise resolving to an object with the new threadId
+     */
+    createThread?: (ctx: History.CreateThreadContext<T>) => MaybePromise<{
+        threadId: string;
+    }>;
+    /**
+     * get is called to load initial conversation history.
+     * If provided, any results passed to createState will be ignored in favor
+     * of the results returned by this function.
+     *
+     * This hook is called after thread initialization but before any agents run,
+     * allowing you to hydrate the conversation state with previous messages
+     * and context from your database.
+     *
+     * @param ctx - Context containing state, threadId, and execution tools
+     * @returns Promise resolving to an array of previous AgentResults
+     */
+    get?: (ctx: History.Context<T>) => Promise<AgentResult[]>;
+    /**
+     * appendUserMessage is called at the beginning of a run to persist the
+     * user's message immediately. This ensures user intent is captured even
+     * if the agent run fails, enabling a "regenerate" workflow.
+     *
+     * @param ctx - Context containing the user message with its canonical ID
+     * @returns Promise that resolves when the message is successfully saved
+     */
+    appendUserMessage?: (ctx: History.Context<T> & {
+        userMessage: {
+            id: string;
+            content: string;
+            role: "user";
+            timestamp: Date;
+        };
+    }) => Promise<void>;
+    /**
+     * appendResults is called to save new agent results to storage after a
+     * network or agent run completes. This receives only the new results that
+     * were generated during the current run.
+     *
+     * @param ctx - Context containing state, threadId, step, and new agent results
+     * @returns Promise that resolves when results are successfully saved
+     */
+    appendResults?: (ctx: History.Context<T> & {
+        newResults: AgentResult[];
+    }) => Promise<void>;
+}
+declare namespace History {
+    /**
+     * Context provides access to the current state and execution context
+     * when history hooks are called.
+     *
+     * This context is passed to both `get` and `appendResults` hooks,
+     * providing all necessary information for loading and saving conversation data.
+     */
+    type Context<T extends StateData> = {
+        /** The current state containing user data and conversation context */
+        state: State<T>;
+        /** The network run instance for accessing network-level information */
+        network: NetworkRun<T>;
+        /** Inngest step tools for durable execution (when running in Inngest context) */
+        step?: GetStepTools<Inngest.Any>;
+        /** The user's input for this conversation turn */
+        input: string;
+        /** The thread identifier for this conversation (available for get/appendResults hooks) */
+        threadId?: string;
+    };
+    /**
+     * CreateThreadContext provides access to the current state and execution context
+     * when the createThread hook is called. Note that threadId is not included since
+     * that's what we're creating, and network is optional since createThread can be
+     * called from both network and standalone agent contexts.
+     *
+     * This context is passed to the `createThread` hook when a new conversation
+     * thread needs to be created.
+     */
+    type CreateThreadContext<T extends StateData> = {
+        /** The current state containing user data */
+        state: State<T>;
+        /** The user's input for this conversation turn */
+        input: string;
+        /** Inngest step tools for durable execution (when running in Inngest context) */
+        step?: GetStepTools<Inngest.Any>;
+        /** The network run instance (optional - may not be available in standalone agent context) */
+        network?: NetworkRun<T>;
+    };
+    /**
+     * Config is an alias for HistoryConfig for consistency with other namespaces
+     */
+    type Config<T extends StateData> = HistoryConfig<T>;
+}
+/**
+ * Base configuration for thread operation functions.
+ *
+ * Contains the common parameters needed by history utility functions
+ * to perform thread operations like initialization, loading, and saving.
+ */
+type ThreadOperationConfig<T extends StateData> = {
+    /** The current state containing conversation data and user context */
+    state: State<T>;
+    /** History configuration with hooks for thread operations */
+    history?: HistoryConfig<T>;
+    /** The user's input for this conversation turn */
+    input: string;
+    /** The network run instance (optional for standalone agent contexts) */
+    network?: NetworkRun<T>;
+};
+/**
+ * Configuration for saveThreadToStorage function - extends base config with initialResultCount.
+ *
+ * The initialResultCount is used to determine which results are "new" and should be
+ * persisted, versus which results were loaded from history and should not be duplicated.
+ */
+type SaveThreadToStorageConfig<T extends StateData> = ThreadOperationConfig<T> & {
+    /** The number of results that existed before this run started (used to identify new results) */
+    initialResultCount: number;
+};
+/**
+ * Handles thread initialization logic - creates new threads or auto-generates threadIds.
+ *
+ * This function is called at the beginning of agent/network runs to ensure a valid
+ * thread context exists. It will:
+ * 1. Create a new thread using the `createThread` hook if no threadId exists
+ * 2. Auto-generate a threadId if `history.get` is configured but no threadId was provided
+ * 3. Do nothing if a threadId already exists or no history configuration is provided
+ *
+ * @param config - Configuration containing state, history, input, and optional network
+ * @returns Promise that resolves when thread initialization is complete
+ *
+ * @example
+ * ```typescript
+ * await initializeThread({
+ *   state: myState,
+ *   history: myHistoryConfig,
+ *   input: userInput,
+ *   network: networkRun
+ * });
+ * console.log(myState.threadId); // Now has a valid threadId
+ * ```
+ */
+declare function initializeThread<T extends StateData>(config: ThreadOperationConfig<T>): Promise<void>;
+/**
+ * Loads conversation history from storage if conditions are met.
+ *
+ * This function retrieves previous conversation messages from storage and populates
+ * the state with historical context. It will only load history if:
+ * 1. A history.get hook is configured
+ * 2. A threadId exists in the state
+ * 3. The state doesn't already have results OR messages (to avoid overwriting client-provided data)
+ *
+ * When either results or messages are provided to createState, this enables client-authoritative
+ * mode where the client maintains conversation state and sends it with each request.
+ *
+ * @param config - Configuration containing state, history, input, and optional network
+ * @returns Promise that resolves when history loading is complete
+ *
+ * @example
+ * ```typescript
+ * await loadThreadFromStorage({
+ *   state: myState,
+ *   history: myHistoryConfig,
+ *   input: userInput,
+ *   network: networkRun
+ * });
+ * console.log(myState.results); // Now contains previous conversation messages
+ * ```
+ */
+declare function loadThreadFromStorage<T extends StateData>(config: ThreadOperationConfig<T>): Promise<void>;
+/**
+ * Saves new conversation results to storage via history.appendResults.
+ *
+ * This function persists only the new AgentResults that were generated during
+ * the current run, excluding any historical results that were loaded via `loadThreadFromStorage`.
+ * This prevents duplication of messages in storage. Additionally, it passes the user's
+ * input message to enable complete conversation history persistence.
+ *
+ * @param config - Configuration containing state, history, input, network, and initialResultCount
+ * @returns Promise that resolves when results are successfully saved
+ *
+ * @example
+ * ```typescript
+ * const initialCount = state.results.length;
+ * // ... run agents that add new results ...
+ * await saveThreadToStorage({
+ *   state: myState,
+ *   history: myHistoryConfig,
+ *   input: userInput,
+ *   initialResultCount: initialCount,
+ *   network: networkRun
+ * });
+ * ```
+ */
+declare function saveThreadToStorage<T extends StateData>(config: SaveThreadToStorageConfig<T>): Promise<void>;
+/** Deterministic step id for the end-of-run save. */
+declare const FINAL_APPEND_STEP_ID = "agent-kit/history/append-results/final";
+/**
+ * Deterministic step id for an incremental (per-iteration) save. `key` MUST be a
+ * replay-stable value such as the network's iteration counter — NEVER a value
+ * derived from `AgentResult.checksum`, a timestamp, a random id, or a UUID, all
+ * of which change between Inngest re-executions and cause
+ * `Could not find step "<hash>" to run`.
+ */
+declare function incrementalAppendStepId(key: string | number): string;
+/**
+ * Persist `newResults` via `history.appendResults`, wrapped in a single durable
+ * `step.run` under the caller-provided, deterministic `stepId`.
+ *
+ * The step is owned HERE (not inside the consumer's hook) and `step` is passed to
+ * the hook as `undefined`, so the hook body runs inline within this one
+ * checkpoint. This guarantees:
+ *   1. the persistence step id is replay-stable (it is `stepId`, e.g. an
+ *      iteration counter — never a checksum/timestamp), so Inngest can always
+ *      find the step on re-execution; and
+ *   2. the write is memoized after it first succeeds, so re-executions don't
+ *      duplicate it (independent of the consumer's own idempotency).
+ *
+ * Safe to call repeatedly with the SAME `stepId` and content across a run — the
+ * memoized step makes extra calls free.
+ */
+declare function persistResults<T extends StateData>(config: ThreadOperationConfig<T>, newResults: AgentResult[], stepId: string): Promise<void>;
+
+/**
+ * AgentKit Streaming System
+ *
+ * This module provides automatic event streaming capabilities for AgentKit networks and agents.
+ * It defines the event schema that matches the useAgent hook expectations and provides
+ * streaming context management for transparent event publishing.
+ */
+
+/**
+ * Base interface for all streaming events
+ */
+interface AgentMessageChunk {
+    /** The event name (e.g., "run.started", "part.created") */
+    event: string;
+    /** Event-specific data payload */
+    data: Record<string, unknown>;
+    /** When the event occurred (Unix timestamp) */
+    timestamp: number;
+    /** Monotonic sequence number for ordering events */
+    sequenceNumber: number;
+    /** Suggested Inngest step ID for optional developer use */
+    id: string;
+}
+/**
+ * Canonical runtime schema for AgentKit streaming events.
+ * Matches the AgentMessageChunk interface above.
+ */
+declare const AgentMessageChunkSchema: z.ZodObject<{
+    event: z.ZodString;
+    data: z.ZodRecord<z.ZodString, z.ZodAny>;
+    timestamp: z.ZodNumber;
+    sequenceNumber: z.ZodNumber;
+    id: z.ZodString;
+}, z.core.$strip>;
+interface RunStartedEvent extends AgentMessageChunk {
+    event: "run.started";
+    data: {
+        runId: string;
+        parentRunId?: string;
+        scope: "network" | "agent";
+        name: string;
+        messageId?: string;
+        threadId?: string;
+        metadata?: Record<string, unknown>;
+    };
+}
+interface RunCompletedEvent extends AgentMessageChunk {
+    event: "run.completed";
+    data: {
+        runId: string;
+        scope: "network" | "agent";
+        name: string;
+        messageId?: string;
+        result?: unknown;
+        usage?: {
+            promptTokens: number;
+            completionTokens: number;
+            totalTokens: number;
+            thinkingTokens?: number;
+        };
+    };
+}
+interface RunFailedEvent extends AgentMessageChunk {
+    event: "run.failed";
+    data: {
+        runId: string;
+        scope: "network" | "agent";
+        name: string;
+        messageId?: string;
+        error: string;
+        recoverable: boolean;
+        metadata?: Record<string, unknown>;
+    };
+}
+interface RunInterruptedEvent extends AgentMessageChunk {
+    event: "run.interrupted";
+    data: {
+        runId: string;
+        scope: "network" | "agent";
+        name: string;
+        reason: "max_tokens" | "user_cancellation" | "timeout" | "other";
+        metadata?: Record<string, unknown>;
+    };
+}
+interface StepStartedEvent extends AgentMessageChunk {
+    event: "step.started";
+    data: {
+        stepId: string;
+        runId: string;
+        description?: string;
+        metadata?: Record<string, unknown>;
+    };
+}
+interface StepCompletedEvent extends AgentMessageChunk {
+    event: "step.completed";
+    data: {
+        stepId: string;
+        runId: string;
+        result?: unknown;
+        duration?: number;
+    };
+}
+interface StepFailedEvent extends AgentMessageChunk {
+    event: "step.failed";
+    data: {
+        stepId: string;
+        runId: string;
+        error: string;
+        recoverable: boolean;
+        retryAttempt?: number;
+    };
+}
+interface PartCreatedEvent extends AgentMessageChunk {
+    event: "part.created";
+    data: {
+        partId: string;
+        runId: string;
+        messageId: string;
+        type: "text" | "tool-call" | "tool-output" | "reasoning" | "data" | "file" | "refusal";
+        metadata?: {
+            toolName?: string;
+            dataType?: string;
+            mimeType?: string;
+            agentName?: string;
+        };
+    };
+}
+interface PartCompletedEvent extends AgentMessageChunk {
+    event: "part.completed";
+    data: {
+        partId: string;
+        runId: string;
+        messageId: string;
+        type: string;
+        finalContent: unknown;
+        metadata?: {
+            toolName?: string;
+            dataType?: string;
+            mimeType?: string;
+            agentName?: string;
+        };
+    };
+}
+interface PartFailedEvent extends AgentMessageChunk {
+    event: "part.failed";
+    data: {
+        partId: string;
+        runId: string;
+        messageId: string;
+        type: string;
+        error: string;
+        recoverable: boolean;
+    };
+}
+interface TextDeltaEvent extends AgentMessageChunk {
+    event: "text.delta";
+    data: {
+        partId: string;
+        messageId: string;
+        delta: string;
+    };
+}
+interface ToolCallArgumentsDeltaEvent extends AgentMessageChunk {
+    event: "tool_call.arguments.delta";
+    data: {
+        partId: string;
+        messageId: string;
+        delta: string;
+        toolName?: string;
+    };
+}
+interface ToolCallOutputDeltaEvent extends AgentMessageChunk {
+    event: "tool_call.output.delta";
+    data: {
+        partId: string;
+        messageId: string;
+        delta: string;
+    };
+}
+interface ReasoningDeltaEvent extends AgentMessageChunk {
+    event: "reasoning.delta";
+    data: {
+        partId: string;
+        messageId: string;
+        delta: string;
+    };
+}
+interface DataDeltaEvent extends AgentMessageChunk {
+    event: "data.delta";
+    data: {
+        partId: string;
+        messageId: string;
+        delta: unknown;
+    };
+}
+interface HitlRequestedEvent extends AgentMessageChunk {
+    event: "hitl.requested";
+    data: {
+        requestId: string;
+        runId: string;
+        toolCalls: Array<{
+            partId: string;
+            toolName: string;
+            toolInput: unknown;
+        }>;
+        expiresAt: string;
+        metadata?: {
+            reason?: string;
+            riskLevel?: "low" | "medium" | "high";
+        };
+    };
+}
+interface HitlResolvedEvent extends AgentMessageChunk {
+    event: "hitl.resolved";
+    data: {
+        requestId: string;
+        runId: string;
+        resolution: "approved" | "denied" | "partial";
+        approvedTools?: string[];
+        reason?: string;
+        resolvedBy: string;
+        resolvedAt: string;
+    };
+}
+interface UsageUpdatedEvent extends AgentMessageChunk {
+    event: "usage.updated";
+    data: {
+        runId: string;
+        usage: {
+            promptTokens: number;
+            completionTokens: number;
+            totalTokens: number;
+            thinkingTokens?: number;
+        };
+        cumulative: boolean;
+    };
+}
+interface MetadataUpdatedEvent extends AgentMessageChunk {
+    event: "metadata.updated";
+    data: {
+        runId: string;
+        metadata: Record<string, unknown>;
+        type: "model_switch" | "parameter_change" | "context_update" | "other";
+    };
+}
+interface StreamEndedEvent extends AgentMessageChunk {
+    event: "stream.ended";
+    data: {
+        scope: "network" | "agent";
+        messageId?: string;
+    };
+}
+interface GenericErrorEvent extends AgentMessageChunk {
+    event: "error";
+    data: {
+        error: string;
+        agentId?: string;
+        recoverable?: boolean;
+        messageId?: string;
+    };
+}
+/**
+ * A simple sequence counter that can be shared between streaming contexts
+ * to ensure events are numbered correctly across related contexts
+ */
+declare class SequenceCounter {
+    private value;
+    getNext(): number;
+    current(): number;
+}
+/**
+ * Default size (in characters) of a simulated streaming delta. Chosen to keep
+ * the typing animation smooth while drastically cutting the number of
+ * `publish()` calls vs. fine-grained chunking. See {@link StreamingConfig}.
+ */
+declare const DEFAULT_CHUNK_SIZE = 256;
+/**
+ * Default ceiling on the number of simulated delta events emitted per streamed
+ * part. Bounds `publish()` volume regardless of output length: a very long part
+ * is split into at most this many (coarser) chunks rather than hundreds.
+ */
+declare const DEFAULT_MAX_CHUNKS_PER_MESSAGE = 24;
+/**
+ * Public-facing streaming configuration interface
+ */
+interface StreamingConfig {
+    /** Function to publish events to the client */
+    publish: (chunk: AgentMessageChunk) => Promise<void>;
+    /** When true, emit simulated chunked deltas; otherwise emit a single delta */
+    simulateChunking?: boolean;
+    /**
+     * Size (characters) of each simulated `*.delta` chunk when
+     * `simulateChunking` is on. Larger → fewer `publish()` calls (each publish is
+     * a durable Inngest step for `@inngest/realtime`'s function-scoped publish, so
+     * this directly affects the step budget). Defaults to {@link DEFAULT_CHUNK_SIZE}.
+     */
+    chunkSize?: number;
+    /**
+     * Hard cap on the number of simulated delta events per streamed part. When a
+     * part is longer than `chunkSize * maxChunksPerMessage`, the chunk size is
+     * grown so the part still emits at most this many deltas — bounding publish
+     * volume (and step usage) regardless of output length. Defaults to
+     * {@link DEFAULT_MAX_CHUNKS_PER_MESSAGE}; set to 0 to disable the cap.
+     */
+    maxChunksPerMessage?: number;
+}
+/**
+ * Internal streaming context that manages state and sequence numbers
+ */
+declare class StreamingContext {
+    private publish;
+    private sequenceCounter;
+    private debug;
+    private simulateChunking;
+    private chunkSize;
+    private maxChunksPerMessage;
+    readonly runId: string;
+    readonly parentRunId?: string;
+    readonly messageId: string;
+    readonly threadId?: string;
+    readonly userId?: string;
+    readonly scope: "network" | "agent";
+    constructor(config: {
+        publish: (chunk: AgentMessageChunk) => Promise<void>;
+        runId: string;
+        parentRunId?: string;
+        messageId: string;
+        threadId?: string;
+        userId?: string;
+        scope: "network" | "agent";
+        sequenceCounter?: SequenceCounter;
+        debug?: boolean;
+        simulateChunking?: boolean;
+        chunkSize?: number;
+        maxChunksPerMessage?: number;
+    });
+    /**
+     * Create a child streaming context for agent runs within network runs
+     */
+    createChildContext(agentRunId: string): StreamingContext;
+    /**
+     * Create a context with different messageId but shared sequence counter
+     */
+    createContextWithSharedSequence(config: {
+        runId: string;
+        messageId: string;
+        scope: "network" | "agent";
+    }): StreamingContext;
+    /**
+     * Extract context information from network state
+     */
+    static fromNetworkState(networkState: State<StateData>, config: {
+        publish: (chunk: AgentMessageChunk) => Promise<void>;
+        runId: string;
+        messageId: string;
+        scope: "network" | "agent";
+        debug?: boolean;
+        simulateChunking?: boolean;
+        chunkSize?: number;
+        maxChunksPerMessage?: number;
+    }): StreamingContext;
+    /**
+     * Publish an event with automatic sequence numbering.
+     * Provides a stepId in the chunk for optional Inngest step wrapping by the developer.
+     */
+    publishEvent(event: Omit<AgentMessageChunk, "timestamp" | "sequenceNumber" | "id">): Promise<void>;
+    /**
+     * Generate intelligent step IDs for streaming events
+     */
+    private generateStreamingStepId;
+    /**
+     * Generate a unique part ID for this streaming context
+     * OpenAI requires tool call IDs to be ≤ 40 characters
+     */
+    generatePartId(): string;
+    /**
+     * Generate a unique step ID for this streaming context
+     */
+    generateStepId(baseName: string): string;
+    /** Returns whether simulated chunking is enabled for this context */
+    isSimulatedChunking(): boolean;
+    /**
+     * Split `content` into the list of `*.delta` strings to publish for one part.
+     *
+     * - chunking off → a single delta with the whole content (1 publish/part);
+     * - chunking on  → fixed-size `chunkSize` chunks, but never more than
+     *   `maxChunksPerMessage` (the chunk size grows for very long content so the
+     *   publish/step count stays bounded regardless of output length).
+     *
+     * Empty content yields no deltas. Each returned element is one `publishEvent`
+     * call by the caller, so this method governs streaming's step-budget cost.
+     */
+    chunkContent(content: string): string[];
+}
+/**
+ * Union type of all possible streaming events
+ */
+type StreamingEvent = RunStartedEvent | RunCompletedEvent | RunFailedEvent | RunInterruptedEvent | StepStartedEvent | StepCompletedEvent | StepFailedEvent | PartCreatedEvent | PartCompletedEvent | PartFailedEvent | TextDeltaEvent | ToolCallArgumentsDeltaEvent | ToolCallOutputDeltaEvent | ReasoningDeltaEvent | DataDeltaEvent | HitlRequestedEvent | HitlResolvedEvent | UsageUpdatedEvent | MetadataUpdatedEvent | StreamEndedEvent | GenericErrorEvent;
+/**
+ * Type guard to check if an event is a specific type
+ */
+declare function isEventType<T extends StreamingEvent>(event: AgentMessageChunk, eventType: T["event"]): event is T;
+/**
+ * Utility to generate unique IDs
+ */
+declare function generateId(): string;
+/**
+ * Helper function to create a StepWrapper if streaming context is available
+ */
+declare function createStepWrapper(originalStep: GetStepTools<Inngest.Any> | undefined, context?: StreamingContext): GetStepTools<Inngest.Any> | undefined;
+
+/**
+ * Network represents a network of agents.
+ */
+declare const createNetwork: <T extends StateData>(opts: Network.Constructor<T>) => Network<T>;
+declare const getDefaultRoutingAgent: () => RoutingAgent<any>;
+/**
+ * Network represents a network of agents.
+ */
+declare class Network<T extends StateData> {
+    /**
+     * The name for the system of agents
+     */
+    name: string;
+    description?: string;
+    /**
+     * agents are all publicly available agents in the netwrok
+     */
+    agents: Map<string, Agent<T>>;
+    /**
+     * state is the entire agent's state.
+     */
+    state: State<T>;
+    /**
+     * defaultModel is the default model to use with the network.  This will not
+     * override an agent's specific model if the agent already has a model defined
+     * (eg. via withModel or via its constructor).
+     */
+    defaultModel?: LanguageModel;
+    router?: Network.Router<T>;
+    /**
+     * maxIter is the maximum number of times the we can call agents before ending
+     * the network's run loop.
+     */
+    maxIter: number;
+    protected _stack: string[];
+    protected _counter: number;
+    protected _agents: Map<string, Agent<T>>;
+    /**
+     * history config for managing thread creation and persistence
+     * used to create a new thread, load initial results/history and
+     * append new results to your database
+     */
+    history?: HistoryConfig<T>;
+    constructor({ name, description, agents, defaultModel, maxIter, defaultState, router, defaultRouter, history, }: Network.Constructor<T>);
+    availableAgents(networkRun?: NetworkRun<T>): Promise<Agent<T>[]>;
+    /**
+     * addAgent adds a new agent to the network.
+     */
+    addAgent(agent: Agent<T>): void;
+    /**
+     * run handles a given request using the network of agents.  It is not
+     * concurrency-safe; you can only call run on a network once, as networks are
+     * stateful.
+     *
+     */
+    run(...[input, overrides]: Network.RunArgs<T>): Promise<NetworkRun<T>>;
+}
+declare namespace Network {
+    type Constructor<T extends StateData> = {
+        name: string;
+        description?: string;
+        agents: Agent<T>[];
+        defaultModel?: LanguageModel;
+        maxIter?: number;
+        defaultState?: State<T>;
+        router?: Router<T>;
+        defaultRouter?: Router<T>;
+        history?: HistoryConfig<T>;
+    };
+    type RunArgs<T extends StateData> = [
+        input: UserMessage | string,
+        overrides?: {
+            router?: Router<T>;
+            defaultRouter?: Router<T>;
+            state?: State<T> | Record<string, any>;
+            streaming?: StreamingConfig;
+        }
+    ];
+    /**
+     * Router defines how a network coordinates between many agents.  A router is
+     * either a RoutingAgent which uses inference calls to choose the next Agent,
+     * or a function which chooses the next Agent to call.
+     *
+     * The function gets given the network, current state, future
+     * agentic calls, and the last inference result from the network.
+     *
+     */
+    type Router<T extends StateData> = RoutingAgent<T> | Router.FnRouter<T>;
+    namespace Router {
+        /**
+         * FnRouter defines a function router which returns an Agent, an AgentRouter, or
+         * undefined if the network should stop.
+         *
+         * If the FnRouter returns an AgentRouter (an agent with the .route function),
+         * the agent will first be ran, then the `.route` function will be called.
+         *
+         */
+        type FnRouter<T extends StateData> = (args: Args<T>) => MaybePromise<RoutingAgent<T> | Agent<T> | Agent<T>[] | undefined>;
+        interface Args<T extends StateData> {
+            /**
+             * input is the input called to the network (always the string content for backwards compatibility)
+             */
+            input: string;
+            /**
+             * userMessage is the rich UserMessage object if provided (new in Phase 1)
+             * Contains client state, timestamps, and optional system prompts
+             */
+            userMessage?: UserMessage;
+            /**
+             * Network is the network that this router is coordinating.  Network state
+             * is accessible via `network.state`.
+             */
+            network: NetworkRun<T>;
+            /**
+             * stack is an ordered array of agents that will be called next.
+             */
+            stack: Agent<T>[];
+            /**
+             * callCount is the number of current agent invocations that the network
+             * has made.  This is a shorthand for `network.state.results.length`.
+             */
+            callCount: number;
+            /**
+             * lastResult is the last inference result that the network made.  This is
+             * a shorthand for `network.state.results.pop()`.
+             */
+            lastResult?: AgentResult;
+        }
+    }
+}
+declare class NetworkRun<T extends StateData> extends Network<T> {
+    constructor(network: Network<T>, state: State<T>);
+    run(): never;
+    availableAgents(): Promise<Agent<T>[]>;
+    /**
+     * Schedule is used to push an agent's run function onto the stack.
+     */
+    schedule(agentName: string): void;
+    private execute;
+    private getNextAgents;
+    private getNextAgentsViaRoutingAgent;
+}
+
+/**
+ * ToolResultPayload mirrors the UI package shape for structured tool outputs.
+ */
+type ToolResultPayload<T> = {
+    data: T;
+};
+/**
+ * createTool is a helper that properly types the input argument for a handler
+ * based off of the Zod parameter types, and captures the handler output type.
+ */
+declare function createTool<TName extends string, TInput extends Tool.Input, TOutput, TState extends StateData>({ name, description, parameters, manualStep, handler, }: {
+    name: TName;
+    description?: string;
+    parameters?: TInput;
+    /**
+     * Opt this tool OUT of AgentKit's automatic durable-step wrapping. See
+     * {@link Tool.manualStep}. Defaults to `false` (the handler is wrapped in a
+     * durable `step.run` when running inside Inngest).
+     */
+    manualStep?: boolean;
+    handler: (input: output<TInput>, opts: Tool.Options<TState>) => MaybePromise<TOutput>;
+}): Tool<TName, TInput, TOutput>;
+type Tool<TName extends string, TInput extends Tool.Input, TOutput> = {
+    name: TName;
+    description?: string;
+    parameters?: TInput;
+    mcp?: {
+        server: MCP.Server;
+        tool: MCP.Tool;
+    };
+    strict?: boolean;
+    /**
+     * Opt out of AgentKit's automatic durable-step wrapping.
+     *
+     * By default, when a tool is invoked inside an Inngest run AgentKit wraps the
+     * handler in a single `step.run(...)` under a deterministic id, so the tool's
+     * side effect executes EXACTLY ONCE across Inngest's replays (Inngest
+     * re-runs the function body on every step boundary; an unwrapped handler would
+     * re-fire — re-applying an `edit_file`, re-billing an image generation, etc.).
+     *
+     * Set `manualStep: true` when the handler must NOT be wrapped, namely:
+     *   - it drives step tooling itself — `step.waitForEvent` (human-in-the-loop),
+     *     `step.invoke` (sub-functions), or its own `step.run` checkpoints (a long
+     *     multi-call subagent) — since wrapping it would nest steps, which Inngest
+     *     forbids; or
+     *   - it is an idempotent large-output read (e.g. a screenshot) whose result
+     *     you don't want occupying step state (all step outputs share a per-run
+     *     ~4MB budget) — re-running a read on replay is only wasted latency, not a
+     *     correctness or billing bug.
+     *
+     * A `manualStep` handler runs inline and receives the live `opts.step`, so it
+     * owns its own durability. A wrapped handler instead receives `opts.step:
+     * undefined` (it is already inside a step). Tools whose primary effect is
+     * mutating `network.state.data` do NOT need this flag — AgentKit re-applies
+     * their state delta across replays automatically.
+     */
+    manualStep?: boolean;
+    handler<TState extends StateData>(input: output<TInput>, opts: Tool.Options<TState>): MaybePromise<TOutput>;
+};
+declare namespace Tool {
+    type Any = Tool<string, Tool.Input, unknown>;
+    type Options<T extends StateData> = {
+        agent: Agent<T>;
+        network: NetworkRun<T>;
+        step?: GetStepTools<Inngest.Any>;
+    };
+    type Input = AnyZodType;
+    type Choice = "auto" | "any" | (string & {});
+}
+/**
+ * Helper to create a strongly-typed tool manifest from a list of tools.
+ *
+ * Returns a simple runtime object keyed by tool name. The primary value is the
+ * compile-time type that captures each tool's input and output types.
+ */
+declare function createToolManifest<TTools extends readonly Tool<string, Tool.Input, unknown>[]>(tools: TTools): { [K in TTools[number] as K["name"]]: K extends Tool<string, infer In extends AnyZodType, infer Out> ? {
+    input: output<In>;
+    output: ToolResultPayload<Out>;
+} : never; };
+declare namespace MCP {
+    type Server = {
+        name: string;
+        transport: TransportSSE | TransportWebsocket | TransportStreamableHttp | TransportStdio;
+    };
+    type Transport = TransportSSE | TransportWebsocket | TransportStreamableHttp | TransportStdio;
+    type TransportStreamableHttp = {
+        type: "streamable-http";
+        url: string;
+        requestInit?: RequestInit;
+        reconnectionOptions?: StreamableHTTPReconnectionOptions;
+        sessionId?: string;
+        authProvider?: OAuthClientProvider;
+    };
+    type TransportStdio = {
+        type: "stdio";
+        command: string;
+        args: string[];
+        env?: Record<string, string>;
+    };
+    type TransportSSE = {
+        type: "sse";
+        url: string;
+        eventSourceInit?: EventSourceInit;
+        requestInit?: RequestInit;
+    };
+    type TransportWebsocket = {
+        type: "ws";
+        url: string;
+    };
+    type Tool = {
+        name: string;
+        description?: string;
+        inputSchema?: {
+            type: "object";
+            properties?: unknown;
+        };
+    };
+}
+
+/**
+ * Default cap on the number of inferences a single `agent.run()` performs in its
+ * internal tool-round loop. Deliberately decoupled from a Network's `maxIter`
+ * (which bounds how many times the network calls agents): when an agent runs
+ * inside a network the network drives iteration and the agent does ONE inference
+ * per call, so total inferences per `network.run` stay ≤ `network.maxIter` rather
+ * than `maxIter²`. Raise `maxIterPerRun` to let a standalone agent loop on its
+ * own tool calls without a network.
+ */
+declare const DEFAULT_MAX_ITER_PER_RUN = 1;
+/**
+ * Agent represents a single agent, responsible for a set of tasks.
+ */
+declare const createAgent: <T extends StateData>(opts: Agent.Constructor<T>) => Agent<T>;
+declare const createRoutingAgent: <T extends StateData>(opts: Agent.RoutingConstructor<T>) => RoutingAgent<T>;
+declare class RoutingAgent<T extends StateData> extends Agent<T> {
+    type: string;
+    lifecycles: Agent.RoutingLifecycle<T>;
+    constructor(opts: Agent.RoutingConstructor<T>);
+    withModel(model: LanguageModel): RoutingAgent<T>;
+}
+/**
+ * Agent represents a single agent, responsible for a set of tasks.
+ */
+declare class Agent<T extends StateData> {
+    /**
+     * name is the name of the agent.
+     */
+    name: string;
+    /**
+     * description is the description of the agent.
+     */
+    description: string;
+    /**
+     * system is the system prompt for the agent.
+     */
+    system: string | ((ctx: {
+        network?: NetworkRun<T>;
+    }) => MaybePromise<string>);
+    /**
+     * Assistant is the assistent message used for completion, if any.
+     */
+    assistant: string;
+    /**
+     * tools are a list of tools that this specific agent has access to.
+     */
+    tools: Map<string, Tool.Any>;
+    /**
+     * tool_choice allows you to specify whether tools are automatically.  this defaults
+     * to "auto", allowing the model to detect when to call tools automatically.  Choices are:
+     *
+     * - "auto": allow the model to choose tools automatically
+     * - "any": force the use of any tool in the tools map
+     * - string: force the name of a particular tool
+     */
+    tool_choice?: Tool.Choice;
+    /**
+     * lifecycles are programmatic hooks used to manage the agent.
+     */
+    lifecycles: Agent.Lifecycle<T> | Agent.RoutingLifecycle<T> | undefined;
+    /**
+     * model is the step caller to use for this agent.  This allows the agent
+     * to use a specific model which may be different to other agents in the
+     * system
+     */
+    model: LanguageModel | undefined;
+    /**
+     * maxIterPerRun caps the inferences performed within a single `run()` call
+     * (the agent's internal tool-round loop), independent of any Network's
+     * `maxIter`. Defaults to {@link DEFAULT_MAX_ITER_PER_RUN} (1). See that
+     * constant for why the two caps are kept separate.
+     */
+    maxIterPerRun?: number;
+    /**
+     * mcpServers is a list of MCP (model-context-protocol) servers which can
+     * provide tools to the agent.
+     */
+    mcpServers?: MCP.Server[];
+    /**
+     * history configuration for managing conversation history
+     */
+    private history?;
+    private _mcpClients;
+    constructor(opts: Agent.Constructor<T> | Agent.RoutingConstructor<T>);
+    private setTools;
+    withModel(model: LanguageModel): Agent<T>;
+    /**
+     * Run runs an agent with the given user input, treated as a user message.  If
+     * the input is an empty string, only the system prompt will execute.
+     */
+    run(input: UserMessage | string, { model, network, state, maxIter, maxIterPerRun, streaming, streamingContext, step, }?: Agent.RunOptions<T> | undefined): Promise<AgentResult>;
+    private performInference;
+    /**
+     * invokeTools takes output messages from an inference call then invokes any tools
+     * in the message responses.
+     */
+    private invokeTools;
+    /**
+     * Invoke one tool-call handler, normalizing its return/throw into the
+     * {@link ToolHandlerResult} shape fed back to the model.
+     *
+     * Durable-by-default: when an Inngest step is available AND the tool has not
+     * set `manualStep`, the handler runs inside ONE `step.run` under a
+     * deterministic id, so its side effect fires EXACTLY ONCE across Inngest's
+     * re-executions (no `edit_file` double-apply, no image-tool re-bill). Memoized
+     * inferences replay the same tool calls in the same order, so the per-run
+     * counter (`network.state.nextDurableToolCallIndex()`) assigns the Nth tool
+     * call the same id on every replay — never a checksum/timestamp/uuid.
+     *
+     * Two subtleties handled here:
+     *   - State mutations: a tool may mutate `network.state.data` (design
+     *     questions / plan / `__stopReason`). That mutation happens INSIDE the
+     *     step and is lost on replay (the memoized body is skipped), so we memoize
+     *     the post-handler data snapshot in the step payload and RE-APPLY it
+     *     outside the step on every execution. State-mutating tools keep working
+     *     with no code change.
+     *   - Errors: captured and returned as `{ error }` (never thrown) so the step
+     *     is recorded as a success returning the error — the failing side effect
+     *     is not retried, and the model sees the same result on replay.
+     *
+     * Inline fallback: no step in context (non-Inngest run / tests) OR the tool
+     * opted out via `manualStep`. The handler then receives the live `step` and
+     * owns its own durability. A wrapped handler instead receives `step:
+     * undefined` (it is already inside a step; a nested `step.run` would break
+     * Inngest).
+     */
+    private runToolHandler;
+    private agentPrompt;
+    private initMCP;
+    /**
+     * listMCPTools lists all available tools for a given MCP server
+     */
+    private listMCPTools;
+    /**
+     * mcpClient creates a new MCP client for the given server.
+     */
+    private mcpClient;
+}
+declare namespace Agent {
+    interface Constructor<T extends StateData> {
+        name: string;
+        description?: string;
+        system: string | ((ctx: {
+            network?: NetworkRun<T>;
+        }) => MaybePromise<string>);
+        assistant?: string;
+        tools?: (Tool.Any | InngestFunction.Any)[];
+        tool_choice?: Tool.Choice;
+        lifecycle?: Lifecycle<T>;
+        model?: LanguageModel;
+        /**
+         * Caps inferences within a single `run()` (the internal tool-round loop),
+         * independent of a Network's `maxIter`. Defaults to
+         * {@link DEFAULT_MAX_ITER_PER_RUN}.
+         */
+        maxIterPerRun?: number;
+        mcpServers?: MCP.Server[];
+        history?: HistoryConfig<T>;
+    }
+    interface RoutingConstructor<T extends StateData> extends Omit<Constructor<T>, "lifecycle"> {
+        lifecycle: RoutingLifecycle<T>;
+    }
+    interface RunOptions<T extends StateData> {
+        model?: LanguageModel;
+        network?: NetworkRun<T>;
+        /**
+         * State allows you to pass custom state into a single agent run call.  This should only
+         * be provided if you are running agents outside of a network.  Networks automatically
+         * supply their own state.
+         */
+        state?: State<T>;
+        /**
+         * @deprecated For the agent's internal tool-round loop, prefer
+         * `maxIterPerRun`. When run inside a Network, the network controls iteration
+         * and passes `maxIterPerRun: 1`; this option is honored only for standalone
+         * runs (back-compat) and never coupled to the network's `maxIter`.
+         */
+        maxIter?: number;
+        /**
+         * Caps inferences within this single `run()` (the internal tool-round loop),
+         * independent of a Network's `maxIter`. Defaults to the agent's
+         * `maxIterPerRun` or {@link DEFAULT_MAX_ITER_PER_RUN}.
+         */
+        maxIterPerRun?: number;
+        /**
+         * Streaming configuration for standalone agent runs. When provided, the agent will
+         * automatically emit streaming events throughout its execution. Note: this is ignored
+         * when the agent is run within a network, as networks control streaming.
+         */
+        streaming?: StreamingConfig;
+        streamingContext?: StreamingContext;
+        step?: GetStepTools<Inngest.Any>;
+    }
+    interface Lifecycle<T extends StateData> {
+        /**
+         * enabled selectively enables or disables this agent based off of network
+         * state.  If this function is not provided, the agent is always enabled.
+         */
+        enabled?: (args: Agent.LifecycleArgs.Base<T>) => MaybePromise<boolean>;
+        /**
+         * onStart is called just before an agent starts an inference call.
+         *
+         * This receives the full agent prompt.  If this is a networked agent, the
+         * agent will also receive the network's history which will be concatenated
+         * to the end of the prompt when making the inference request.
+         *
+         * The return values can be used to adjust the prompt, history, or to stop
+         * the agent from making the call altogether.
+         *
+         */
+        onStart?: (args: Agent.LifecycleArgs.Before<T>) => MaybePromise<{
+            prompt: Message[];
+            history: Message[];
+            stop: boolean;
+        }>;
+        /**
+         * onResponse is called after the inference call finishes, before any tools
+         * have been invoked. This allows you to moderate the response prior to
+         * running tools.
+         */
+        onResponse?: (args: Agent.LifecycleArgs.Result<T>) => MaybePromise<AgentResult>;
+        /**
+         * onFinish is called with a finalized AgentResult, including any tool
+         * call results. The returned AgentResult will be saved to network
+         * history, if the agent is part of the network.
+         *
+         */
+        onFinish?: (args: Agent.LifecycleArgs.Result<T>) => MaybePromise<AgentResult>;
+    }
+    namespace LifecycleArgs {
+        interface Base<T extends StateData> {
+            agent: Agent<T>;
+            network?: NetworkRun<T>;
+        }
+        interface Result<T extends StateData> extends Base<T> {
+            result: AgentResult;
+        }
+        interface Before<T extends StateData> extends Base<T> {
+            input?: string;
+            prompt: Message[];
+            history?: Message[];
+        }
+    }
+    interface RoutingLifecycle<T extends StateData> extends Lifecycle<T> {
+        onRoute: RouterFn<T>;
+    }
+    type RouterFn<T extends StateData> = (args: Agent.RouterArgs<T>) => string[] | undefined;
+    /**
+     * Router args are the arguments passed to the onRoute lifecycle hook.
+     */
+    type RouterArgs<T extends StateData> = Agent.LifecycleArgs.Result<T>;
+}
+
+export { type PartCreatedEvent as $, Agent as A, type ThreadOperationConfig as B, type SaveThreadToStorageConfig as C, DEFAULT_MAX_ITER_PER_RUN as D, initializeThread as E, loadThreadFromStorage as F, saveThreadToStorage as G, type HistoryConfig as H, type ImageContent as I, FINAL_APPEND_STEP_ID as J, incrementalAppendStepId as K, persistResults as L, type Message as M, Network as N, type AgentMessageChunk as O, AgentMessageChunkSchema as P, type RunStartedEvent as Q, type ReasoningDetail as R, type StateData as S, Tool as T, type UserMessage as U, type RunCompletedEvent as V, type RunFailedEvent as W, type RunInterruptedEvent as X, type StepStartedEvent as Y, type StepCompletedEvent as Z, type StepFailedEvent as _, createRoutingAgent as a, type PartCompletedEvent as a0, type PartFailedEvent as a1, type TextDeltaEvent as a2, type ToolCallArgumentsDeltaEvent as a3, type ToolCallOutputDeltaEvent as a4, type ReasoningDeltaEvent as a5, type DataDeltaEvent as a6, type HitlRequestedEvent as a7, type HitlResolvedEvent as a8, type UsageUpdatedEvent as a9, type MetadataUpdatedEvent as aa, type StreamEndedEvent as ab, type GenericErrorEvent as ac, DEFAULT_CHUNK_SIZE as ad, DEFAULT_MAX_CHUNKS_PER_MESSAGE as ae, type StreamingConfig as af, StreamingContext as ag, type StreamingEvent as ah, isEventType as ai, generateId as aj, createStepWrapper as ak, RoutingAgent as b, createAgent as c, createNetwork as d, NetworkRun as e, createState as f, getDefaultRoutingAgent as g, State as h, type ToolResultPayload as i, createTool as j, createToolManifest as k, MCP as l, type MaybePromise as m, type AnyZodType as n, getStepTools as o, isInngestFn as p, getInngestFnInput as q, type TextMessage as r, stringifyError as s, type ReasoningMessage as t, type ToolCallMessage as u, type ToolResultMessage as v, type TextContent as w, type ToolMessage as x, AgentResult as y, History as z };
