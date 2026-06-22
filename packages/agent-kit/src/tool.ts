@@ -25,11 +25,18 @@ export function createTool<
   name,
   description,
   parameters,
+  manualStep,
   handler,
 }: {
   name: TName;
   description?: string;
   parameters?: TInput;
+  /**
+   * Opt this tool OUT of AgentKit's automatic durable-step wrapping. See
+   * {@link Tool.manualStep}. Defaults to `false` (the handler is wrapped in a
+   * durable `step.run` when running inside Inngest).
+   */
+  manualStep?: boolean;
   handler: (
     input: ZodOutput<TInput>,
     opts: Tool.Options<TState>
@@ -39,6 +46,7 @@ export function createTool<
     name,
     description,
     parameters,
+    manualStep,
     handler<TS extends StateData>(
       input: ZodOutput<TInput>,
       opts: Tool.Options<TS>
@@ -61,6 +69,33 @@ export type Tool<TName extends string, TInput extends Tool.Input, TOutput> = {
   };
 
   strict?: boolean;
+
+  /**
+   * Opt out of AgentKit's automatic durable-step wrapping.
+   *
+   * By default, when a tool is invoked inside an Inngest run AgentKit wraps the
+   * handler in a single `step.run(...)` under a deterministic id, so the tool's
+   * side effect executes EXACTLY ONCE across Inngest's replays (Inngest
+   * re-runs the function body on every step boundary; an unwrapped handler would
+   * re-fire — re-applying an `edit_file`, re-billing an image generation, etc.).
+   *
+   * Set `manualStep: true` when the handler must NOT be wrapped, namely:
+   *   - it drives step tooling itself — `step.waitForEvent` (human-in-the-loop),
+   *     `step.invoke` (sub-functions), or its own `step.run` checkpoints (a long
+   *     multi-call subagent) — since wrapping it would nest steps, which Inngest
+   *     forbids; or
+   *   - it is an idempotent large-output read (e.g. a screenshot) whose result
+   *     you don't want occupying step state (all step outputs share a per-run
+   *     ~4MB budget) — re-running a read on replay is only wasted latency, not a
+   *     correctness or billing bug.
+   *
+   * A `manualStep` handler runs inline and receives the live `opts.step`, so it
+   * owns its own durability. A wrapped handler instead receives `opts.step:
+   * undefined` (it is already inside a step). Tools whose primary effect is
+   * mutating `network.state.data` do NOT need this flag — AgentKit re-applies
+   * their state delta across replays automatically.
+   */
+  manualStep?: boolean;
 
   handler<TState extends StateData>(
     input: ZodOutput<TInput>,

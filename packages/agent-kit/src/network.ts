@@ -229,6 +229,9 @@ export const getDefaultRoutingAgent = () => {
         name: "select_agent",
         description:
           "Select an agent to handle the next step of the conversation",
+        // Pure routing primitive (no side effect, no state mutation) — skip the
+        // automatic durable-step wrap so routing doesn't spend a step per call.
+        manualStep: true,
         parameters: z
           .object({
             name: z
@@ -262,6 +265,8 @@ export const getDefaultRoutingAgent = () => {
         name: "done",
         description:
           "Signal that the conversation is complete and no more agents need to be called",
+        // Pure routing primitive — skip the automatic durable-step wrap.
+        manualStep: true,
         parameters: z
           .object({
             summary: z

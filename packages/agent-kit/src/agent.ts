@@ -24,6 +24,7 @@ import { type MCP, type Tool } from "./tool";
 import {
   AgentResult,
   type Message,
+  type ToolMessage,
   type ToolResultMessage,
   type UserMessage,
 } from "./types";
@@ -46,6 +47,31 @@ import {
   generateId,
   type StreamingConfig,
 } from "./streaming";
+
+/**
+ * Normalized result of invoking a tool handler — either its data or a serialized
+ * error — exactly as fed back to the model. Errors are CAPTURED (never thrown)
+ * so that a tool failure is reported to the model and, when the handler runs
+ * inside a durable step, the step is recorded as a success returning that error
+ * (the side effect is not retried / re-run).
+ */
+type ToolHandlerResult =
+  | { data: unknown }
+  | { error: ReturnType<typeof errors.serializeError> };
+
+/**
+ * `JSON.stringify` that never throws (returns `undefined` on circular /
+ * unserializable input). Used to cheaply detect whether a tool mutated
+ * `network.state.data` so we only memoize a state patch when it actually
+ * changed (keeping per-step output within Inngest's ~4MB-per-run budget).
+ */
+const safeSerialize = (value: unknown): string | undefined => {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+};
 
 /**
  * Default cap on the number of inferences a single `agent.run()` performs in its
@@ -165,6 +191,11 @@ export class Agent<T extends StateData> {
           description: tool.description,
           // TODO Should we error here if we can't find an input schema?
           parameters: getInngestFnInput(tool),
+          // This handler calls `step.invoke`, which is itself a step operation
+          // and CANNOT run inside a `step.run`. Opt out of the automatic durable
+          // wrap so it executes inline with the live step (step.invoke is
+          // already durable on its own).
+          manualStep: true,
           handler: async (input: MinimalEventPayload["data"], opts) => {
             // Doing this late means a potential throw if we use the agent in a
             // non-Inngest environment. We could instead calculate the tool list
@@ -724,35 +755,23 @@ export class Agent<T extends StateData> {
           });
         }
 
-        // Call this tool.
+        // Call this tool — durable-by-default.
         //
-        // XXX: You might expect this to be wrapped in a step, but each tool can
-        // use multiple step tools, eg. `step.run`, then `step.waitForEvent` for
-        // human in the loop tasks.
-        //
-
-        type ToolHandlerResult =
-          | { data: unknown }
-          | { error: ReturnType<typeof errors.serializeError> };
-
-        const result: ToolHandlerResult = await Promise.resolve(
-          found.handler(tool.input, {
-            agent: this,
-            network,
-            step: step as GetStepTools<Inngest.Any>,
-          })
-        )
-          .then((r) => {
-            return {
-              data:
-                typeof r === "undefined"
-                  ? `${tool.name} successfully executed`
-                  : r,
-            };
-          })
-          .catch((err: Error) => {
-            return { error: errors.serializeError(err) };
-          });
+        // Inngest re-executes the function body on every step boundary, so an
+        // unwrapped handler re-fires on each replay: `edit_file` reports "string
+        // not found" the second time, an image tool re-bills, etc. We therefore
+        // wrap each handler in ONE deterministic `step.run` so its side effect
+        // runs exactly once (see `runToolHandler`). A tool can opt out with
+        // `manualStep` when it drives its OWN step tools (HITL `waitForEvent`,
+        // `step.invoke`, a multi-`step.run` subagent) — those cannot be nested —
+        // in which case it runs inline with the live step, as every tool did
+        // before this change.
+        const result: ToolHandlerResult = await this.runToolHandler(
+          found,
+          tool,
+          network,
+          step
+        );
 
         // Stream tool output if context available
         if (streamingContext) {
@@ -820,6 +839,102 @@ export class Agent<T extends StateData> {
     }
 
     return output;
+  }
+
+  /**
+   * Invoke one tool-call handler, normalizing its return/throw into the
+   * {@link ToolHandlerResult} shape fed back to the model.
+   *
+   * Durable-by-default: when an Inngest step is available AND the tool has not
+   * set `manualStep`, the handler runs inside ONE `step.run` under a
+   * deterministic id, so its side effect fires EXACTLY ONCE across Inngest's
+   * re-executions (no `edit_file` double-apply, no image-tool re-bill). Memoized
+   * inferences replay the same tool calls in the same order, so the per-run
+   * counter (`network.state.nextDurableToolCallIndex()`) assigns the Nth tool
+   * call the same id on every replay — never a checksum/timestamp/uuid.
+   *
+   * Two subtleties handled here:
+   *   - State mutations: a tool may mutate `network.state.data` (design
+   *     questions / plan / `__stopReason`). That mutation happens INSIDE the
+   *     step and is lost on replay (the memoized body is skipped), so we memoize
+   *     the post-handler data snapshot in the step payload and RE-APPLY it
+   *     outside the step on every execution. State-mutating tools keep working
+   *     with no code change.
+   *   - Errors: captured and returned as `{ error }` (never thrown) so the step
+   *     is recorded as a success returning the error — the failing side effect
+   *     is not retried, and the model sees the same result on replay.
+   *
+   * Inline fallback: no step in context (non-Inngest run / tests) OR the tool
+   * opted out via `manualStep`. The handler then receives the live `step` and
+   * owns its own durability. A wrapped handler instead receives `step:
+   * undefined` (it is already inside a step; a nested `step.run` would break
+   * Inngest).
+   */
+  private async runToolHandler(
+    toolDef: Tool.Any,
+    call: ToolMessage,
+    network: NetworkRun<T>,
+    step?: GetStepTools<Inngest.Any>
+  ): Promise<ToolHandlerResult> {
+    const invoke = async (
+      handlerStep: GetStepTools<Inngest.Any> | undefined
+    ): Promise<ToolHandlerResult> => {
+      try {
+        const r = await toolDef.handler(call.input, {
+          agent: this,
+          network,
+          step: handlerStep,
+        });
+        return {
+          data:
+            typeof r === "undefined" ? `${call.name} successfully executed` : r,
+        };
+      } catch (err) {
+        return { error: errors.serializeError(err as Error) };
+      }
+    };
+
+    // Prefer the threaded step; fall back to the ambient Inngest step so tools
+    // are durable on any path that reaches Inngest (mirrors how inference and
+    // streaming-id generation already resolve their step).
+    const durableStep = step ?? (await getStepTools());
+
+    // Inline path: no Inngest step, or the tool manages its own durability.
+    if (!durableStep || toolDef.manualStep) {
+      return invoke(step);
+    }
+
+    // Durable path: exactly-once side effect under a deterministic id.
+    const index = network.state.nextDurableToolCallIndex();
+    const stepId = `${this.name}/tool/${call.name}/${index}`;
+
+    // `step.run` applies `Jsonify` to its output type; the value is JSON
+    // round-tripped at runtime, so we annotate the de-serialized shape we expect
+    // (mirrors how `model.ts` types its `step.run(...)` result).
+    const memoized = (await durableStep.run(stepId, async () => {
+      const before = safeSerialize(network.state.data);
+      // Already inside a step → never give the handler a step (a nested
+      // `step.run` would break Inngest); a wrapped tool is a leaf by contract.
+      const result = await invoke(undefined);
+      const after = network.state.data;
+      const stateChanged =
+        before === undefined || safeSerialize(after) !== before;
+      return {
+        result,
+        // Only carry a patch when the tool actually mutated state — every step's
+        // output counts against Inngest's ~4MB-per-run total.
+        statePatch: stateChanged ? after : undefined,
+      };
+    })) as unknown as { result: ToolHandlerResult; statePatch?: T };
+
+    // Re-apply any state delta OUTSIDE the step on EVERY execution — including
+    // replays, where the memoized body did not run so the live mutation is
+    // missing from `network.state`.
+    if (memoized.statePatch !== undefined) {
+      network.state.importData(memoized.statePatch);
+    }
+
+    return memoized.result;
   }
 
   private async agentPrompt(
@@ -925,14 +1040,15 @@ export class Agent<T extends StateData> {
             tool: t,
           },
           handler: async (input: { [x: string]: unknown } | undefined) => {
-            const fn = () =>
-              client.callTool({
-                name: t.name,
-                arguments: input,
-              });
-
-            const step = await getStepTools();
-            const result = await (step?.run(name, fn) ?? fn());
+            // No self-wrapping here: AgentKit wraps every tool handler in a
+            // durable step by default (see Agent.runToolHandler), giving each
+            // MCP call a replay-stable, per-call step id. The previous self-wrap
+            // keyed the step on the tool name alone, which collided when the same
+            // MCP tool was invoked more than once in a run.
+            const result = await client.callTool({
+              name: t.name,
+              arguments: input,
+            });
 
             return result.content;
           },
