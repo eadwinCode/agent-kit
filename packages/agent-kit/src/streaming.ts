@@ -344,6 +344,20 @@ class SequenceCounter {
 // =============================================================================
 
 /**
+ * Default size (in characters) of a simulated streaming delta. Chosen to keep
+ * the typing animation smooth while drastically cutting the number of
+ * `publish()` calls vs. fine-grained chunking. See {@link StreamingConfig}.
+ */
+export const DEFAULT_CHUNK_SIZE = 256;
+
+/**
+ * Default ceiling on the number of simulated delta events emitted per streamed
+ * part. Bounds `publish()` volume regardless of output length: a very long part
+ * is split into at most this many (coarser) chunks rather than hundreds.
+ */
+export const DEFAULT_MAX_CHUNKS_PER_MESSAGE = 24;
+
+/**
  * Public-facing streaming configuration interface
  */
 export interface StreamingConfig {
@@ -351,6 +365,21 @@ export interface StreamingConfig {
   publish: (chunk: AgentMessageChunk) => Promise<void>;
   /** When true, emit simulated chunked deltas; otherwise emit a single delta */
   simulateChunking?: boolean;
+  /**
+   * Size (characters) of each simulated `*.delta` chunk when
+   * `simulateChunking` is on. Larger → fewer `publish()` calls (each publish is
+   * a durable Inngest step for `@inngest/realtime`'s function-scoped publish, so
+   * this directly affects the step budget). Defaults to {@link DEFAULT_CHUNK_SIZE}.
+   */
+  chunkSize?: number;
+  /**
+   * Hard cap on the number of simulated delta events per streamed part. When a
+   * part is longer than `chunkSize * maxChunksPerMessage`, the chunk size is
+   * grown so the part still emits at most this many deltas — bounding publish
+   * volume (and step usage) regardless of output length. Defaults to
+   * {@link DEFAULT_MAX_CHUNKS_PER_MESSAGE}; set to 0 to disable the cap.
+   */
+  maxChunksPerMessage?: number;
 }
 
 /**
@@ -361,6 +390,8 @@ export class StreamingContext {
   private sequenceCounter: SequenceCounter;
   private debug: boolean;
   private simulateChunking: boolean;
+  private chunkSize: number;
+  private maxChunksPerMessage: number;
 
   public readonly runId: string;
   public readonly parentRunId?: string;
@@ -380,6 +411,8 @@ export class StreamingContext {
     sequenceCounter?: SequenceCounter;
     debug?: boolean;
     simulateChunking?: boolean;
+    chunkSize?: number;
+    maxChunksPerMessage?: number;
   }) {
     this.publish = config.publish;
     this.runId = config.runId;
@@ -391,6 +424,12 @@ export class StreamingContext {
     this.sequenceCounter = config.sequenceCounter || new SequenceCounter();
     this.debug = config.debug ?? process.env.NODE_ENV === "development";
     this.simulateChunking = config.simulateChunking ?? false;
+    this.chunkSize =
+      config.chunkSize && config.chunkSize > 0
+        ? config.chunkSize
+        : DEFAULT_CHUNK_SIZE;
+    this.maxChunksPerMessage =
+      config.maxChunksPerMessage ?? DEFAULT_MAX_CHUNKS_PER_MESSAGE;
   }
 
   /**
@@ -408,6 +447,8 @@ export class StreamingContext {
       sequenceCounter: this.sequenceCounter, // Share the same counter
       debug: this.debug, // Inherit debug setting
       simulateChunking: this.simulateChunking,
+      chunkSize: this.chunkSize,
+      maxChunksPerMessage: this.maxChunksPerMessage,
     });
   }
 
@@ -430,6 +471,8 @@ export class StreamingContext {
       sequenceCounter: this.sequenceCounter, // Share the same counter instance
       debug: this.debug, // Inherit debug setting
       simulateChunking: this.simulateChunking,
+      chunkSize: this.chunkSize,
+      maxChunksPerMessage: this.maxChunksPerMessage,
     });
   }
 
@@ -445,6 +488,8 @@ export class StreamingContext {
       scope: "network" | "agent";
       debug?: boolean;
       simulateChunking?: boolean;
+      chunkSize?: number;
+      maxChunksPerMessage?: number;
     }
   ): StreamingContext {
     const debug = config.debug ?? process.env.NODE_ENV === "development";
@@ -460,6 +505,8 @@ export class StreamingContext {
       scope: config.scope,
       debug,
       simulateChunking: config.simulateChunking ?? false,
+      chunkSize: config.chunkSize,
+      maxChunksPerMessage: config.maxChunksPerMessage,
     });
   }
 
@@ -545,6 +592,34 @@ export class StreamingContext {
   /** Returns whether simulated chunking is enabled for this context */
   isSimulatedChunking(): boolean {
     return this.simulateChunking;
+  }
+
+  /**
+   * Split `content` into the list of `*.delta` strings to publish for one part.
+   *
+   * - chunking off → a single delta with the whole content (1 publish/part);
+   * - chunking on  → fixed-size `chunkSize` chunks, but never more than
+   *   `maxChunksPerMessage` (the chunk size grows for very long content so the
+   *   publish/step count stays bounded regardless of output length).
+   *
+   * Empty content yields no deltas. Each returned element is one `publishEvent`
+   * call by the caller, so this method governs streaming's step-budget cost.
+   */
+  chunkContent(content: string): string[] {
+    if (!content) return [];
+    if (!this.simulateChunking) return [content];
+
+    let size = Math.max(1, this.chunkSize);
+    if (this.maxChunksPerMessage > 0) {
+      // Grow the chunk size so we emit at most `maxChunksPerMessage` chunks.
+      size = Math.max(size, Math.ceil(content.length / this.maxChunksPerMessage));
+    }
+
+    const chunks: string[] = [];
+    for (let i = 0; i < content.length; i += size) {
+      chunks.push(content.slice(i, i + size));
+    }
+    return chunks;
   }
 }
 

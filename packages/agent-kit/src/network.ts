@@ -550,6 +550,8 @@ export class NetworkRun<T extends StateData> extends Network<T> {
         messageId: networkRunId, // Use networkRunId as messageId for network-level events
         scope: "network",
         simulateChunking: overrides?.streaming?.simulateChunking,
+        chunkSize: overrides?.streaming?.chunkSize,
+        maxChunksPerMessage: overrides?.streaming?.maxChunksPerMessage,
       });
       await streamingContext.publishEvent({
         event: "run.started",
@@ -633,8 +635,11 @@ export class NetworkRun<T extends StateData> extends Network<T> {
           return this;
         }
 
-        // We force Agent to emit structured output in case of the use of tools by
-        // setting maxIter to 0.
+        // The network is the iteration authority: it calls the agent once per
+        // loop and decides (via the router) whether to call again. So the agent
+        // does exactly ONE inference per call (maxIterPerRun: 1) — its internal
+        // tool-round loop is intentionally NOT driven by the network's maxIter,
+        // keeping total inferences per network.run ≤ maxIter (not maxIter²).
         // Generate unique IDs for this agent's execution using durable steps
         let agentRunId: string;
         let agentMessageId: string;
@@ -683,7 +688,8 @@ export class NetworkRun<T extends StateData> extends Network<T> {
 
         const call = await agent.run(inputContent, {
           network: this,
-          maxIter: 0,
+          // One inference per network iteration; decoupled from network.maxIter.
+          maxIterPerRun: 1,
           // Provide streaming context so the agent can emit part/text/tool events
           streamingContext: agentStreamingContext,
           // Provide wrapped step tools for automatic step lifecycle events
