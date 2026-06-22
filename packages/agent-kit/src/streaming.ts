@@ -612,7 +612,10 @@ export class StreamingContext {
     let size = Math.max(1, this.chunkSize);
     if (this.maxChunksPerMessage > 0) {
       // Grow the chunk size so we emit at most `maxChunksPerMessage` chunks.
-      size = Math.max(size, Math.ceil(content.length / this.maxChunksPerMessage));
+      size = Math.max(
+        size,
+        Math.ceil(content.length / this.maxChunksPerMessage)
+      );
     }
 
     const chunks: string[] = [];

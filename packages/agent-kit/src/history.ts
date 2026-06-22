@@ -322,18 +322,64 @@ export async function loadThreadFromStorage<T extends StateData>(
 export async function saveThreadToStorage<T extends StateData>(
   config: SaveThreadToStorageConfig<T>
 ): Promise<void> {
-  const { state, history, initialResultCount, network, input } = config;
-  if (!history?.appendResults) return;
+  const { state, initialResultCount } = config;
+  const newResults = state.getResultsFrom(initialResultCount);
+  // End-of-run backstop. When results were already persisted incrementally
+  // (see persistResults), the consumer's idempotency makes this a no-op.
+  await persistResults(config, newResults, FINAL_APPEND_STEP_ID);
+}
+
+/** Deterministic step id for the end-of-run save. */
+export const FINAL_APPEND_STEP_ID = "agent-kit/history/append-results/final";
+
+/**
+ * Deterministic step id for an incremental (per-iteration) save. `key` MUST be a
+ * replay-stable value such as the network's iteration counter — NEVER a value
+ * derived from `AgentResult.checksum`, a timestamp, a random id, or a UUID, all
+ * of which change between Inngest re-executions and cause
+ * `Could not find step "<hash>" to run`.
+ */
+export function incrementalAppendStepId(key: string | number): string {
+  return `agent-kit/history/append-results/${key}`;
+}
+
+/**
+ * Persist `newResults` via `history.appendResults`, wrapped in a single durable
+ * `step.run` under the caller-provided, deterministic `stepId`.
+ *
+ * The step is owned HERE (not inside the consumer's hook) and `step` is passed to
+ * the hook as `undefined`, so the hook body runs inline within this one
+ * checkpoint. This guarantees:
+ *   1. the persistence step id is replay-stable (it is `stepId`, e.g. an
+ *      iteration counter — never a checksum/timestamp), so Inngest can always
+ *      find the step on re-execution; and
+ *   2. the write is memoized after it first succeeds, so re-executions don't
+ *      duplicate it (independent of the consumer's own idempotency).
+ *
+ * Safe to call repeatedly with the SAME `stepId` and content across a run — the
+ * memoized step makes extra calls free.
+ */
+export async function persistResults<T extends StateData>(
+  config: ThreadOperationConfig<T>,
+  newResults: AgentResult[],
+  stepId: string
+): Promise<void> {
+  const { state, history, network, input } = config;
+  if (!history?.appendResults || newResults.length === 0) return;
 
   const step = await getStepTools();
-  const newResults = state.getResultsFrom(initialResultCount);
+  const append = () =>
+    history.appendResults!({
+      state,
+      network: network!,
+      // Intentionally undefined: this call is ALREADY inside a step.run, so the
+      // hook must run inline (a nested step.run would break Inngest). The hook's
+      // own durability/step id (if any) is therefore not used.
+      step: undefined,
+      newResults,
+      input,
+      threadId: state.threadId,
+    });
 
-  await history.appendResults({
-    state,
-    network: network!,
-    step,
-    newResults,
-    input,
-    threadId: state.threadId,
-  });
+  await (step ? step.run(stepId, append) : append());
 }

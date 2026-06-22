@@ -35,7 +35,9 @@ describe("StreamingContext.chunkContent", () => {
   });
 
   it("returns no deltas for empty content", () => {
-    expect(makeContext({ simulateChunking: true }).chunkContent("")).toEqual([]);
+    expect(makeContext({ simulateChunking: true }).chunkContent("")).toEqual(
+      []
+    );
   });
 
   it("splits by chunkSize when chunking is on", () => {
@@ -99,9 +101,9 @@ describe("streaming publish volume scales with chunk config", () => {
   });
 
   it("emits ~content/chunkSize deltas when chunking is on", async () => {
-    expect(await countTextDeltas({ simulateChunking: true, chunkSize: 100 })).toBe(
-      10
-    );
+    expect(
+      await countTextDeltas({ simulateChunking: true, chunkSize: 100 })
+    ).toBe(10);
     expect(
       await countTextDeltas({ simulateChunking: true, chunkSize: 250 })
     ).toBe(4);
