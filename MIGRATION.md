@@ -223,7 +223,77 @@ either way. No behavioral regression for Clevix.
 
 ---
 
-## 8. Consuming the fork & dropping the patch
+## 8. Step budget: streaming publishes & iteration caps
+
+A durable Inngest function has a **1000-step limit**. Two things in the agentic
+loop consume steps; both are now bounded/configurable.
+
+### Streaming publishes (each `publish()` is a durable step)
+
+`@inngest/realtime`'s function-scoped `publish` wraps every call in a `step.run`
+(you'll see `publish:<channel>:*` steps). AgentKit calls your `streaming.publish`
+once per streaming event, so **publish volume = step cost**. Previously, with
+`simulateChunking: true`, each inference's text was split into hardcoded ~50-char
+`text.delta`s — a long turn emitted ~900 publish-steps and overflowed the limit.
+
+Chunking is now configurable on the streaming options:
+
+```ts
+await network.run(msg, {
+  state,
+  streaming: {
+    publish,
+    simulateChunking: true,   // keep the typing animation…
+    chunkSize: 256,           // …but ~5× fewer publishes than the old 50 (default 256)
+    maxChunksPerMessage: 24,  // hard cap per part — bounds publishes regardless of
+                              // output length (default 24; 0 = unlimited)
+  },
+});
+```
+
+- `chunkSize` (default **256**) — characters per `*.delta`. Bigger → fewer steps.
+- `maxChunksPerMessage` (default **24**) — a part longer than
+  `chunkSize × maxChunksPerMessage` is split into at most this many (coarser)
+  chunks, so one part never emits more than N delta-steps.
+- `simulateChunking: false` → **one** delta per part (minimum: `part.created` +
+  one delta + `part.completed` ≈ 3 steps/part). The event shapes are unchanged in
+  every mode — only the number of `*.delta` events differs.
+
+Rough cost: `publishes ≈ Σ_parts (min(⌈len/chunkSize⌉, maxChunksPerMessage) + 2)`.
+The defaults keep a typical multi-inference turn well under the step budget while
+preserving incremental streaming.
+
+**Removing streaming from the step budget entirely (recommended for long turns).**
+Because these are fire-and-forget UI updates and the consumer runs with
+`retries: 0`, durability buys little. If you pass a `publish` that does **not**
+create steps — i.e. publish outside Inngest's durable graph rather than the
+function-scoped `publish` from `realtimeMiddleware()` — streaming costs **zero**
+steps regardless of chunking. AgentKit just calls whatever `publish` you give it;
+it never wraps publishes in steps itself. (With a non-durable publish you can turn
+`simulateChunking` back on for a smooth animation at no step cost.)
+
+### Iteration caps (no `maxIter²`)
+
+The network is the single iteration authority: it calls each agent once per loop
+and the router decides whether to continue, so the agent does **one inference per
+call** (`maxIterPerRun: 1`). Total inferences per `network.run` is therefore
+**≤ `network.maxIter`**, never `maxIter²` — the network does **not** pass its
+`maxIter` into the agent's internal tool-round loop.
+
+`Agent` now exposes its own internal cap, decoupled from any network:
+
+- `maxIterPerRun` (constructor or `agent.run(...)` option, default **1**) bounds
+  inferences within a single `run()`. Raise it to let a **standalone** agent loop
+  on its own tool calls without a network; it never affects the network bound.
+- The legacy `agent.run({ maxIter })` option still works for standalone runs
+  (back-compat) but is decoupled from `network.maxIter` and deprecated in favor of
+  `maxIterPerRun`.
+
+> Note: a prior dist led some consumers to believe the fork ran `maxIter²`
+> inferences. It does not — the network passes `maxIterPerRun: 1` to the agent.
+> You can size `network.maxIter` purely as the per-turn inference ceiling.
+
+## 9. Consuming the fork & dropping the patch
 
 1. **Remove the patch** from Clevix:
    - delete `patches/@inngest%2Fagent-kit@0.13.2.patch`

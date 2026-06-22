@@ -48,6 +48,17 @@ import {
 } from "./streaming";
 
 /**
+ * Default cap on the number of inferences a single `agent.run()` performs in its
+ * internal tool-round loop. Deliberately decoupled from a Network's `maxIter`
+ * (which bounds how many times the network calls agents): when an agent runs
+ * inside a network the network drives iteration and the agent does ONE inference
+ * per call, so total inferences per `network.run` stay ≤ `network.maxIter` rather
+ * than `maxIter²`. Raise `maxIterPerRun` to let a standalone agent loop on its
+ * own tool calls without a network.
+ */
+export const DEFAULT_MAX_ITER_PER_RUN = 1;
+
+/**
  * Agent represents a single agent, responsible for a set of tasks.
  */
 export const createAgent = <T extends StateData>(opts: Agent.Constructor<T>) =>
@@ -109,6 +120,14 @@ export class Agent<T extends StateData> {
   model: LanguageModel | undefined;
 
   /**
+   * maxIterPerRun caps the inferences performed within a single `run()` call
+   * (the agent's internal tool-round loop), independent of any Network's
+   * `maxIter`. Defaults to {@link DEFAULT_MAX_ITER_PER_RUN} (1). See that
+   * constant for why the two caps are kept separate.
+   */
+  maxIterPerRun?: number;
+
+  /**
    * mcpServers is a list of MCP (model-context-protocol) servers which can
    * provide tools to the agent.
    */
@@ -131,6 +150,7 @@ export class Agent<T extends StateData> {
     this.tool_choice = opts.tool_choice;
     this.lifecycles = opts.lifecycle;
     this.model = opts.model;
+    this.maxIterPerRun = opts.maxIterPerRun;
     this.history = opts.history;
     this.setTools(opts.tools);
     this.mcpServers = opts.mcpServers;
@@ -181,6 +201,7 @@ export class Agent<T extends StateData> {
       tools: Array.from(this.tools.values()),
       lifecycle: this.lifecycles,
       model,
+      maxIterPerRun: this.maxIterPerRun,
     });
   }
 
@@ -195,6 +216,7 @@ export class Agent<T extends StateData> {
       network,
       state,
       maxIter = 0,
+      maxIterPerRun,
       streaming,
       streamingContext,
       step,
@@ -202,6 +224,14 @@ export class Agent<T extends StateData> {
   ): Promise<AgentResult> {
     // Attempt to resolve the MCP tools, if we haven't yet done so.
     await this.initMCP();
+
+    // The internal tool-round cap is the agent's OWN cap, never the network's
+    // `maxIter`. Precedence: explicit run option → agent default → legacy
+    // `maxIter` (back-compat for standalone callers) → DEFAULT_MAX_ITER_PER_RUN.
+    const internalMaxIter =
+      maxIterPerRun ??
+      this.maxIterPerRun ??
+      (maxIter && maxIter > 0 ? maxIter : DEFAULT_MAX_ITER_PER_RUN);
 
     const rawModel = model || this.model || network?.defaultModel;
     if (!rawModel) {
@@ -249,6 +279,8 @@ export class Agent<T extends StateData> {
         messageId,
         scope: "agent",
         simulateChunking: streaming.simulateChunking,
+        chunkSize: streaming.chunkSize,
+        maxChunksPerMessage: streaming.maxChunksPerMessage,
       });
 
       // Create wrapped step for standalone agent streaming
@@ -367,9 +399,14 @@ export class Agent<T extends StateData> {
         if (standaloneStreamingContext) {
           result.id = standaloneStreamingContext.messageId;
         }
-        history = [...inference.output];
+        // Feed the assistant output AND the tool results back into history so a
+        // multi-iteration internal loop (maxIterPerRun > 1) sends a valid
+        // tool-call → tool-result sequence. Mirrors State.formatHistory's order
+        // (output then toolCalls). Single-iteration runs (the network default)
+        // are unaffected.
+        history = [...inference.output, ...inference.toolCalls];
         iter++;
-      } while (hasMoreActions && iter < maxIter);
+      } while (hasMoreActions && iter < internalMaxIter);
 
       if (this.lifecycles?.onFinish) {
         result = await this.lifecycles.onFinish({
@@ -503,25 +540,13 @@ export class Agent<T extends StateData> {
           },
         });
 
-        if (streamingContext.isSimulatedChunking()) {
-          const chunkSize = 50;
-          for (let i = 0; i < msg.content.length; i += chunkSize) {
-            await streamingContext.publishEvent({
-              event: "reasoning.delta",
-              data: {
-                partId,
-                messageId: streamingContext.messageId,
-                delta: msg.content.slice(i, i + chunkSize),
-              },
-            });
-          }
-        } else {
+        for (const delta of streamingContext.chunkContent(msg.content)) {
           await streamingContext.publishEvent({
             event: "reasoning.delta",
             data: {
               partId,
               messageId: streamingContext.messageId,
-              delta: msg.content,
+              delta,
             },
           });
         }
@@ -580,26 +605,13 @@ export class Agent<T extends StateData> {
           },
         });
 
-        if (streamingContext.isSimulatedChunking()) {
-          const chunkSize = 50;
-          for (let i = 0; i < content.length; i += chunkSize) {
-            await streamingContext.publishEvent({
-              event: "text.delta",
-              data: {
-                partId,
-                messageId: streamingContext.messageId,
-                delta: content.slice(i, i + chunkSize),
-              },
-            });
-          }
-        } else {
-          // Single delta when not simulating chunking
+        for (const delta of streamingContext.chunkContent(content)) {
           await streamingContext.publishEvent({
             event: "text.delta",
             data: {
               partId,
               messageId: streamingContext.messageId,
-              delta: content,
+              delta,
             },
           });
         }
@@ -686,26 +698,15 @@ export class Agent<T extends StateData> {
               metadata: { toolName: tool.name, agentName: this.name },
             },
           });
-          if (streamingContext.isSimulatedChunking()) {
-            const argChunkSize = 50;
-            for (let i = 0; i < toolArgsJson.length; i += argChunkSize) {
-              await streamingContext.publishEvent({
-                event: "tool_call.arguments.delta",
-                data: {
-                  partId: toolCallPartId,
-                  delta: toolArgsJson.slice(i, i + argChunkSize),
-                  toolName: i === 0 ? tool.name : undefined,
-                  messageId: streamingContext.messageId,
-                },
-              });
-            }
-          } else {
+          const argChunks = streamingContext.chunkContent(toolArgsJson);
+          for (let i = 0; i < argChunks.length; i++) {
             await streamingContext.publishEvent({
               event: "tool_call.arguments.delta",
               data: {
                 partId: toolCallPartId,
-                delta: toolArgsJson,
-                toolName: tool.name,
+                delta: argChunks[i]!,
+                // toolName is included only on the first delta.
+                toolName: i === 0 ? tool.name : undefined,
                 messageId: streamingContext.messageId,
               },
             });
@@ -778,24 +779,12 @@ export class Agent<T extends StateData> {
           });
 
           const resultJson = JSON.stringify(result);
-          if (streamingContext.isSimulatedChunking()) {
-            const outChunk = 80;
-            for (let i = 0; i < resultJson.length; i += outChunk) {
-              await streamingContext.publishEvent({
-                event: "tool_call.output.delta",
-                data: {
-                  partId: outputPartId,
-                  delta: resultJson.slice(i, i + outChunk),
-                  messageId: streamingContext.messageId,
-                },
-              });
-            }
-          } else {
+          for (const delta of streamingContext.chunkContent(resultJson)) {
             await streamingContext.publishEvent({
               event: "tool_call.output.delta",
               data: {
                 partId: outputPartId,
-                delta: resultJson,
+                delta,
                 messageId: streamingContext.messageId,
               },
             });
@@ -1034,6 +1023,7 @@ export class RoutingAgent<T extends StateData> extends Agent<T> {
       tools: Array.from(this.tools.values()),
       lifecycle: this.lifecycles,
       model,
+      maxIterPerRun: this.maxIterPerRun,
     });
   }
 }
@@ -1050,6 +1040,12 @@ export namespace Agent {
     tool_choice?: Tool.Choice;
     lifecycle?: Lifecycle<T>;
     model?: LanguageModel;
+    /**
+     * Caps inferences within a single `run()` (the internal tool-round loop),
+     * independent of a Network's `maxIter`. Defaults to
+     * {@link DEFAULT_MAX_ITER_PER_RUN}.
+     */
+    maxIterPerRun?: number;
     mcpServers?: MCP.Server[];
     history?: HistoryConfig<T>;
   }
@@ -1068,7 +1064,19 @@ export namespace Agent {
      * supply their own state.
      */
     state?: State<T>;
+    /**
+     * @deprecated For the agent's internal tool-round loop, prefer
+     * `maxIterPerRun`. When run inside a Network, the network controls iteration
+     * and passes `maxIterPerRun: 1`; this option is honored only for standalone
+     * runs (back-compat) and never coupled to the network's `maxIter`.
+     */
     maxIter?: number;
+    /**
+     * Caps inferences within this single `run()` (the internal tool-round loop),
+     * independent of a Network's `maxIter`. Defaults to the agent's
+     * `maxIterPerRun` or {@link DEFAULT_MAX_ITER_PER_RUN}.
+     */
+    maxIterPerRun?: number;
     /**
      * Streaming configuration for standalone agent runs. When provided, the agent will
      * automatically emit streaming events throughout its execution. Note: this is ignored
