@@ -43,6 +43,21 @@ export const AgentMessageChunkSchema = z.object({
 // RUN LIFECYCLE EVENTS
 // =============================================================================
 
+/**
+ * Why a network run stopped early (before the agent stack drained). Carried by
+ * {@link RunInterruptedEvent} and, for visibility, on the terminal
+ * {@link RunCompletedEvent} / {@link StreamEndedEvent}. The string-literal escape
+ * hatch lets consumers use custom reasons without a fork change.
+ */
+export type StopReason =
+  | "budget"
+  | "max_tokens"
+  | "timeout"
+  | "user_cancellation"
+  | "cancelled"
+  | "other"
+  | (string & {});
+
 export interface RunStartedEvent extends AgentMessageChunk {
   event: "run.started";
   data: {
@@ -64,6 +79,8 @@ export interface RunCompletedEvent extends AgentMessageChunk {
     name: string;
     messageId?: string; // Optional message context
     result?: unknown; // Final result from the run
+    /** Set when the run stopped early (e.g. via stopWhen); absent on a normal finish. */
+    reason?: StopReason;
     usage?: {
       promptTokens: number;
       completionTokens: number;
@@ -92,7 +109,7 @@ export interface RunInterruptedEvent extends AgentMessageChunk {
     runId: string;
     scope: "network" | "agent";
     name: string;
-    reason: "max_tokens" | "user_cancellation" | "timeout" | "other";
+    reason: StopReason;
     metadata?: Record<string, unknown>;
   };
 }
@@ -305,6 +322,8 @@ export interface StreamEndedEvent extends AgentMessageChunk {
   data: {
     scope: "network" | "agent";
     messageId?: string; // Optional message context
+    /** Set when the run stopped early (e.g. via stopWhen); absent on a normal finish. */
+    reason?: StopReason;
   };
 }
 

@@ -468,7 +468,73 @@ things to know:
   re-running a read on replay is only wasted latency (not a correctness or
   billing bug), and its output never occupies step state.
 
-## 10. Consuming the fork & dropping the patch
+## 10. Ending a run early with `stopWhen` (budget / iteration caps)
+
+The router is the only place to stop a run, and it runs **between** inferences —
+fine, because that's the only *safe* stop point (every persisted `AgentResult` is
+complete: `output` + all its `toolCalls`; aborting mid-inference would orphan a
+tool-call and break replay/history). `stopWhen` formalizes that boundary and makes
+a budget-stop **legible on the stream**, instead of looking like a normal finish.
+
+```ts
+createNetwork({
+  /* … */
+  stopWhen: ({ network, callCount, lastResult }) =>
+    regulator.budgetReached ? { reason: "budget", metadata: { … } } : undefined,
+});
+// or per-run: network.run(msg, { state, streaming, stopWhen })
+```
+
+- Evaluated **before each inference**, decoupled from routing (it composes with
+  and overrides the router). Return a `{ reason, metadata? }` to stop, or
+  `undefined`/`false` to continue. It can also stop **before the first** inference
+  (already over budget at turn start → 0 inferences).
+- On stop the network emits **`run.interrupted` `{ reason }`** and then the normal
+  terminal `run.completed` + `stream.ended` — both now carry `reason?: StopReason`
+  so a subscriber that only watches the terminal still learns why. Normal finishes
+  have no `reason`. `StopReason` is `"budget" | "max_tokens" | "timeout" |
+  "user_cancellation" | "cancelled" | "other" | (string & {})`.
+- **Replay rule:** `stopWhen` MUST be a pure function of `network.state` (rebuilt
+  deterministically from memoized steps). Reading `Date.now()`/random would make a
+  replay stop at a different point — the same hazard as a non-deterministic step id.
+  Reading accumulated token usage off the results is deterministic and fine.
+- **Back-compat:** purely additive; `router → undefined` consumers are unchanged.
+  (Also fixes a latent double-fire of the network terminal on the unknown-agent
+  path — there is now a single terminal emitter.)
+
+### Long-running tools: pull, don't push
+
+`stopWhen` ticks **between** inferences, so it can't bound a single tool that does
+unbounded work inside its one `step.run` (e.g. a subagent doing many model calls,
+or a tool generating dozens of images). And the framework **cannot** push an
+`AbortSignal` into a running tool — the handler runs *inside* a `step.run`, so the
+framework isn't executing alongside it to fire one (and on an Inngest `cancelOn`
+hard-kill the function is torn down without the fork getting to abort anything).
+
+So a long tool must **cooperatively check budget itself** — it already receives
+`network`, so it reads your budget off `network.state` and winds down, returning a
+**valid** result (a partial output, or an error result) so the turn stays
+consistent:
+
+```ts
+createTool({
+  name: "subagent",
+  handler: async (input, { network }) => {
+    const out = [];
+    for (const unit of plan(input)) {
+      if ((network.state.data as ClevixState).budgetReached) break; // wind down
+      out.push(await doUnit(unit));
+    }
+    return out; // always a valid tool_result
+  },
+});
+```
+
+This is app-side by necessity, not by omission: core's contribution is already
+made by handing the tool `network`. (If you pass `opts.step` through, also remember
+a multi-call tool should wrap each unit in its own `step.run` — see §9.)
+
+## 11. Consuming the fork & dropping the patch
 
 1. **Remove the patch** from Clevix:
    - delete `patches/@inngest%2Fagent-kit@0.13.2.patch`

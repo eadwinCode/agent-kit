@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/require-await, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment */
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/require-await, @typescript-eslint/no-unsafe-argument */
 /**
  * Regression test for streaming part-id step-id collisions.
  *
@@ -98,9 +98,9 @@ describe("streaming part-id step ids — same tool twice in one inference", () =
     expect(new Set(outputPartIds).size).toBe(2);
 
     // … and NONE of them was Inngest-auto-suffixed (a `:1` means a collision).
-    expect(rec.ids.some((id) => /generate-(tool|output)-part-id-.*:\d+$/.test(id))).toBe(
-      false
-    );
+    expect(
+      rec.ids.some((id) => /generate-(tool|output)-part-id-.*:\d+$/.test(id))
+    ).toBe(false);
   });
 
   it("produces byte-identical part-id step ids across a replay", async () => {
