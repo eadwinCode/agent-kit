@@ -547,13 +547,18 @@ export class Agent<T extends StateData> {
     // Stream reasoning content if streaming context exists
     if (streamingContext) {
       const reasoningMsgs = result.output.filter((m) => m.type === "reasoning");
-      for (const msg of reasoningMsgs) {
+      // `index` is the reasoning part's position within this inference. It MUST
+      // be part of the step id: an inference can emit >1 reasoning part, and
+      // without it both parts share a step id — Inngest then collides/auto-
+      // suffixes them, the id drifts across replays, and the part is re-published
+      // (the chunk is delivered twice).
+      for (const [index, msg] of reasoningMsgs.entries()) {
         if (msg.type !== "reasoning") continue;
 
         const stepTools = step || (await getStepTools());
         const partId = stepTools
           ? await stepTools.run(
-              `generate-reasoning-part-id-${streamingContext.messageId}`,
+              `generate-reasoning-part-id-${streamingContext.messageId}-${index}`,
               () => {
                 return streamingContext.generatePartId();
               }
@@ -697,7 +702,14 @@ export class Agent<T extends StateData> {
         continue;
       }
 
-      for (const tool of msg.tools) {
+      // `index` is the tool call's position within this inference. It MUST be
+      // part of the streaming part-id step ids below: the model commonly calls
+      // the same tool twice in one inference (e.g. two read_files), so keying a
+      // step id on the tool NAME alone collides — Inngest then auto-suffixes the
+      // duplicate, the id drifts across replays, and the part is re-published
+      // (its `*.delta` chunks are delivered twice). The index is deterministic
+      // across replays; the tool NAME is kept only for readability.
+      for (const [index, tool] of msg.tools.entries()) {
         const found = this.tools.get(tool.name);
         if (!found) {
           throw new Error(
@@ -712,7 +724,7 @@ export class Agent<T extends StateData> {
           const stepTools = step || (await getStepTools());
           const toolCallPartId = stepTools
             ? await stepTools.run(
-                `generate-tool-part-id-${streamingContext.messageId}-${tool.name}`,
+                `generate-tool-part-id-${streamingContext.messageId}-${tool.name}-${index}`,
                 () => {
                   return streamingContext.generatePartId();
                 }
@@ -779,7 +791,7 @@ export class Agent<T extends StateData> {
           const stepTools = step || (await getStepTools());
           const outputPartId = stepTools
             ? await stepTools.run(
-                `generate-output-part-id-${streamingContext.messageId}-${tool.name}`,
+                `generate-output-part-id-${streamingContext.messageId}-${tool.name}-${index}`,
                 () => {
                   return streamingContext.generatePartId();
                 }
