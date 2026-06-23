@@ -18,6 +18,7 @@ import {
   StreamingContext,
   createStepWrapper,
   generateId,
+  type StopReason,
   type StreamingConfig,
 } from "./streaming";
 import { getStepTools } from "./util";
@@ -60,6 +61,13 @@ export class Network<T extends StateData> {
   router?: Network.Router<T>;
 
   /**
+   * stopWhen is an optional stop policy evaluated before each inference (see
+   * {@link Network.StopWhen}). It ends the run early with a typed reason; the
+   * router is unaffected when it is absent.
+   */
+  stopWhen?: Network.StopWhen<T>;
+
+  /**
    * maxIter is the maximum number of times the we can call agents before ending
    * the network's run loop.
    */
@@ -92,6 +100,7 @@ export class Network<T extends StateData> {
     defaultState,
     router,
     defaultRouter,
+    stopWhen,
     history,
   }: Network.Constructor<T>) {
     this.name = name;
@@ -100,6 +109,7 @@ export class Network<T extends StateData> {
     this._agents = new Map();
     this.defaultModel = defaultModel;
     this.router = defaultRouter ?? router;
+    this.stopWhen = stopWhen;
     this.maxIter = maxIter || 0;
     this._stack = [];
     this.history = history;
@@ -341,6 +351,16 @@ export namespace Network {
     defaultState?: State<T>;
     router?: Router<T>;
     defaultRouter?: Router<T>;
+    /**
+     * stopWhen is a stop policy checked BEFORE each agent inference, decoupled
+     * from routing. Return a {@link NetworkStop} (with a typed reason) to end the
+     * run early — the network emits `run.interrupted` then the normal terminal
+     * `run.completed`/`stream.ended` (carrying the reason). Use it for per-turn
+     * budget/iteration caps; it composes with (and overrides) the router. It MUST
+     * be a deterministic function of `network.state` so an Inngest replay stops at
+     * the same point (no `Date.now()`/random).
+     */
+    stopWhen?: StopWhen<T>;
     history?: HistoryConfig<T>;
   };
 
@@ -349,6 +369,8 @@ export namespace Network {
     overrides?: {
       router?: Router<T>;
       defaultRouter?: Router<T>;
+      /** Per-run stop policy; overrides the network's `stopWhen`. */
+      stopWhen?: StopWhen<T>;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       state?: State<T> | Record<string, any>;
       streaming?: StreamingConfig;
@@ -417,6 +439,41 @@ export namespace Network {
       lastResult?: AgentResult;
     }
   }
+
+  /**
+   * NetworkStop is returned by a {@link StopWhen} predicate to end a run early.
+   */
+  export interface NetworkStop {
+    /** Why the run is stopping; surfaced on `run.interrupted` + the terminal events. */
+    reason: StopReason;
+    /** Optional structured context attached to the `run.interrupted` event. */
+    metadata?: Record<string, unknown>;
+  }
+
+  /**
+   * StopWhen is a stop policy evaluated before each agent inference. Returning a
+   * {@link NetworkStop} ends the run at the SAFE between-inference boundary (every
+   * persisted AgentResult is complete: `output` + all `toolCalls`). Return
+   * `undefined`/`false` to continue.
+   *
+   * It MUST be a pure function of `network.state` (which is rebuilt
+   * deterministically from memoized steps on replay) — reading wall-clock/random
+   * makes a replay diverge, the same hazard as a non-deterministic step id.
+   */
+  export type StopWhen<T extends StateData> = (
+    args: StopWhen.Args<T>
+  ) => MaybePromise<NetworkStop | undefined | false>;
+
+  export namespace StopWhen {
+    export interface Args<T extends StateData> {
+      /** The network being coordinated; budget state lives on `network.state`. */
+      network: NetworkRun<T>;
+      /** Inferences completed so far this run (`network.state.results.length`). */
+      callCount: number;
+      /** The most recent AgentResult, if any. */
+      lastResult?: AgentResult;
+    }
+  }
 }
 
 export class NetworkRun<T extends StateData> extends Network<T> {
@@ -428,6 +485,7 @@ export class NetworkRun<T extends StateData> extends Network<T> {
       defaultModel: network.defaultModel,
       defaultState: network.state,
       router: network.router,
+      stopWhen: network.stopWhen,
       maxIter: network.maxIter,
       history: network.history,
     });
@@ -469,6 +527,11 @@ export class NetworkRun<T extends StateData> extends Network<T> {
 
     const streamingPublish = overrides?.streaming?.publish;
     let streamingContext: StreamingContext | undefined;
+
+    // Effective stop policy (per-run override → network default) and a holder for
+    // the decision, so the terminal events emitted in `finally` can carry its reason.
+    const stopWhen = overrides?.stopWhen ?? this.stopWhen;
+    let stopInfo: Network.NetworkStop | undefined;
 
     // If history.get is configured AND the state is empty, use it to load initial history
     // When passing passing in messages from the client, history.get() is disabled - allowing the client to maintain conversation state and send it with each request
@@ -607,6 +670,35 @@ export class NetworkRun<T extends StateData> extends Network<T> {
         this._stack.length > 0 &&
         (this.maxIter === 0 || this._counter < this.maxIter)
       ) {
+        // Stop policy: evaluated BEFORE popping/inferring, at the safe
+        // between-inference boundary (every persisted AgentResult is complete).
+        // Decoupled from routing; pure over state → replay-stable. On stop we
+        // emit run.interrupted then fall through to the single terminal emitter
+        // (the `finally` below), which now carries the reason.
+        if (stopWhen) {
+          const decision = await stopWhen({
+            network: this,
+            callCount: this._counter,
+            lastResult: this.state.results[this.state.results.length - 1],
+          });
+          if (decision) {
+            stopInfo = decision;
+            if (streamingContext) {
+              await streamingContext.publishEvent({
+                event: "run.interrupted",
+                data: {
+                  runId: networkRunId,
+                  scope: "network",
+                  name: this.name,
+                  reason: decision.reason,
+                  metadata: decision.metadata,
+                },
+              });
+            }
+            break;
+          }
+        }
+
         // XXX: It would be possible to parallel call these agents here by
         // fetching the entire stack, parallel running, then awaiting the
         // responses.   However, this confuses history and we'll take our time to
@@ -619,27 +711,11 @@ export class NetworkRun<T extends StateData> extends Network<T> {
         // the router.
         const agent = agentName && this._agents.get(agentName);
         if (!agent) {
-          // We're done.
-          // Emit run.completed and stream.ended if streaming
-          if (streamingContext) {
-            await streamingContext.publishEvent({
-              event: "run.completed",
-              data: {
-                runId: networkRunId,
-                scope: "network",
-                name: this.name,
-                messageId: networkRunId, // Use networkRunId for network completion
-              },
-            });
-            await streamingContext.publishEvent({
-              event: "stream.ended",
-              data: {
-                scope: "network",
-                messageId: networkRunId,
-              },
-            });
-          }
-          return this;
+          // Stack is drained (or a scheduled agent is unknown) — we're done.
+          // Break out to the single terminal emitter in `finally` rather than
+          // emitting run.completed/stream.ended here AND in finally (which would
+          // double-fire the terminal events).
+          break;
         }
 
         // The network is the iteration authority: it calls the agent once per
@@ -791,7 +867,10 @@ export class NetworkRun<T extends StateData> extends Network<T> {
       // Re-throw the original error
       throw error;
     } finally {
-      // Always emit completion events for network streaming
+      // Always emit completion events for network streaming. This is the SINGLE
+      // terminal emitter for every exit path (normal drain, stopWhen, unknown
+      // agent, even after run.failed) so subscribers reliably unstick. When the
+      // run stopped early, `stopInfo.reason` annotates both terminal events.
       if (streamingContext) {
         try {
           await streamingContext.publishEvent({
@@ -801,6 +880,7 @@ export class NetworkRun<T extends StateData> extends Network<T> {
               scope: "network",
               name: this.name,
               messageId: networkRunId, // Use networkRunId for network completion in finally block
+              ...(stopInfo ? { reason: stopInfo.reason } : {}),
             },
           });
           await streamingContext.publishEvent({
@@ -808,6 +888,7 @@ export class NetworkRun<T extends StateData> extends Network<T> {
             data: {
               scope: "network",
               messageId: networkRunId,
+              ...(stopInfo ? { reason: stopInfo.reason } : {}),
             },
           });
         } catch (streamingError) {
