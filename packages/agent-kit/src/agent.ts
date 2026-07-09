@@ -312,6 +312,7 @@ export class Agent<T extends StateData> {
         simulateChunking: streaming.simulateChunking,
         chunkSize: streaming.chunkSize,
         maxChunksPerMessage: streaming.maxChunksPerMessage,
+        streamReasoning: streaming.streamReasoning,
       });
 
       // Create wrapped step for standalone agent streaming
@@ -544,8 +545,10 @@ export class Agent<T extends StateData> {
       });
     }
 
-    // Stream reasoning content if streaming context exists
-    if (streamingContext) {
+    // Stream reasoning content only when the caller opted in via
+    // `streaming.streamReasoning` (default off). Thinking always runs on the
+    // model; its chain-of-thought is forwarded to the client ONLY when requested.
+    if (streamingContext?.streamReasoning) {
       const reasoningMsgs = result.output.filter((m) => m.type === "reasoning");
       // `index` is the reasoning part's position within this inference. It MUST
       // be part of the step id: an inference can emit >1 reasoning part, and

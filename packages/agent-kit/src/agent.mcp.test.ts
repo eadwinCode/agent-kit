@@ -170,7 +170,7 @@ const newMCPServer = async (
             inputSchema: {
               type: "object",
               properties: {
-                format: "string",
+                format: { type: "string" },
               },
               required: ["format"],
             },
