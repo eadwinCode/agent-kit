@@ -399,6 +399,14 @@ export interface StreamingConfig {
    * {@link DEFAULT_MAX_CHUNKS_PER_MESSAGE}; set to 0 to disable the cap.
    */
   maxChunksPerMessage?: number;
+  /**
+   * When true, the model's reasoning ("thinking") parts are streamed to the
+   * client as `part.created` / `reasoning.delta` / `part.completed` (type
+   * `"reasoning"`) events. Defaults to **false**: thinking still runs on the
+   * model, but its chain-of-thought is NOT forwarded to the UI. Set to `true`
+   * to surface reasoning in the transcript.
+   */
+  streamReasoning?: boolean;
 }
 
 /**
@@ -411,6 +419,10 @@ export class StreamingContext {
   private simulateChunking: boolean;
   private chunkSize: number;
   private maxChunksPerMessage: number;
+
+  /** Whether reasoning ("thought") parts are forwarded to the client. Default
+   *  false — thinking runs on the model but is not streamed to the UI. */
+  public readonly streamReasoning: boolean;
 
   public readonly runId: string;
   public readonly parentRunId?: string;
@@ -432,6 +444,7 @@ export class StreamingContext {
     simulateChunking?: boolean;
     chunkSize?: number;
     maxChunksPerMessage?: number;
+    streamReasoning?: boolean;
   }) {
     this.publish = config.publish;
     this.runId = config.runId;
@@ -449,6 +462,7 @@ export class StreamingContext {
         : DEFAULT_CHUNK_SIZE;
     this.maxChunksPerMessage =
       config.maxChunksPerMessage ?? DEFAULT_MAX_CHUNKS_PER_MESSAGE;
+    this.streamReasoning = config.streamReasoning ?? false;
   }
 
   /**
@@ -468,6 +482,7 @@ export class StreamingContext {
       simulateChunking: this.simulateChunking,
       chunkSize: this.chunkSize,
       maxChunksPerMessage: this.maxChunksPerMessage,
+      streamReasoning: this.streamReasoning,
     });
   }
 
@@ -492,6 +507,7 @@ export class StreamingContext {
       simulateChunking: this.simulateChunking,
       chunkSize: this.chunkSize,
       maxChunksPerMessage: this.maxChunksPerMessage,
+      streamReasoning: this.streamReasoning,
     });
   }
 
@@ -509,6 +525,7 @@ export class StreamingContext {
       simulateChunking?: boolean;
       chunkSize?: number;
       maxChunksPerMessage?: number;
+      streamReasoning?: boolean;
     }
   ): StreamingContext {
     const debug = config.debug ?? process.env.NODE_ENV === "development";
@@ -526,6 +543,7 @@ export class StreamingContext {
       simulateChunking: config.simulateChunking ?? false,
       chunkSize: config.chunkSize,
       maxChunksPerMessage: config.maxChunksPerMessage,
+      streamReasoning: config.streamReasoning ?? false,
     });
   }
 

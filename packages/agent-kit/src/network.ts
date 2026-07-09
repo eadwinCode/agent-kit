@@ -171,15 +171,27 @@ export class Network<T extends StateData> {
       if (overrides.state instanceof State) {
         state = overrides.state;
       } else {
+        // `overrides.state` is not an `instanceof State` of THIS module copy.
+        // This happens when the caller constructed its State from a DIFFERENT
+        // physical copy of @inngest/agent-kit (e.g. a monorepo where two
+        // workspace packages each resolved their own nested install) — the
+        // class identity differs even though the shape is identical. Rebuild a
+        // native State from the duck-typed fields. `threadId` MUST be carried
+        // over: dropping it makes the history adapter mint a fresh randomUUID()
+        // for the `createThread` step id on every Inngest replay, which is
+        // non-deterministic and sends `network.run` into an infinite
+        // thread-creation loop that never reaches inference.
         const stateObj = overrides.state as {
           data?: T;
           _messages?: Message[];
           _results?: AgentResult[];
+          threadId?: string;
         };
         state = new State<T>({
           data: stateObj.data || ({} as T),
           messages: stateObj._messages || [],
           results: stateObj._results || [],
+          threadId: stateObj.threadId,
         });
       }
     } else {
@@ -622,6 +634,7 @@ export class NetworkRun<T extends StateData> extends Network<T> {
         simulateChunking: overrides?.streaming?.simulateChunking,
         chunkSize: overrides?.streaming?.chunkSize,
         maxChunksPerMessage: overrides?.streaming?.maxChunksPerMessage,
+        streamReasoning: overrides?.streaming?.streamReasoning,
       });
       await streamingContext.publishEvent({
         event: "run.started",
