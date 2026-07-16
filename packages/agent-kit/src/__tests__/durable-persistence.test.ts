@@ -134,7 +134,9 @@ describe("Bug 1/cross-cutting — persistence step ids are checksum-free", () =>
 
     const out: Message[] = [{ type: "text", role: "assistant", content: "hi" }];
     const r1 = new AgentResult("a", out, [], new Date(1000));
-    const r2 = new AgentResult("a", out, [], new Date(2000)); // different createdAt → different checksum
+    r1.id = "result-1";
+    const r2 = new AgentResult("a", out, [], new Date(2000));
+    r2.id = "result-2"; // different id → different checksum (createdAt no longer participates — replay-stability)
     expect(r1.checksum).not.toBe(r2.checksum);
 
     const history: HistoryConfig<any> = { appendResults: async () => {} };
