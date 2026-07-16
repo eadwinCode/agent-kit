@@ -1,0 +1,19 @@
+# .graphifyignore
+**/dist
+node_modules/
+**/dist/
+**/public/
+**/logs/
+**/.inngest/
+**/.turbo/
+*.generated.py
+docs/public/**
+.claude
+.codex
+.cursor
+.vscode
+.graphify-out
+.claude-design
+untitled
+bun.lock
+pnpm-lock.yaml
