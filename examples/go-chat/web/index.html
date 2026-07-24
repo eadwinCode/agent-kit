@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>go-chat — agent-kit Go × use-agent</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b0b0d;
+        --panel: #16161a;
+        --line: #2a2a31;
+        --fg: #e9e9ee;
+        --muted: #8d8d99;
+        --accent: #4f8cff;
+        --think: #a98bff;
+        --tool: #4bd0a0;
+        --danger: #ff6b6b;
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #fbfbfd; --panel: #fff; --line: #e5e5ec; --fg: #16161a;
+          --muted: #6b6b78;
+        }
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--fg); }
+      #root { display: flex; flex-direction: column; height: 100vh; }
+
+      header {
+        display: flex; align-items: center; gap: 12px;
+        padding: 12px 20px; border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      header h1 { font-size: 15px; margin: 0; letter-spacing: -0.01em; }
+      .title { font-size: 13px; color: var(--muted); }
+      .spacer { flex: 1; }
+      .tokens { display: inline-flex; gap: 8px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: default; }
+      .tok { display: inline-flex; align-items: center; gap: 3px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 999px; }
+      .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+      .conn i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+      .conn.on i { background: var(--tool); box-shadow: 0 0 0 3px color-mix(in srgb, var(--tool) 22%, transparent); }
+      .conn.off i { background: var(--danger); }
+
+      .log { flex: 1; overflow-y: auto; padding: 22px 20px 8px; display: flex; flex-direction: column; gap: 14px; scroll-behavior: smooth; }
+      .empty { color: var(--muted); font-size: 14px; margin: auto; }
+
+      .bubble { max-width: 660px; padding: 11px 15px; border-radius: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+      .bubble.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 5px; }
+      .bubble.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+
+      .turn { display: flex; flex-direction: column; gap: 8px; align-self: flex-start; max-width: 720px; width: 100%; }
+      .tool-group { display: flex; flex-direction: column; gap: 6px; }
+      .group-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding-left: 2px; }
+
+      .part { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); overflow: hidden; }
+      .part.is-streaming { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+      .part.failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+      .part-head {
+        display: flex; align-items: center; gap: 9px; width: 100%;
+        background: none; border: 0; color: inherit; font: inherit;
+        padding: 9px 12px; cursor: pointer; text-align: left;
+      }
+      .part-head.static { cursor: default; }
+      .part-head:hover:not(.static) { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+      .chev { font-size: 10px; color: var(--muted); transition: transform 0.15s; display: inline-block; }
+      .chev.open { transform: rotate(90deg); }
+      .glyph { font-size: 12px; width: 14px; text-align: center; }
+      .reasoning .glyph { color: var(--think); }
+      .tool .glyph { color: var(--tool); }
+      .failed .glyph { color: var(--danger); }
+      .label { font-size: 13px; }
+      .label code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12.5px; }
+      .muted { color: var(--muted); font-weight: 400; }
+
+      .part-body { padding: 0 12px 11px 35px; font-size: 13px; }
+      .reasoning-body { color: var(--muted); font-style: italic; white-space: pre-wrap; line-height: 1.55; }
+      .kv { margin-top: 6px; }
+      .kv .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+      .kv pre {
+        margin: 3px 0 0; padding: 8px 10px; background: var(--bg);
+        border: 1px solid var(--line); border-radius: 7px;
+        font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px;
+        overflow-x: auto; white-space: pre; max-height: 260px;
+      }
+
+      .activity { display: flex; align-items: center; gap: 9px; align-self: flex-start; color: var(--muted); font-size: 13px; padding-left: 3px; }
+
+      .dots { display: inline-flex; gap: 3px; margin-left: auto; }
+      .part-head .dots { margin-left: auto; }
+      .dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: 0.35; animation: pulse 1.2s infinite; }
+      .dots i:nth-child(2) { animation-delay: 0.18s; }
+      .dots i:nth-child(3) { animation-delay: 0.36s; }
+      @keyframes pulse { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+
+      .caret { display: inline-block; width: 2px; height: 1em; background: var(--accent); margin-left: 2px; vertical-align: text-bottom; animation: blink 1s step-end infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+
+      form { display: flex; gap: 9px; padding: 14px 20px; border-top: 1px solid var(--line); background: var(--panel); }
+      input {
+        flex: 1; padding: 11px 14px; border-radius: 10px;
+        border: 1px solid var(--line); background: var(--bg); color: inherit; font-size: 14px;
+      }
+      input:focus { outline: none; border-color: var(--accent); }
+      button {
+        padding: 11px 20px; border-radius: 10px; border: 0;
+        background: var(--accent); color: #fff; font-size: 14px; font-weight: 500; cursor: pointer;
+      }
+      button:disabled { opacity: 0.45; cursor: default; }
+
+      @media (prefers-reduced-motion: reduce) {
+        .dots i, .caret { animation: none; }
+        .log { scroll-behavior: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

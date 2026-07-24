@@ -68,7 +68,7 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
       const type = data.type;
       const messageId = data.messageId;
       const partId = data.partId;
-      if (type === "text" || type === "tool-call") {
+      if (type === "text" || type === "tool-call" || type === "reasoning") {
         if (typeof messageId === "string" && typeof partId === "string") {
           return {
             event: obj.event,
@@ -87,6 +87,32 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
             id,
           } as AgentKitEvent<TManifest>;
         }
+      }
+      break;
+    }
+    case "reasoning.delta": {
+      const { messageId, partId, delta } = data as {
+        messageId?: unknown;
+        partId?: unknown;
+        delta?: unknown;
+      };
+      if (
+        typeof messageId === "string" &&
+        typeof partId === "string" &&
+        typeof delta === "string"
+      ) {
+        return {
+          event: obj.event,
+          data: {
+            threadId: data.threadId as string | undefined,
+            messageId,
+            partId,
+            delta,
+          },
+          timestamp: obj.timestamp,
+          sequenceNumber: obj.sequenceNumber,
+          id,
+        } as AgentKitEvent<TManifest>;
       }
       break;
     }
@@ -164,7 +190,10 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
       const messageId = data.messageId;
       const partId = data.partId;
       if (
-        (type === "text" || type === "tool-call" || type === "tool-output") &&
+        (type === "text" ||
+          type === "tool-call" ||
+          type === "tool-output" ||
+          type === "reasoning") &&
         typeof messageId === "string" &&
         typeof partId === "string"
       ) {
