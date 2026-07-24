@@ -63,9 +63,9 @@ const (
 	EventPartCompleted = "part.completed"
 	EventPartFailed    = "part.failed"
 
-	EventTextDelta     = "text.delta"
-	EventToolArgsDelta = "tool_call.arguments.delta"
-	EventToolOutDelta  = "tool_call.output.delta"
+	EventTextDelta      = "text.delta"
+	EventToolArgsDelta  = "tool_call.arguments.delta"
+	EventToolOutDelta   = "tool_call.output.delta"
 	EventReasoningDelta = "reasoning.delta"
 	EventDataDelta      = "data.delta"
 

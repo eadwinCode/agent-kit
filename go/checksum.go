@@ -1,9 +1,3 @@
-// Package agentkit is a Go port of @inngest/agent-kit: a framework for
-// creating and orchestrating durable AI agents on Inngest.
-//
-// It maintains strict JSON wire parity with the TypeScript package so the two
-// can run side by side against the same database and streaming clients during
-// a migration.
 package agentkit
 
 import (

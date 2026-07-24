@@ -152,19 +152,19 @@ func TestNetworkStreamingEventFlow(t *testing.T) {
 
 	got := cap.events()
 	want := []string{
-		"run.started",               // network
-		"run.started",               // agent (child)
-		"part.created",              // text part ("calling set_sku")
+		"run.started",  // network
+		"run.started",  // agent (child)
+		"part.created", // text part ("calling set_sku")
 		"text.delta",
 		"part.completed",
-		"part.created",              // tool-call args
+		"part.created", // tool-call args
 		"tool_call.arguments.delta",
 		"part.completed",
-		"part.created",              // tool output
+		"part.created", // tool output
 		"tool_call.output.delta",
 		"part.completed",
-		"run.completed",             // agent
-		"run.completed",             // network (terminal)
+		"run.completed", // agent
+		"run.completed", // network (terminal)
 		"stream.ended",
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
