@@ -97,13 +97,18 @@ export type PartCreated = EventBase & {
   data: WithThread & {
     messageId: string;
     partId: string;
-    type: "text" | "tool-call";
-    metadata?: { toolName?: string };
+    type: "text" | "tool-call" | "reasoning";
+    metadata?: { toolName?: string; agentName?: string };
   };
 };
 
 export type TextDelta = EventBase & {
   event: "text.delta";
+  data: WithThread & { messageId: string; partId: string; delta: string };
+};
+
+export type ReasoningDelta = EventBase & {
+  event: "reasoning.delta";
   data: WithThread & { messageId: string; partId: string; delta: string };
 };
 
@@ -124,7 +129,7 @@ export type ToolOutputDelta = EventBase & {
 };
 
 type PartCompletedBasePayload<
-  TType extends "text" | "tool-call" | "tool-output",
+  TType extends "text" | "tool-call" | "tool-output" | "reasoning",
 > = WithThread & {
   messageId: string;
   partId: string;
@@ -134,7 +139,7 @@ type PartCompletedBasePayload<
 };
 
 type PartCompletedEventBase<
-  TType extends "text" | "tool-call" | "tool-output",
+  TType extends "text" | "tool-call" | "tool-output" | "reasoning",
   TExtra extends Record<string, unknown> = Record<string, unknown>,
 > = EventBase & {
   event: "part.completed";
@@ -143,6 +148,13 @@ type PartCompletedEventBase<
 
 type PartCompletedTextEvent = PartCompletedEventBase<
   "text",
+  {
+    finalContent?: string | undefined;
+  }
+>;
+
+type PartCompletedReasoningEvent = PartCompletedEventBase<
+  "reasoning",
   {
     finalContent?: string | undefined;
   }
@@ -191,6 +203,7 @@ type ManifestToolOutputEvent<TManifest extends ToolManifest> =
 
 export type TypedPartCompletedEvent<TManifest extends ToolManifest> =
   | PartCompletedTextEvent
+  | PartCompletedReasoningEvent
   | PartCompletedToolCallEvent<TManifest>
   | ManifestToolOutputEvent<TManifest>
   | PartCompletedToolOutputFallbackEvent;
@@ -203,6 +216,7 @@ export type AgentKitEvent<TManifest extends ToolManifest = ToolManifest> =
   | StreamEnded
   | PartCreated
   | TextDelta
+  | ReasoningDelta
   | ToolArgsDelta
   | ToolOutputDelta
   | TypedPartCompletedEvent<TManifest>

@@ -14,6 +14,8 @@ import type {
   AgentKitEvent,
   ToolManifest,
   ToolResultPayload,
+  ReasoningDelta,
+  ReasoningUIPart,
 } from "../../types/index.js";
 
 // Safe accessor for typed event.data
@@ -499,6 +501,12 @@ function applyEvent<
     case "text.delta": {
       return applyTextDelta<TManifest, TState>(thread, (evt as TextDelta).data);
     }
+    case "reasoning.delta": {
+      return applyReasoningDelta<TManifest, TState>(
+        thread,
+        (evt as ReasoningDelta).data
+      );
+    }
     case "tool_call.arguments.delta": {
       return applyToolArgumentsDelta<TManifest, TState>(
         thread,
@@ -626,6 +634,30 @@ function ensureTextPart<
   return part;
 }
 
+function ensureReasoningPart<
+  TManifest extends ToolManifest = ToolManifest,
+  TState = Record<string, unknown>,
+>(
+  message: ConversationMessage<TManifest, TState>,
+  partId: string,
+  agentName?: string
+): ReasoningUIPart {
+  let part = message.parts.find(
+    (p) => p.type === "reasoning" && p.id === partId
+  ) as ReasoningUIPart | undefined;
+  if (!part) {
+    part = {
+      type: "reasoning",
+      id: partId,
+      agentName: agentName || "",
+      content: "",
+      status: "streaming",
+    } as ReasoningUIPart;
+    message.parts = [...message.parts, part];
+  }
+  return part;
+}
+
 function applyPartCreated<
   TManifest extends ToolManifest = ToolManifest,
   TState = Record<string, unknown>,
@@ -644,6 +676,12 @@ function applyPartCreated<
   );
   if (type === "text") {
     ensureTextPart<TManifest, TState>(msg, partId);
+  } else if (type === "reasoning") {
+    ensureReasoningPart<TManifest, TState>(
+      msg,
+      partId,
+      (data?.metadata as { agentName?: string } | undefined)?.agentName
+    );
   } else if (type === "tool-call") {
     const tool: ToolCallUIPart<TManifest> = {
       type: "tool-call",
@@ -655,6 +693,33 @@ function applyPartCreated<
     } as ToolCallUIPart<TManifest>;
     msg.parts = [...msg.parts, tool];
   }
+  return {
+    ...thread,
+    messages: list,
+    agentStatus: "streaming",
+    lastActivity: new Date(),
+  };
+}
+
+function applyReasoningDelta<
+  TManifest extends ToolManifest = ToolManifest,
+  TState = Record<string, unknown>,
+>(
+  thread: ThreadState<TManifest, TState>,
+  data: ReasoningDelta["data"]
+): ThreadState<TManifest, TState> {
+  if (!data) return thread;
+  const partId = data?.partId;
+  const messageId = data?.messageId;
+  const delta = data?.delta;
+  if (!partId || !messageId || typeof delta !== "string") return { ...thread };
+  const { list, msg } = getOrCreateAssistantMessage<TManifest, TState>(
+    thread.messages,
+    data
+  );
+  const part = ensureReasoningPart<TManifest, TState>(msg, partId);
+  part.content = (part.content || "") + delta;
+  part.status = "streaming";
   return {
     ...thread,
     messages: list,
@@ -713,6 +778,19 @@ function applyPartCompleted<
       | TextUIPart
       | undefined;
     if (text) text.status = "complete";
+    return { ...thread, messages: list, lastActivity: new Date() };
+  }
+
+  if (type === "reasoning") {
+    const part = msg.parts.find(
+      (p) => p.type === "reasoning" && p.id === partId
+    ) as ReasoningUIPart | undefined;
+    if (part) {
+      if (typeof finalContent === "string" && finalContent) {
+        part.content = finalContent;
+      }
+      part.status = "complete";
+    }
     return { ...thread, messages: list, lastActivity: new Date() };
   }
 
