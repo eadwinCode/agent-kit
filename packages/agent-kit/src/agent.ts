@@ -251,6 +251,7 @@ export class Agent<T extends StateData> {
       streaming,
       streamingContext,
       step,
+      signal,
     }: Agent.RunOptions<T> | undefined = {}
   ): Promise<AgentResult> {
     // Attempt to resolve the MCP tools, if we haven't yet done so.
@@ -411,7 +412,8 @@ export class Agent<T extends StateData> {
           history,
           run,
           effectiveStreamingContext,
-          effectiveStep
+          effectiveStep,
+          signal
         );
 
         // Filter out reasoning messages before checking stop_reason,
@@ -517,7 +519,8 @@ export class Agent<T extends StateData> {
     history: Message[],
     network: NetworkRun<T>,
     streamingContext?: StreamingContext,
-    step?: GetStepTools<Inngest.Any>
+    step?: GetStepTools<Inngest.Any>,
+    signal?: AbortSignal
   ): Promise<AgentResult> {
     const { output, raw } = await p.infer(
       this.name,
@@ -673,7 +676,8 @@ export class Agent<T extends StateData> {
       result.output,
       network,
       streamingContext,
-      step
+      step,
+      signal
     );
     if (toolCallOutput.length > 0) {
       result.toolCalls = result.toolCalls.concat(toolCallOutput);
@@ -685,175 +689,319 @@ export class Agent<T extends StateData> {
   /**
    * invokeTools takes output messages from an inference call then invokes any tools
    * in the message responses.
+   *
+   * Concurrency model: calls execute in SEGMENTS derived from model-call order.
+   * Each maximal run of consecutive `parallelSafe` calls executes concurrently;
+   * every other call executes serially, exactly as before. The determinism
+   * invariants (all preserved under concurrency):
+   *
+   *   - results are appended in model-call order, never completion order;
+   *   - durable step ids are PRE-ASSIGNED in model-call order before any handler
+   *     starts, so concurrent execution cannot interleave the replay-stable
+   *     counter;
+   *   - `network.state` patches are re-applied in model-call order after each
+   *     parallel batch settles;
+   *   - streaming events within a batch publish in model-call order (arguments
+   *     before dispatch, outputs after the batch settles).
+   *
+   * Cancellation is cooperative: `signal` is checked BETWEEN segments. In-flight
+   * handlers are never interrupted; skipped calls still produce an error result
+   * so every model `tool_call` stays paired with a `tool_result`.
    */
   private async invokeTools(
     msgs: Message[],
     network: NetworkRun<T>,
     streamingContext?: StreamingContext,
-    step?: GetStepTools<Inngest.Any>
+    step?: GetStepTools<Inngest.Any>,
+    signal?: AbortSignal
   ): Promise<ToolResultMessage[]> {
-    const output: ToolResultMessage[] = [];
-    // Best-effort streaming for tool execution: emit tool-call and output deltas via network streaming if available
-    // Determine if a StreamingContext exists by checking for a symbol on step wrapper (not exposed); for now rely on model-level streaming additions later
-
+    // Flatten all tool calls in deterministic model-call order. `index` is the
+    // tool call's position within its message. It MUST be part of the streaming
+    // part-id step ids below: the model commonly calls the same tool twice in
+    // one inference (e.g. two read_files), so keying a step id on the tool NAME
+    // alone collides — Inngest then auto-suffixes the duplicate, the id drifts
+    // across replays, and the part is re-published (its `*.delta` chunks are
+    // delivered twice). The index is deterministic across replays; the tool
+    // NAME is kept only for readability.
+    const planned: Array<{
+      call: ToolMessage;
+      index: number;
+      toolDef: Tool.Any;
+      pos: number;
+      durableIndex?: number;
+    }> = [];
     for (const msg of msgs) {
-      if (msg.type !== "tool_call") {
+      if (msg.type !== "tool_call" || !Array.isArray(msg.tools)) {
         continue;
       }
-
-      if (!Array.isArray(msg.tools)) {
-        continue;
-      }
-
-      // `index` is the tool call's position within this inference. It MUST be
-      // part of the streaming part-id step ids below: the model commonly calls
-      // the same tool twice in one inference (e.g. two read_files), so keying a
-      // step id on the tool NAME alone collides — Inngest then auto-suffixes the
-      // duplicate, the id drifts across replays, and the part is re-published
-      // (its `*.delta` chunks are delivered twice). The index is deterministic
-      // across replays; the tool NAME is kept only for readability.
-      for (const [index, tool] of msg.tools.entries()) {
-        const found = this.tools.get(tool.name);
-        if (!found) {
+      for (const [index, call] of msg.tools.entries()) {
+        const toolDef = this.tools.get(call.name);
+        if (!toolDef) {
           throw new Error(
-            `Inference requested a non-existent tool: ${tool.name}`
+            `Inference requested a non-existent tool: ${call.name}`
           );
         }
+        planned.push({ call, index, toolDef, pos: planned.length });
+      }
+    }
+    if (planned.length === 0) {
+      return [];
+    }
 
-        // Stream tool arguments if context available
-        const toolArgsJson = JSON.stringify(tool.input ?? {});
-        if (streamingContext) {
-          // Generate partId deterministically within a step to avoid replay issues
-          const stepTools = step || (await getStepTools());
-          const toolCallPartId = stepTools
-            ? await stepTools.run(
-                `generate-tool-part-id-${streamingContext.messageId}-${tool.name}-${index}`,
-                () => {
-                  return streamingContext.generatePartId();
-                }
-              )
-            : streamingContext.generatePartId();
+    // Resolve the durable step ONCE up front: dispatching a parallel batch must
+    // create every `step.run` in the same tick (Inngest's parallel-step rule),
+    // which an async per-call `getStepTools()` lookup would break.
+    const durableStep = step ?? (await getStepTools());
 
-          await streamingContext.publishEvent({
-            event: "part.created",
-            data: {
-              partId: toolCallPartId,
-              runId: streamingContext.runId,
-              messageId: streamingContext.messageId,
-              type: "tool-call",
-              metadata: { toolName: tool.name, agentName: this.name },
-            },
-          });
-          const argChunks = streamingContext.chunkContent(toolArgsJson);
-          for (let i = 0; i < argChunks.length; i++) {
-            await streamingContext.publishEvent({
-              event: "tool_call.arguments.delta",
-              data: {
-                partId: toolCallPartId,
-                delta: argChunks[i]!,
-                // toolName is included only on the first delta.
-                toolName: i === 0 ? tool.name : undefined,
-                messageId: streamingContext.messageId,
-              },
-            });
-          }
-          await streamingContext.publishEvent({
-            event: "part.completed",
-            data: {
-              partId: toolCallPartId,
-              runId: streamingContext.runId,
-              messageId: streamingContext.messageId,
-              type: "tool-call",
-              finalContent: tool.input ?? {},
-              metadata: { toolName: tool.name, agentName: this.name },
-            },
-          });
-        }
-
-        // Call this tool — durable-by-default.
-        //
-        // Inngest re-executes the function body on every step boundary, so an
-        // unwrapped handler re-fires on each replay: `edit_file` reports "string
-        // not found" the second time, an image tool re-bills, etc. We therefore
-        // wrap each handler in ONE deterministic `step.run` so its side effect
-        // runs exactly once (see `runToolHandler`). A tool can opt out with
-        // `manualStep` when it drives its OWN step tools (HITL `waitForEvent`,
-        // `step.invoke`, a multi-`step.run` subagent) — those cannot be nested —
-        // in which case it runs inline with the live step, as every tool did
-        // before this change.
-        const result: ToolHandlerResult = await this.runToolHandler(
-          found,
-          tool,
-          network,
-          step
-        );
-
-        // Stream tool output if context available
-        if (streamingContext) {
-          // Generate partId deterministically within a step to avoid replay issues
-          const stepTools = step || (await getStepTools());
-          const outputPartId = stepTools
-            ? await stepTools.run(
-                `generate-output-part-id-${streamingContext.messageId}-${tool.name}-${index}`,
-                () => {
-                  return streamingContext.generatePartId();
-                }
-              )
-            : streamingContext.generatePartId();
-
-          await streamingContext.publishEvent({
-            event: "part.created",
-            data: {
-              partId: outputPartId,
-              runId: streamingContext.runId,
-              messageId: streamingContext.messageId,
-              type: "tool-output",
-              metadata: { toolName: tool.name, agentName: this.name },
-            },
-          });
-
-          const resultJson = JSON.stringify(result);
-          for (const delta of streamingContext.chunkContent(resultJson)) {
-            await streamingContext.publishEvent({
-              event: "tool_call.output.delta",
-              data: {
-                partId: outputPartId,
-                delta,
-                messageId: streamingContext.messageId,
-              },
-            });
-          }
-
-          await streamingContext.publishEvent({
-            event: "part.completed",
-            data: {
-              partId: outputPartId,
-              runId: streamingContext.runId,
-              messageId: streamingContext.messageId,
-              type: "tool-output",
-              finalContent: result,
-              metadata: { toolName: tool.name, agentName: this.name },
-            },
-          });
-        }
-
-        output.push({
-          role: "tool_result",
-          type: "tool_result",
-          tool: {
-            type: "tool",
-            id: tool.id,
-            name: tool.name,
-            input: tool.input.arguments as Record<string, unknown>,
-          },
-
-          content: result,
-          stop_reason: "tool",
-        });
+    // Pre-assign durable step indices in model-call order, synchronously and
+    // BEFORE any handler runs, so concurrent execution cannot interleave the
+    // replay-stable counter.
+    for (const p of planned) {
+      if (durableStep && !p.toolDef.manualStep) {
+        p.durableIndex = network.state.nextDurableToolCallIndex();
       }
     }
 
-    return output;
+    // Partition into segments: a maximal run of consecutive `parallelSafe`
+    // calls forms one concurrent batch; anything else is a serialized segment.
+    const segments: Array<Array<(typeof planned)[number]>> = [];
+    for (const p of planned) {
+      const prev = segments[segments.length - 1];
+      if (p.toolDef.parallelSafe && prev && prev[0]!.toolDef.parallelSafe) {
+        prev.push(p);
+      } else {
+        segments.push([p]);
+      }
+    }
+
+    const results = new Array<ToolHandlerResult>(planned.length);
+
+    for (const segment of segments) {
+      // Cooperative cancellation between segments: skipped calls still get an
+      // error result so the tool_call → tool_result pairing stays valid.
+      if (signal?.aborted) {
+        for (const p of segment) {
+          results[p.pos] = {
+            error: errors.serializeError(new Error("Tool execution cancelled")),
+          };
+        }
+        continue;
+      }
+
+      if (segment.length === 1) {
+        // Serialized call — identical execution order to the pre-parallel loop.
+        const p = segment[0]!;
+        await this.streamToolCallInput(
+          streamingContext,
+          durableStep,
+          p.call,
+          p.index
+        );
+        const r = await this.runToolHandler(
+          p.toolDef,
+          p.call,
+          network,
+          step,
+          durableStep,
+          p.durableIndex
+        );
+        this.applyStatePatch(network, r.statePatch);
+        await this.streamToolCallOutput(
+          streamingContext,
+          durableStep,
+          p.call,
+          p.index,
+          r.result
+        );
+        results[p.pos] = r.result;
+        continue;
+      }
+
+      // Parallel batch (all calls are `parallelSafe`). Stream arguments in
+      // model-call order BEFORE dispatch so event order stays replay-stable.
+      for (const p of segment) {
+        await this.streamToolCallInput(
+          streamingContext,
+          durableStep,
+          p.call,
+          p.index
+        );
+      }
+
+      // Dispatch: the map creates every handler promise — and therefore every
+      // durable `step.run` — in the SAME tick, before any await (Inngest's
+      // parallel-step rule). Tool errors are captured into ToolHandlerResult
+      // (never thrown), so one failing tool cannot fail the batch.
+      const settled = await Promise.all(
+        segment.map((p) =>
+          this.runToolHandler(
+            p.toolDef,
+            p.call,
+            network,
+            step,
+            durableStep,
+            p.durableIndex
+          )
+        )
+      );
+
+      // Re-apply state patches in deterministic model-call order. parallelSafe
+      // tools must not mutate state; this is applied defensively in order.
+      for (const r of settled) {
+        this.applyStatePatch(network, r.statePatch);
+      }
+
+      // Stream outputs and record results in model-call order — never
+      // completion order.
+      for (const [i, p] of segment.entries()) {
+        const r = settled[i]!;
+        await this.streamToolCallOutput(
+          streamingContext,
+          durableStep,
+          p.call,
+          p.index,
+          r.result
+        );
+        results[p.pos] = r.result;
+      }
+    }
+
+    // Emit results in model-call order — never completion order.
+    return planned.map((p, i) => ({
+      role: "tool_result",
+      type: "tool_result",
+      tool: {
+        type: "tool",
+        id: p.call.id,
+        name: p.call.name,
+        input: p.call.input.arguments as Record<string, unknown>,
+      },
+
+      content: results[i]!,
+      stop_reason: "tool",
+    }));
+  }
+
+  /**
+   * Stream a tool call's arguments (part.created → arguments deltas →
+   * part.completed). No-op without a streaming context.
+   */
+  private async streamToolCallInput(
+    streamingContext: StreamingContext | undefined,
+    step: GetStepTools<Inngest.Any> | undefined,
+    tool: ToolMessage,
+    index: number
+  ): Promise<void> {
+    if (!streamingContext) {
+      return;
+    }
+    const toolArgsJson = JSON.stringify(tool.input ?? {});
+    // Generate partId deterministically within a step to avoid replay issues
+    const stepTools = step || (await getStepTools());
+    const toolCallPartId = stepTools
+      ? await stepTools.run(
+          `generate-tool-part-id-${streamingContext.messageId}-${tool.name}-${index}`,
+          () => {
+            return streamingContext.generatePartId();
+          }
+        )
+      : streamingContext.generatePartId();
+
+    await streamingContext.publishEvent({
+      event: "part.created",
+      data: {
+        partId: toolCallPartId,
+        runId: streamingContext.runId,
+        messageId: streamingContext.messageId,
+        type: "tool-call",
+        metadata: { toolName: tool.name, agentName: this.name },
+      },
+    });
+    const argChunks = streamingContext.chunkContent(toolArgsJson);
+    for (let i = 0; i < argChunks.length; i++) {
+      await streamingContext.publishEvent({
+        event: "tool_call.arguments.delta",
+        data: {
+          partId: toolCallPartId,
+          delta: argChunks[i]!,
+          // toolName is included only on the first delta.
+          toolName: i === 0 ? tool.name : undefined,
+          messageId: streamingContext.messageId,
+        },
+      });
+    }
+    await streamingContext.publishEvent({
+      event: "part.completed",
+      data: {
+        partId: toolCallPartId,
+        runId: streamingContext.runId,
+        messageId: streamingContext.messageId,
+        type: "tool-call",
+        finalContent: tool.input ?? {},
+        metadata: { toolName: tool.name, agentName: this.name },
+      },
+    });
+  }
+
+  /**
+   * Stream a tool call's output (part.created → output deltas → part.completed).
+   * No-op without a streaming context.
+   */
+  private async streamToolCallOutput(
+    streamingContext: StreamingContext | undefined,
+    step: GetStepTools<Inngest.Any> | undefined,
+    tool: ToolMessage,
+    index: number,
+    result: ToolHandlerResult
+  ): Promise<void> {
+    if (!streamingContext) {
+      return;
+    }
+    // Generate partId deterministically within a step to avoid replay issues
+    const stepTools = step || (await getStepTools());
+    const outputPartId = stepTools
+      ? await stepTools.run(
+          `generate-output-part-id-${streamingContext.messageId}-${tool.name}-${index}`,
+          () => {
+            return streamingContext.generatePartId();
+          }
+        )
+      : streamingContext.generatePartId();
+
+    await streamingContext.publishEvent({
+      event: "part.created",
+      data: {
+        partId: outputPartId,
+        runId: streamingContext.runId,
+        messageId: streamingContext.messageId,
+        type: "tool-output",
+        metadata: { toolName: tool.name, agentName: this.name },
+      },
+    });
+
+    const resultJson = JSON.stringify(result);
+    for (const delta of streamingContext.chunkContent(resultJson)) {
+      await streamingContext.publishEvent({
+        event: "tool_call.output.delta",
+        data: {
+          partId: outputPartId,
+          delta,
+          messageId: streamingContext.messageId,
+        },
+      });
+    }
+
+    await streamingContext.publishEvent({
+      event: "part.completed",
+      data: {
+        partId: outputPartId,
+        runId: streamingContext.runId,
+        messageId: streamingContext.messageId,
+        type: "tool-output",
+        finalContent: result,
+        metadata: { toolName: tool.name, agentName: this.name },
+      },
+    });
   }
 
   /**
@@ -863,34 +1011,41 @@ export class Agent<T extends StateData> {
    * Durable-by-default: when an Inngest step is available AND the tool has not
    * set `manualStep`, the handler runs inside ONE `step.run` under a
    * deterministic id, so its side effect fires EXACTLY ONCE across Inngest's
-   * re-executions (no `edit_file` double-apply, no image-tool re-bill). Memoized
-   * inferences replay the same tool calls in the same order, so the per-run
-   * counter (`network.state.nextDurableToolCallIndex()`) assigns the Nth tool
-   * call the same id on every replay — never a checksum/timestamp/uuid.
+   * re-executions (no `edit_file` double-apply, no image-tool re-bill). The
+   * caller (`invokeTools`) pre-assigns each call's index in model-call order
+   * BEFORE any handler starts, so even a concurrently dispatched batch gets
+   * replay-stable ids — never a checksum/timestamp/uuid.
    *
    * Two subtleties handled here:
    *   - State mutations: a tool may mutate `network.state.data` (design
    *     questions / plan / `__stopReason`). That mutation happens INSIDE the
    *     step and is lost on replay (the memoized body is skipped), so we memoize
-   *     the post-handler data snapshot in the step payload and RE-APPLY it
-   *     outside the step on every execution. State-mutating tools keep working
-   *     with no code change.
+   *     the post-handler data snapshot in the step payload and return it as
+   *     `statePatch`; the caller re-applies it OUTSIDE the step on every
+   *     execution — in model-call order when the call ran in a parallel batch.
+   *     State-mutating tools keep working with no code change.
    *   - Errors: captured and returned as `{ error }` (never thrown) so the step
    *     is recorded as a success returning the error — the failing side effect
-   *     is not retried, and the model sees the same result on replay.
+   *     is not retried, the model sees the same result on replay, and one
+   *     failing tool cannot fail a concurrent batch.
    *
    * Inline fallback: no step in context (non-Inngest run / tests) OR the tool
    * opted out via `manualStep`. The handler then receives the live `step` and
    * owns its own durability. A wrapped handler instead receives `step:
    * undefined` (it is already inside a step; a nested `step.run` would break
    * Inngest).
+   *
+   * `durableStep` is pre-resolved by the caller so a parallel batch creates
+   * every `step.run` in the same tick (Inngest's parallel-step rule).
    */
   private async runToolHandler(
     toolDef: Tool.Any,
     call: ToolMessage,
     network: NetworkRun<T>,
-    step?: GetStepTools<Inngest.Any>
-  ): Promise<ToolHandlerResult> {
+    step: GetStepTools<Inngest.Any> | undefined,
+    durableStep: GetStepTools<Inngest.Any> | undefined,
+    durableIndex?: number
+  ): Promise<{ result: ToolHandlerResult; statePatch?: T }> {
     const invoke = async (
       handlerStep: GetStepTools<Inngest.Any> | undefined
     ): Promise<ToolHandlerResult> => {
@@ -909,18 +1064,15 @@ export class Agent<T extends StateData> {
       }
     };
 
-    // Prefer the threaded step; fall back to the ambient Inngest step so tools
-    // are durable on any path that reaches Inngest (mirrors how inference and
-    // streaming-id generation already resolve their step).
-    const durableStep = step ?? (await getStepTools());
-
     // Inline path: no Inngest step, or the tool manages its own durability.
     if (!durableStep || toolDef.manualStep) {
-      return invoke(step);
+      return { result: await invoke(step) };
     }
 
-    // Durable path: exactly-once side effect under a deterministic id.
-    const index = network.state.nextDurableToolCallIndex();
+    // Durable path: exactly-once side effect under a deterministic id. The
+    // index is pre-assigned by invokeTools in model-call order; the counter
+    // fallback keeps any direct caller replay-stable.
+    const index = durableIndex ?? network.state.nextDurableToolCallIndex();
     const stepId = `${this.name}/tool/${call.name}/${index}`;
 
     // `step.run` applies `Jsonify` to its output type; the value is JSON
@@ -942,14 +1094,24 @@ export class Agent<T extends StateData> {
       };
     })) as unknown as { result: ToolHandlerResult; statePatch?: T };
 
-    // Re-apply any state delta OUTSIDE the step on EVERY execution — including
-    // replays, where the memoized body did not run so the live mutation is
-    // missing from `network.state`.
-    if (memoized.statePatch !== undefined) {
-      network.state.importData(memoized.statePatch);
-    }
+    // The state patch is NOT applied here: the caller re-applies patches in
+    // model-call order (immediately for serial calls, after the batch settles
+    // for parallel ones), so concurrent completion order cannot scramble state.
+    return { result: memoized.result, statePatch: memoized.statePatch };
+  }
 
-    return memoized.result;
+  /**
+   * Re-applies a durable tool's memoized `network.state` patch OUTSIDE the step
+   * (see {@link runToolHandler}). Called exactly once per executed call, in
+   * model-call order.
+   */
+  private applyStatePatch(
+    network: NetworkRun<T>,
+    statePatch: T | undefined
+  ): void {
+    if (statePatch !== undefined) {
+      network.state.importData(statePatch);
+    }
   }
 
   private async agentPrompt(
@@ -1218,6 +1380,14 @@ export namespace Agent {
     streamingContext?: StreamingContext;
     // Internal: provided by Network to pass wrapped step tools for automatic step events
     step?: GetStepTools<Inngest.Any>;
+    /**
+     * Optional cooperative cancellation signal. Checked BETWEEN tool-execution
+     * segments (never mid-handler): once aborted, not-yet-started tool calls
+     * receive a "Tool execution cancelled" error result so every model
+     * `tool_call` stays paired with a `tool_result`. In-flight handlers always
+     * run to completion.
+     */
+    signal?: AbortSignal;
   }
 
   export interface Lifecycle<T extends StateData> {

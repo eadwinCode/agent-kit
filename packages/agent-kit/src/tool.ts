@@ -26,6 +26,7 @@ export function createTool<
   description,
   parameters,
   manualStep,
+  parallelSafe,
   handler,
 }: {
   name: TName;
@@ -37,6 +38,12 @@ export function createTool<
    * durable `step.run` when running inside Inngest).
    */
   manualStep?: boolean;
+  /**
+   * Mark this tool as safe to run CONCURRENTLY with other tools from the same
+   * inference. See {@link Tool.parallelSafe}. Defaults to `false` (the tool is
+   * executed serially, in model-call order).
+   */
+  parallelSafe?: boolean;
   handler: (
     input: ZodOutput<TInput>,
     opts: Tool.Options<TState>
@@ -47,6 +54,7 @@ export function createTool<
     description,
     parameters,
     manualStep,
+    parallelSafe,
     handler<TS extends StateData>(
       input: ZodOutput<TInput>,
       opts: Tool.Options<TS>
@@ -96,6 +104,31 @@ export type Tool<TName extends string, TInput extends Tool.Input, TOutput> = {
    * their state delta across replays automatically.
    */
   manualStep?: boolean;
+
+  /**
+   * Mark this tool as safe to run CONCURRENTLY with other `parallelSafe` tools
+   * from the same model inference.
+   *
+   * When a single inference emits multiple tool calls, AgentKit groups each
+   * maximal run of consecutive `parallelSafe` calls into a batch and executes
+   * the batch concurrently; every other call still executes serially, in
+   * model-call order. Results are ALWAYS fed back to the model in the original
+   * call order (never completion order), and durable step ids are pre-assigned
+   * in call order, so batching changes ONLY wall-clock latency — never the
+   * observable result sequence or Inngest replay behavior.
+   *
+   * Only set this for tools whose executions are mutually independent:
+   *   - no reads or writes of `network.state` (a parallel batch shares the
+   *     state object; concurrent mutation is a data race);
+   *   - no dependence on a sibling call's output or side effect;
+   *   - side effects (if any) touch disjoint resources (e.g. pure reads such
+   *     as `read_file`/`grep`/`glob`, or writes to distinct, non-overlapping
+   *     targets).
+   *
+   * Mutating tools (`edit_file`, `cp/mv/rm`, billing, publication) and any
+   * tool that mutates `network.state` must keep the default `false`.
+   */
+  parallelSafe?: boolean;
 
   handler<TState extends StateData>(
     input: ZodOutput<TInput>,
