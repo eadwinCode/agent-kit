@@ -1,5 +1,11 @@
 # @inngest/agent-kit
 
+## 0.14.0-alpha.0
+
+### Minor Changes
+
+- 0842360: Parallel agentic execution. Tools can declare `parallelSafe: true`: consecutive `parallelSafe` calls from one inference execute as a concurrent batch while everything else stays serialized, with durable step ids pre-assigned in model-call order (same-tick `step.run` creation per Inngest's parallel-step rule), results always fed back in call order, state patches re-applied in call order, and per-call error capture. `agent.run()` accepts a cooperative `signal: AbortSignal` checked between execution segments. Networks gain opt-in concurrent subagent dispatch via `parallelAgents: true` (constructor or per-run override), finalizing batched results in stack order and persisting successes before rethrowing failures. Fully backward compatible: defaults are unchanged (serial).
+
 ## 0.13.2
 
 ### Patch Changes
