@@ -73,6 +73,13 @@ export class Network<T extends StateData> {
    */
   maxIter: number;
 
+  /**
+   * parallelAgents opts the network into CONCURRENT subagent dispatch. See
+   * {@link Network.Constructor.parallelAgents}. Defaults to `false` (agents run
+   * one at a time off the stack, as they always have).
+   */
+  parallelAgents?: boolean;
+
   // _stack is an array of strings, each representing an agent name to call.
   protected _stack: string[];
 
@@ -101,6 +108,7 @@ export class Network<T extends StateData> {
     router,
     defaultRouter,
     stopWhen,
+    parallelAgents,
     history,
   }: Network.Constructor<T>) {
     this.name = name;
@@ -110,6 +118,7 @@ export class Network<T extends StateData> {
     this.defaultModel = defaultModel;
     this.router = defaultRouter ?? router;
     this.stopWhen = stopWhen;
+    this.parallelAgents = parallelAgents;
     this.maxIter = maxIter || 0;
     this._stack = [];
     this.history = history;
@@ -373,6 +382,25 @@ export namespace Network {
      * the same point (no `Date.now()`/random).
      */
     stopWhen?: StopWhen<T>;
+    /**
+     * Opt the network into CONCURRENT subagent dispatch.
+     *
+     * When the router schedules more than one agent for the same iteration,
+     * the default behavior runs them ONE AT A TIME off the stack. With
+     * `parallelAgents: true`, each iteration drains the stack as a single
+     * concurrent batch (bounded by `maxIter`). Determinism is preserved:
+     * agent run ids, per-agent streaming contexts, result ordering in
+     * `state.results`, and persistence step ids are all assigned in STACK
+     * order — never completion order.
+     *
+     * Only enable this when concurrently scheduled agents have NON-conflicting
+     * scopes: they share `network.state` (including `state.data` and history),
+     * so agents in the same batch must not mutate overlapping state keys and
+     * must not depend on a sibling agent's output. If any agent in a batch
+     * throws, the batch still settles, every successful agent's result is
+     * persisted in stack order, and the first error is then re-thrown.
+     */
+    parallelAgents?: boolean;
     history?: HistoryConfig<T>;
   };
 
@@ -383,6 +411,8 @@ export namespace Network {
       defaultRouter?: Router<T>;
       /** Per-run stop policy; overrides the network's `stopWhen`. */
       stopWhen?: StopWhen<T>;
+      /** Per-run override for the network's `parallelAgents` setting. */
+      parallelAgents?: boolean;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       state?: State<T> | Record<string, any>;
       streaming?: StreamingConfig;
@@ -498,6 +528,7 @@ export class NetworkRun<T extends StateData> extends Network<T> {
       defaultState: network.state,
       router: network.router,
       stopWhen: network.stopWhen,
+      parallelAgents: network.parallelAgents,
       maxIter: network.maxIter,
       history: network.history,
     });
@@ -544,6 +575,11 @@ export class NetworkRun<T extends StateData> extends Network<T> {
     // the decision, so the terminal events emitted in `finally` can carry its reason.
     const stopWhen = overrides?.stopWhen ?? this.stopWhen;
     let stopInfo: Network.NetworkStop | undefined;
+
+    // Effective concurrency policy (per-run override → network default). When
+    // enabled, each loop iteration drains the stack as one concurrent batch.
+    const parallelAgents =
+      overrides?.parallelAgents ?? this.parallelAgents ?? false;
 
     // If history.get is configured AND the state is empty, use it to load initial history
     // When passing passing in messages from the client, history.get() is disabled - allowing the client to maintain conversation state and send it with each request
@@ -712,18 +748,31 @@ export class NetworkRun<T extends StateData> extends Network<T> {
           }
         }
 
-        // XXX: It would be possible to parallel call these agents here by
-        // fetching the entire stack, parallel running, then awaiting the
-        // responses.   However, this confuses history and we'll take our time to
-        // introduce parallelisation after the foundations are set.
-
-        // Fetch the agent we need to call next off of the stack.
-        const agentName = this._stack.shift();
-
-        // Grab agents from the private map, as this may have been introduced in
-        // the router.
-        const agent = agentName && this._agents.get(agentName);
-        if (!agent) {
+        // Fetch the agent(s) to run this iteration. With `parallelAgents`
+        // enabled the stack drains as ONE concurrent batch (bounded by
+        // maxIter); otherwise exactly one agent runs, as before. Either way,
+        // agents run in stack order and their results are appended in stack
+        // order — never completion order.
+        const batchLimit = parallelAgents
+          ? this.maxIter === 0
+            ? this._stack.length
+            : Math.min(this._stack.length, this.maxIter - this._counter)
+          : Math.min(1, this._stack.length);
+        const batch: Agent<T>[] = [];
+        while (batch.length < batchLimit && this._stack.length > 0) {
+          const agentName = this._stack.shift()!;
+          // Grab agents from the private map, as this may have been introduced
+          // in the router.
+          const next = this._agents.get(agentName);
+          if (!next) {
+            // Unknown agent on the stack — stop collecting; if the batch is
+            // empty we're done entirely (matches the prior break-on-unknown
+            // behavior).
+            break;
+          }
+          batch.push(next);
+        }
+        if (batch.length === 0) {
           // Stack is drained (or a scheduled agent is unknown) — we're done.
           // Break out to the single terminal emitter in `finally` rather than
           // emitting run.completed/stream.ended here AND in finally (which would
@@ -731,103 +780,117 @@ export class NetworkRun<T extends StateData> extends Network<T> {
           break;
         }
 
-        // The network is the iteration authority: it calls the agent once per
-        // loop and decides (via the router) whether to call again. So the agent
+        // The network is the iteration authority: it calls each agent once per
+        // loop and decides (via the router) whether to call again. So each agent
         // does exactly ONE inference per call (maxIterPerRun: 1) — its internal
         // tool-round loop is intentionally NOT driven by the network's maxIter,
         // keeping total inferences per network.run ≤ maxIter (not maxIter²).
-        // Generate unique IDs for this agent's execution using durable steps
-        let agentRunId: string;
-        let agentMessageId: string;
+        //
+        // Prepare every agent SEQUENTIALLY, in stack order, BEFORE dispatch:
+        // run ids come from deterministic `step.run` id generation keyed on
+        // the iteration counter, and streaming run.started events publish in
+        // stack order — concurrent dispatch must not scramble either.
+        const prepared: Array<{
+          agent: Agent<T>;
+          agentRunId: string;
+          agentMessageId: string;
+          agentStreamingContext?: StreamingContext;
+        }> = [];
+        for (const [i, agent] of batch.entries()) {
+          let agentRunId: string;
+          let agentMessageId: string;
 
-        if (stepTools) {
-          // Use Inngest steps for deterministic agent ID generation
-          const agentIds = await stepTools.run(
-            `generate-agent-ids-${this._counter}`,
-            () => {
-              return {
-                agentRunId: generateId(),
-                agentMessageId: randomUUID(),
-              };
-            }
-          );
-          agentRunId = agentIds.agentRunId;
-          agentMessageId = agentIds.agentMessageId;
-        } else {
-          // Fallback for non-Inngest contexts
-          agentRunId = generateId();
-          agentMessageId = randomUUID();
-        }
+          if (stepTools) {
+            // Use Inngest steps for deterministic agent ID generation
+            const agentIds = await stepTools.run(
+              `generate-agent-ids-${this._counter + i}`,
+              () => {
+                return {
+                  agentRunId: generateId(),
+                  agentMessageId: randomUUID(),
+                };
+              }
+            );
+            agentRunId = agentIds.agentRunId;
+            agentMessageId = agentIds.agentMessageId;
+          } else {
+            // Fallback for non-Inngest contexts
+            agentRunId = generateId();
+            agentMessageId = randomUUID();
+          }
 
-        // Create agent streaming context that shares the sequence counter
-        let agentStreamingContext: StreamingContext | undefined;
-        if (streamingContext) {
-          // Create context with shared sequence counter but agent-specific messageId
-          agentStreamingContext =
-            streamingContext.createContextWithSharedSequence({
-              runId: agentRunId,
-              messageId: agentMessageId,
-              scope: "agent",
+          // Create agent streaming context that shares the sequence counter
+          let agentStreamingContext: StreamingContext | undefined;
+          if (streamingContext) {
+            // Create context with shared sequence counter but agent-specific messageId
+            agentStreamingContext =
+              streamingContext.createContextWithSharedSequence({
+                runId: agentRunId,
+                messageId: agentMessageId,
+                scope: "agent",
+              });
+
+            await streamingContext.publishEvent({
+              event: "run.started",
+              data: {
+                runId: agentRunId,
+                parentRunId: networkRunId,
+                scope: "agent",
+                name: agent.name,
+                messageId: agentMessageId, // Use agent-specific messageId
+              },
             });
+          }
 
-          await streamingContext.publishEvent({
-            event: "run.started",
-            data: {
-              runId: agentRunId,
-              parentRunId: networkRunId,
-              scope: "agent",
-              name: agent.name,
-              messageId: agentMessageId, // Use agent-specific messageId
-            },
+          prepared.push({
+            agent,
+            agentRunId,
+            agentMessageId,
+            agentStreamingContext,
           });
         }
 
-        const call = await agent.run(inputContent, {
-          network: this,
-          // One inference per network iteration; decoupled from network.maxIter.
-          maxIterPerRun: 1,
-          // Provide streaming context so the agent can emit part/text/tool events
-          streamingContext: agentStreamingContext,
-          // Provide wrapped step tools for automatic step lifecycle events
-          step: wrappedStep,
-        });
-
-        // CRITICAL FIX: Set the canonical message ID on the AgentResult
-        // This ensures the streaming agentMessageId becomes the persisted message_id
-        call.id = agentMessageId;
-
-        if (agentStreamingContext) {
-          await agentStreamingContext.publishEvent({
-            event: "run.completed",
-            data: {
-              runId: agentRunId,
-              scope: "agent",
-              name: agent.name,
-              messageId: agentMessageId, // Include agent-specific messageId in completion event
-            },
-          });
-        }
-        this._counter += 1;
-
-        // Ensure that we store the call network history.
-        this.state.appendResult(call);
-
-        // Persist this result the moment it's produced, so a mid-run failure or
-        // hard abort (cancel/overflow/timeout) still leaves every completed
-        // inference on disk — not just the once-at-the-end save below. The step
-        // id is the iteration counter (replay-stable), NEVER result.checksum
-        // (which embeds a regenerated timestamp). Idempotent: the end-of-run
-        // save and the consumer's own dedupe make re-writes no-ops.
-        await persistResults(
-          {
-            state: this.state,
-            history: this.history,
-            input: inputContent,
+        const runOne = (p: (typeof prepared)[number]): Promise<AgentResult> =>
+          p.agent.run(inputContent, {
             network: this,
-          },
-          [call],
-          incrementalAppendStepId(this._counter)
-        );
+            // One inference per network iteration; decoupled from network.maxIter.
+            maxIterPerRun: 1,
+            // Provide streaming context so the agent can emit part/text/tool events
+            streamingContext: p.agentStreamingContext,
+            // Provide wrapped step tools for automatic step lifecycle events
+            step: wrappedStep,
+          });
+
+        if (batch.length === 1) {
+          // Serialized path — identical execution order to a pre-parallel run.
+          const call = await runOne(prepared[0]!);
+          await this.finalizeAgentCall(prepared[0]!, call, inputContent);
+        } else {
+          // Concurrent batch: all agents dispatched before any await, results
+          // finalized in STACK order. A rejected agent does NOT lose its
+          // siblings' results: fulfilled calls are appended and persisted in
+          // order first, then the first error is re-thrown (the outer catch
+          // emits run.failed, matching a serialized failure).
+          const settled = await Promise.allSettled(prepared.map(runOne));
+          let firstError: unknown;
+          for (const [i, p] of prepared.entries()) {
+            const s = settled[i]!;
+            if (s.status === "rejected") {
+              firstError ??= s.reason;
+              continue;
+            }
+            await this.finalizeAgentCall(p, s.value, inputContent);
+          }
+          if (firstError !== undefined) {
+            throw firstError instanceof Error
+              ? firstError
+              : new Error(
+                  typeof firstError === "string"
+                    ? firstError
+                    : JSON.stringify(firstError)
+                );
+          }
+        }
 
         // Here we face a problem: what's the definition of done?   An agent may
         // have just been called with part of the information to solve an input.
@@ -912,6 +975,63 @@ export class NetworkRun<T extends StateData> extends Network<T> {
     }
 
     return this;
+  }
+
+  /**
+   * Finalize one completed agent call: stamp its canonical streaming message
+   * id, emit the agent-level run.completed, append the result to network
+   * history, and persist it immediately (per-iteration durability).
+   *
+   * ALWAYS called in stack order — for a concurrent batch this runs after the
+   * batch settles, so result ordering and persistence step ids stay
+   * deterministic regardless of completion order.
+   */
+  private async finalizeAgentCall(
+    prepared: {
+      agent: Agent<T>;
+      agentRunId: string;
+      agentMessageId: string;
+      agentStreamingContext?: StreamingContext;
+    },
+    call: AgentResult,
+    inputContent: string
+  ): Promise<void> {
+    // CRITICAL FIX: Set the canonical message ID on the AgentResult
+    // This ensures the streaming agentMessageId becomes the persisted message_id
+    call.id = prepared.agentMessageId;
+
+    if (prepared.agentStreamingContext) {
+      await prepared.agentStreamingContext.publishEvent({
+        event: "run.completed",
+        data: {
+          runId: prepared.agentRunId,
+          scope: "agent",
+          name: prepared.agent.name,
+          messageId: prepared.agentMessageId, // Include agent-specific messageId in completion event
+        },
+      });
+    }
+    this._counter += 1;
+
+    // Ensure that we store the call network history.
+    this.state.appendResult(call);
+
+    // Persist this result the moment it's produced, so a mid-run failure or
+    // hard abort (cancel/overflow/timeout) still leaves every completed
+    // inference on disk — not just the once-at-the-end save below. The step
+    // id is the iteration counter (replay-stable), NEVER result.checksum
+    // (which embeds a regenerated timestamp). Idempotent: the end-of-run
+    // save and the consumer's own dedupe make re-writes no-ops.
+    await persistResults(
+      {
+        state: this.state,
+        history: this.history,
+        input: inputContent,
+        network: this,
+      },
+      [call],
+      incrementalAppendStepId(this._counter)
+    );
   }
 
   private async getNextAgents(
