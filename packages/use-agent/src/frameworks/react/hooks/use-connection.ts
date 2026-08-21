@@ -23,10 +23,17 @@ export function useConnectionSubscription(params: {
   /** Optional: direct token fetcher; when provided, we use the official hook */
   refreshToken?: () => Promise<unknown>;
 }) {
-  const { channel, onMessage, onStateChange, debug, refreshToken } = params;
+  const { connection, channel, onMessage, onStateChange, debug, refreshToken } =
+    params;
+  const onMessageRef = useRef(onMessage);
+  const onStateChangeRef = useRef(onStateChange);
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+    onStateChangeRef.current = onStateChange;
+  }, [onMessage, onStateChange]);
 
-  // Token is required for realtime subscriptions
-  const enabled = Boolean(channel && refreshToken);
+  const customConnectionEnabled = Boolean(channel && connection);
+  const realtimeHookEnabled = Boolean(channel && refreshToken && !connection);
   type SubscriptionOptions = {
     key?: string;
     enabled?: boolean;
@@ -34,9 +41,12 @@ export function useConnectionSubscription(params: {
   };
   const subOptions: SubscriptionOptions = {
     key: channel || undefined,
-    enabled,
+    enabled: realtimeHookEnabled,
     refreshToken: async () => {
-      return await refreshToken!();
+      if (!refreshToken) {
+        throw new Error("Realtime token provider is unavailable");
+      }
+      return await refreshToken();
     },
   };
 
@@ -46,17 +56,17 @@ export function useConnectionSubscription(params: {
 
   const lastLenRef = useRef(0);
   useEffect(() => {
-    if (!enabled) return;
+    if (!realtimeHookEnabled) return;
     try {
       onStateChange?.(state);
     } catch (err) {
       if (debug)
         console.warn("[useConnectionSubscription] state handler error", err);
     }
-  }, [enabled, state, onStateChange]);
+  }, [realtimeHookEnabled, state, onStateChange]);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!realtimeHookEnabled) return;
     if (!Array.isArray(data)) return;
     for (let i = lastLenRef.current; i < data.length; i++) {
       try {
@@ -70,22 +80,58 @@ export function useConnectionSubscription(params: {
       }
     }
     lastLenRef.current = data.length;
-  }, [enabled, data, onMessage]);
+  }, [realtimeHookEnabled, data, onMessage]);
+
+  useEffect(() => {
+    if (!customConnectionEnabled || !connection || !channel) return;
+    let disposed = false;
+    let activeSubscription: { unsubscribe(): void } | undefined;
+
+    Promise.resolve(
+      connection.subscribe({
+        channel,
+        onMessage: (chunk) => onMessageRef.current(chunk),
+        onStateChange: (nextState) => onStateChangeRef.current?.(nextState),
+        debug,
+      })
+    )
+      .then((subscription) => {
+        if (disposed) subscription.unsubscribe();
+        else activeSubscription = subscription;
+      })
+      .catch((err: unknown) => {
+        if (debug)
+          console.warn(
+            "[useConnectionSubscription] custom connection error",
+            err
+          );
+        try {
+          onStateChangeRef.current?.("Error");
+        } catch {
+          // Ignore consumer callback failures.
+        }
+      });
+
+    return () => {
+      disposed = true;
+      activeSubscription?.unsubscribe();
+    };
+  }, [customConnectionEnabled, connection, channel, debug]);
 
   // Minimal error logging / diagnostics
   useEffect(() => {
-    if (enabled || !channel) return;
+    if (realtimeHookEnabled || customConnectionEnabled || !channel) return;
     if (debug)
       console.warn(
         "[useConnectionSubscription] Token is required; realtime disabled (channel=",
         channel,
         ")"
       );
-  }, [enabled, channel, debug]);
+  }, [realtimeHookEnabled, customConnectionEnabled, channel, debug]);
 
   useEffect(() => {
-    if (!enabled || !error) return;
+    if (!realtimeHookEnabled || !error) return;
     if (debug)
       console.warn("[useConnectionSubscription] realtime error", error);
-  }, [enabled, error, debug]);
+  }, [realtimeHookEnabled, error, debug]);
 }

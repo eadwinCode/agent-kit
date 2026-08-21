@@ -9,25 +9,20 @@ vi.mock("../../../../core/adapters/http-transport.js", async (orig) => {
   return {
     ...mod,
     createDefaultHttpTransport: vi.fn(() => ({
-      getRealtimeToken: vi.fn(async () => ({ token: "tok", expires: new Date().toISOString() })),
+      getRealtimeToken: vi.fn(async () => ({
+        token: "tok",
+        expires: new Date().toISOString(),
+      })),
     })),
   };
 });
 
-vi.mock("../../../../core/adapters/inngest-connection.js", async (orig) => {
-  const mod: any = await (orig as any)();
-  return {
-    ...mod,
-    createInngestConnection: vi.fn(() => ({ id: "conn" })),
-  };
-});
-
 describe("AgentProvider", () => {
-  it("creates default transport and connection when not provided", () => {
+  it("creates a default transport and leaves connection unset by default", () => {
     function Probe() {
       const ctx = useContext(AgentContext);
       expect(ctx?.transport).toBeTruthy();
-      expect(ctx?.connection).toBeTruthy();
+      expect(ctx?.connection).toBeNull();
       return null;
     }
     render(
@@ -38,7 +33,12 @@ describe("AgentProvider", () => {
   });
 
   it("uses provided transport and connection when specified", () => {
-    const transport: any = { getRealtimeToken: vi.fn(async () => ({ token: "x", expires: new Date().toISOString() })) };
+    const transport: any = {
+      getRealtimeToken: vi.fn(async () => ({
+        token: "x",
+        expires: new Date().toISOString(),
+      })),
+    };
     const connection: any = { id: "c" };
     function Probe() {
       const ctx = useContext(AgentContext);
@@ -48,7 +48,11 @@ describe("AgentProvider", () => {
       return null;
     }
     render(
-      <AgentProvider debug={false} transport={transport} connection={connection}>
+      <AgentProvider
+        debug={false}
+        transport={transport}
+        connection={connection}
+      >
         <Probe />
       </AgentProvider>
     );
@@ -67,5 +71,3 @@ describe("AgentProvider", () => {
     );
   });
 });
-
-
