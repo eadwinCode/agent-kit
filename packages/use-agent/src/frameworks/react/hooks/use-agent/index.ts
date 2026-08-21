@@ -225,6 +225,18 @@ export function useAgents<
       }),
     [config.fetchHistory, effectiveTransport]
   );
+  const fetchRunEventsFn = useMemo(
+    () =>
+      (config.fetchRunEvents as
+        | ((tid: string) => Promise<unknown[]>)
+        | undefined) ||
+      (async (tid: string) => {
+        return effectiveTransport.fetchRunEvents
+          ? effectiveTransport.fetchRunEvents({ threadId: tid })
+          : [];
+      }),
+    [config.fetchRunEvents, effectiveTransport]
+  );
   const deleteThreadFn = useMemo(
     () =>
       (config.deleteThread as (tid: string) => Promise<void> | undefined) ||
@@ -841,8 +853,9 @@ export function useAgents<
       }
       if (bcRef.current === bc) bcRef.current = null;
     };
-    // Intentionally only re-run on channel changes
-  }, [effectiveChannel]);
+    // Re-request once the server-selected thread id becomes available. On a
+    // cold load it is commonly null when the channel first connects.
+  }, [effectiveChannel, currentThreadId]);
 
   // Utility getters
   const getThreadState = useCallback((tid: string) => {
@@ -1078,6 +1091,43 @@ export function useAgents<
             });
           }
         }
+
+        const replay = await fetchRunEventsFn(threadId);
+        const current = engineRef.current?.getState()?.currentThreadId;
+        if (current === threadId && Array.isArray(replay)) {
+          const events = replay
+            .filter(
+              (value): value is AgentKitEvent<TManifest> =>
+                Boolean(value) &&
+                typeof value === "object" &&
+                typeof (value as { event?: unknown }).event === "string"
+            )
+            .sort((left, right) => {
+              const a =
+                typeof left.sequenceNumber === "number"
+                  ? left.sequenceNumber
+                  : 0;
+              const b =
+                typeof right.sequenceNumber === "number"
+                  ? right.sequenceNumber
+                  : 0;
+              return a - b;
+            });
+          for (const event of events) {
+            const key = dedupKeyForEvent(event);
+            if (appliedEventIdsRef.current.has(key)) continue;
+            appliedEventIdsRef.current.add(key);
+            engineRef.current?.handleRealtimeMessages([event]);
+            const data = event.data as Record<string, unknown>;
+            config.onEvent?.(event, {
+              threadId,
+              runId: typeof data.runId === "string" ? data.runId : undefined,
+              messageId:
+                typeof data.messageId === "string" ? data.messageId : undefined,
+              source: "unknown",
+            });
+          }
+        }
       } catch (err: unknown) {
         logger.warn("switchToThread validation/load failed", err);
         config.onThreadNotFound?.(threadId);
@@ -1093,6 +1143,8 @@ export function useAgents<
       hasQueryProvider,
       dispatchReplaceMessages,
       dispatchMarkViewed,
+      fetchRunEventsFn,
+      dedupKeyForEvent,
     ]
   );
 
