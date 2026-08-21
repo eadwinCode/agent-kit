@@ -91,6 +91,11 @@ export function useAgents<
   const threadSessionIdRef = useRef<number>(0);
 
   const provider = useProviderContext();
+  if (config.requireProvider && !provider.hasProvider) {
+    throw new Error(
+      "useAgent with requireProvider=true must be used within an AgentProvider"
+    );
+  }
   if (config.debug) {
     logger.log(AgentsEvents.ProviderIdentityResolved, {
       userId: provider.userId,
@@ -353,6 +358,18 @@ export function useAgents<
       default:
         return null;
     }
+  }, [currentThreadId, engineState]);
+
+  const engineError = useMemo(() => {
+    if (!engineState) return undefined;
+    const tid = currentThreadId || fallbackThreadIdRef.current!;
+    return engineState.threads?.[tid]?.error;
+  }, [currentThreadId, engineState]);
+
+  const engineCurrentAgent = useMemo(() => {
+    if (!engineState) return undefined;
+    const tid = currentThreadId || fallbackThreadIdRef.current!;
+    return engineState.threads?.[tid]?.currentAgent;
   }, [currentThreadId, engineState]);
 
   // Derive messages from engine state if enabled
@@ -1267,8 +1284,8 @@ export function useAgents<
     messages: engineMessages || [],
     status: (engineStatus as AgentStatus) ?? "ready",
     isConnected: Boolean(engineRef.current?.getState().isConnected),
-    currentAgent: undefined,
-    error: undefined,
+    currentAgent: engineCurrentAgent,
+    error: engineError,
     clearError: () => {
       const tid = currentThreadId || fallbackThreadIdRef.current!;
       try {

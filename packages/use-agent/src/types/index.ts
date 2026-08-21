@@ -97,8 +97,18 @@ export type PartCreated = EventBase & {
   data: WithThread & {
     messageId: string;
     partId: string;
-    type: "text" | "tool-call" | "reasoning";
-    metadata?: { toolName?: string; agentName?: string };
+    type:
+      | "text"
+      | "tool-call"
+      | "reasoning"
+      | "data"
+      | "status"
+      | "file"
+      | "source"
+      | "error"
+      | "hitl";
+    content?: unknown;
+    metadata?: JsonObject;
   };
 };
 
@@ -109,7 +119,57 @@ export type TextDelta = EventBase & {
 
 export type ReasoningDelta = EventBase & {
   event: "reasoning.delta";
-  data: WithThread & { messageId: string; partId: string; delta: string };
+  data: WithThread & {
+    messageId: string;
+    partId: string;
+    delta: string;
+    metadata?: JsonObject;
+  };
+};
+
+export type DataDelta = EventBase & {
+  event: "data.delta";
+  data: WithThread & {
+    messageId: string;
+    partId: string;
+    delta: unknown;
+    metadata?: JsonObject;
+  };
+};
+
+export type ErrorEvent = EventBase & {
+  event: "error";
+  data: WithThread & {
+    messageId?: string;
+    partId?: string;
+    error: string;
+    recoverable?: boolean;
+    agentId?: string;
+  };
+};
+
+export type HitlRequested = EventBase & {
+  event: "hitl.requested";
+  data: WithThread & {
+    messageId: string;
+    partId?: string;
+    requestId?: string;
+    toolCalls: HitlUIPart["toolCalls"];
+    expiresAt?: string;
+    metadata?: HitlUIPart["metadata"];
+  };
+};
+
+export type HitlResolved = EventBase & {
+  event: "hitl.resolved";
+  data: WithThread & {
+    partId?: string;
+    requestId?: string;
+    status?: HitlUIPart["status"];
+    approved?: boolean;
+    resolvedBy?: string;
+    resolvedAt?: string;
+  };
 };
 
 export type ToolArgsDelta = EventBase & {
@@ -129,17 +189,27 @@ export type ToolOutputDelta = EventBase & {
 };
 
 type PartCompletedBasePayload<
-  TType extends "text" | "tool-call" | "tool-output" | "reasoning",
+  TType extends
+    | "text"
+    | "tool-call"
+    | "tool-output"
+    | "reasoning"
+    | StructuredPartType,
 > = WithThread & {
   messageId: string;
   partId: string;
   type: TType;
   toolName?: string;
-  metadata?: { toolName?: string };
+  metadata?: JsonObject;
 };
 
 type PartCompletedEventBase<
-  TType extends "text" | "tool-call" | "tool-output" | "reasoning",
+  TType extends
+    | "text"
+    | "tool-call"
+    | "tool-output"
+    | "reasoning"
+    | StructuredPartType,
   TExtra extends Record<string, unknown> = Record<string, unknown>,
 > = EventBase & {
   event: "part.completed";
@@ -201,12 +271,32 @@ type ManifestToolOutputEvent<TManifest extends ToolManifest> =
         >;
       }[keyof TManifest & string];
 
+export type StructuredPartType =
+  | "data"
+  | "status"
+  | "file"
+  | "source"
+  | "error"
+  | "hitl";
+
+type PartCompletedStructuredEvent = EventBase & {
+  event: "part.completed";
+  data: WithThread & {
+    messageId: string;
+    partId: string;
+    type: StructuredPartType;
+    finalContent?: unknown;
+    metadata?: JsonObject;
+  };
+};
+
 export type TypedPartCompletedEvent<TManifest extends ToolManifest> =
   | PartCompletedTextEvent
   | PartCompletedReasoningEvent
   | PartCompletedToolCallEvent<TManifest>
   | ManifestToolOutputEvent<TManifest>
-  | PartCompletedToolOutputFallbackEvent;
+  | PartCompletedToolOutputFallbackEvent
+  | PartCompletedStructuredEvent;
 
 export type PartCompleted = TypedPartCompletedEvent<ToolManifest>;
 
@@ -217,6 +307,10 @@ export type AgentKitEvent<TManifest extends ToolManifest = ToolManifest> =
   | PartCreated
   | TextDelta
   | ReasoningDelta
+  | DataDelta
+  | ErrorEvent
+  | HitlRequested
+  | HitlResolved
   | ToolArgsDelta
   | ToolOutputDelta
   | TypedPartCompletedEvent<TManifest>
@@ -228,6 +322,11 @@ type KnownEventNames =
   | "stream.ended"
   | "part.created"
   | "text.delta"
+  | "reasoning.delta"
+  | "data.delta"
+  | "error"
+  | "hitl.requested"
+  | "hitl.resolved"
   | "tool_call.arguments.delta"
   | "tool_call.output.delta"
   | "part.completed";
@@ -914,6 +1013,8 @@ export interface ThreadState<
   historyLoaded?: boolean;
   /** Whether a run is currently active for this thread (from run.started to run.completed/stream.ended). */
   runActive?: boolean;
+  /** Event identities already accepted for this thread, used for realtime deduplication. */
+  processedEventIds?: Set<string>;
 
   // Error handling (per thread)
   /** Thread-specific error information. */

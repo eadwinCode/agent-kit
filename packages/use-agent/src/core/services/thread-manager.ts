@@ -125,18 +125,32 @@ export class ThreadManager {
 
   formatRawHistoryMessages(rawMessages: unknown[]): ConversationMessage[] {
     if (!Array.isArray(rawMessages)) return [];
-    return rawMessages.map((raw) => {
+    return rawMessages.map((raw, messageIndex) => {
       const msg = isRecord(raw) ? raw : {};
       const id =
         typeof msg["message_id"] === "string"
           ? msg["message_id"]
-          : `msg-${Date.now()}`;
+          : typeof msg["id"] === "string"
+            ? msg["id"]
+            : `msg-${Date.now()}-${messageIndex}`;
       const baseTimestamp = msg["createdAt"] ?? msg["created_at"] ?? Date.now();
       const timestamp = toDate(baseTimestamp);
 
-      if (msg["type"] === "user") {
-        const content =
-          typeof msg["content"] === "string" ? msg["content"] : "";
+      if (
+        (msg["role"] === "user" || msg["role"] === "assistant") &&
+        Array.isArray(msg["parts"])
+      ) {
+        return {
+          ...msg,
+          id,
+          timestamp,
+          status: typeof msg["status"] === "string" ? msg["status"] : "sent",
+        } as ConversationMessage;
+      }
+
+      const kind = msg["kind"] ?? msg["type"];
+      if (kind === "user") {
+        const content = historyContentText(msg["content"]);
         const clientState = isRecord(msg["clientState"])
           ? msg["clientState"]
           : undefined;
@@ -152,36 +166,122 @@ export class ThreadManager {
         } as ConversationMessage;
       }
 
-      // assistant: extract first text output if present
-      let assistantText = "";
-      const data = msg["data"];
-      if (isRecord(data)) {
-        const output = data["output"];
-        if (Array.isArray(output)) {
-          for (const item of output as unknown[]) {
-            if (
-              isRecord(item) &&
-              item["type"] === "text" &&
-              typeof item["content"] === "string"
-            ) {
-              assistantText = item["content"];
-              break;
+      const data = isRecord(msg["data"]) ? msg["data"] : {};
+      const output = asUnknownArray(msg["output"]);
+      const nestedOutput = asUnknownArray(data["output"]);
+      const resolvedOutput = output.length > 0 ? output : nestedOutput;
+      const toolResults = asUnknownArray(msg["toolCalls"]);
+      const nestedToolResults = asUnknownArray(data["toolCalls"]);
+      const resolvedToolResults =
+        toolResults.length > 0 ? toolResults : nestedToolResults;
+      const agentName =
+        typeof msg["agentName"] === "string"
+          ? msg["agentName"]
+          : typeof data["agentName"] === "string"
+            ? data["agentName"]
+            : "";
+      const parts: ConversationMessage["parts"] = [];
+      let toolResultIndex = 0;
+
+      for (
+        let outputIndex = 0;
+        outputIndex < resolvedOutput.length;
+        outputIndex++
+      ) {
+        const item = resolvedOutput[outputIndex];
+        if (!isRecord(item)) continue;
+
+        if (item["type"] === "text") {
+          parts.push({
+            type: "text",
+            id: `text-${id}-${outputIndex}`,
+            content: historyContentText(item["content"]),
+            status: "complete",
+          });
+          continue;
+        }
+
+        if (item["type"] === "reasoning") {
+          parts.push({
+            type: "reasoning",
+            id: `reasoning-${id}-${outputIndex}`,
+            agentName,
+            content: historyContentText(item["content"]),
+            status: "complete",
+          });
+          continue;
+        }
+
+        const rawTools = asUnknownArray(item["tools"]);
+        if (item["type"] === "tool_call" && rawTools.length > 0) {
+          for (const rawTool of rawTools) {
+            if (!isRecord(rawTool)) continue;
+            const result = resolvedToolResults[toolResultIndex++];
+            const resultRecord = isRecord(result) ? result : undefined;
+            const tool =
+              resultRecord && isRecord(resultRecord["tool"])
+                ? resultRecord["tool"]
+                : {};
+            const toolCallId =
+              typeof rawTool["id"] === "string"
+                ? rawTool["id"]
+                : typeof tool["id"] === "string"
+                  ? tool["id"]
+                  : `tool-${id}-${outputIndex}-${toolResultIndex}`;
+            const rawResult = resultRecord?.["content"];
+            const normalizedResult =
+              isRecord(rawResult) && "data" in rawResult
+                ? rawResult
+                : { data: rawResult };
+            const toolName =
+              typeof rawTool["name"] === "string"
+                ? rawTool["name"]
+                : typeof tool["name"] === "string"
+                  ? tool["name"]
+                  : "tool";
+            if (resultRecord) {
+              parts.push({
+                type: "tool-call",
+                toolCallId,
+                toolName,
+                state: "output-available",
+                input: rawTool["input"] ?? {},
+                output: normalizedResult,
+              });
+            } else {
+              parts.push({
+                type: "tool-call",
+                toolCallId,
+                toolName,
+                state: "input-available",
+                input: rawTool["input"] ?? {},
+              });
             }
           }
         }
       }
 
+      if (parts.length === 0) {
+        const legacyText = (() => {
+          for (const item of resolvedOutput) {
+            if (isRecord(item) && item["type"] === "text") {
+              return historyContentText(item["content"]);
+            }
+          }
+          return "";
+        })();
+        parts.push({
+          type: "text",
+          id: `text-${id}`,
+          content: legacyText,
+          status: "complete",
+        });
+      }
+
       return {
         id,
         role: "assistant",
-        parts: [
-          {
-            type: "text",
-            id: `text-${id}`,
-            content: assistantText,
-            status: "complete",
-          },
-        ],
+        parts,
         timestamp,
         status: "sent",
       } as ConversationMessage;
@@ -196,7 +296,32 @@ export function isGenericTitle(title?: string | null): boolean {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object";
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function asUnknownArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? (value as unknown[]) : [];
+}
+
+function historyContentText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((part) =>
+        isRecord(part) &&
+        part["type"] === "text" &&
+        typeof part["text"] === "string"
+          ? part["text"]
+          : ""
+      )
+      .join("");
+  }
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "[unserializable value]";
+  }
 }
 
 function toDate(value: unknown): Date {
