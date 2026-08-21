@@ -78,15 +78,6 @@ export interface IClientTransport {
     params: FetchHistoryParams,
     options?: RequestOptions
   ): Promise<unknown[]>;
-  /**
-   * Optional durable replay source for the thread's current active run.
-   * Returned standard AgentKit envelopes are reduced after canonical history
-   * and before subsequent live events.
-   */
-  fetchRunEvents?(
-    params: FetchHistoryParams,
-    options?: RequestOptions
-  ): Promise<unknown[]>;
   createThread(
     params: CreateThreadParams,
     options?: RequestOptions

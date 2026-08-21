@@ -186,15 +186,6 @@ export function reduceStreamingState<
               typeof d.name === "string" ? d.name : thread.currentAgent;
             thread.lastActivity = new Date();
           }
-
-          // run.started can establish a new epoch without leaving an event for
-          // drainBuffer to apply. Persist the lifecycle mutation immutably so
-          // StreamingEngine observes a new root state and notifies React. The
-          // sending tab already has an optimistic submitted state, but sibling
-          // tabs depend on this notification to render the same live status.
-          next = writeThread<TManifest, TState>(next, threadId, {
-            ...thread,
-          } as ThreadState<TManifest, TState>);
         }
 
         // Drain any consecutive events now available

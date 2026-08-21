@@ -179,55 +179,6 @@ describe("useAgents core", () => {
     expect(onEvent).toHaveBeenCalledTimes(0);
   });
 
-  it("reduces durable active-run events after canonical history", async () => {
-    const onEvent = vi.fn();
-    const fetchHistory = vi.fn(async () => []);
-    const fetchRunEvents = vi.fn(async () => [
-      {
-        event: "run.started",
-        data: {
-          threadId: "thread-1",
-          runId: "run-1",
-          scope: "network",
-        },
-        timestamp: 1,
-        sequenceNumber: 1,
-        id: "evt-1",
-      },
-    ]);
-    const transport: any = {
-      sendMessage: vi.fn(async () => {}),
-      cancelMessage: vi.fn(async () => {}),
-      approveToolCall: vi.fn(async () => {}),
-      getRealtimeToken: vi.fn(async () => ({
-        token: "t",
-        expires: new Date().toISOString(),
-      })),
-      fetchHistory,
-      fetchRunEvents,
-    };
-
-    const { result } = renderHook(() =>
-      useAgents({
-        transport,
-        initialThreadId: "thread-1",
-        enableThreadValidation: true,
-        debug: false,
-        onEvent,
-      })
-    );
-
-    await waitFor(() =>
-      expect(fetchRunEvents).toHaveBeenCalledWith({ threadId: "thread-1" })
-    );
-    expect(fetchHistory).toHaveBeenCalledWith({ threadId: "thread-1" });
-    await waitFor(() => expect(result.current.status).toBe("submitted"));
-    expect(onEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ event: "run.started" }),
-      expect.objectContaining({ threadId: "thread-1", runId: "run-1" })
-    );
-  });
-
   it("cancel calls transport with current or fallback thread id", async () => {
     const cancelMessage = vi.fn(async () => {});
     const transport: any = {

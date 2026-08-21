@@ -40,7 +40,6 @@ export interface DefaultHttpTransportConfig {
     getRealtimeToken: string | (() => string | Promise<string>);
     fetchThreads: string | (() => string | Promise<string>);
     fetchHistory: string | (() => string | Promise<string>); // e.g., '/api/threads/{threadId}'
-    fetchRunEvents?: string | (() => string | Promise<string>); // e.g., '/api/threads/{threadId}/run-events'
     createThread: string | (() => string | Promise<string>);
     deleteThread: string | (() => string | Promise<string>); // e.g., '/api/threads/{threadId}'
     approveToolCall: string | (() => string | Promise<string>);
@@ -282,25 +281,6 @@ export class DefaultHttpTransport implements IClientTransport {
       }
     );
     return response.messages;
-  }
-
-  async fetchRunEvents(
-    params: FetchHistoryParams,
-    options?: RequestOptions
-  ): Promise<unknown[]> {
-    const configured = this.config.api.fetchRunEvents;
-    if (!configured) return [];
-    const endpoint = await this.resolveOption(configured);
-    const response = await this.makeRequest<{ events: unknown[] }>(
-      endpoint,
-      { threadId: params.threadId },
-      {
-        method: "GET",
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
-    return response.events;
   }
 
   async createThread(
