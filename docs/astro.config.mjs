@@ -82,6 +82,10 @@ export default defineConfig({
           items: [
             { label: "Overview", slug: "streaming/overview" },
             { label: "Usage Guide", slug: "streaming/usage-guide" },
+            {
+              label: "Stateful Sessions",
+              slug: "streaming/stateful-sessions",
+            },
             { label: "Events", slug: "streaming/events" },
             { label: "Transport", slug: "streaming/transport" },
             { label: "Provider", slug: "streaming/provider" },

@@ -1,0 +1,418 @@
+---
+title: "Stateful Agent Sessions"
+description: "Recover AgentKit conversations across reloads, reconnects, and multiple clients with durable events and server-authoritative state."
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+Stateful sessions keep an AgentKit conversation correct when a browser reloads,
+a realtime connection drops, or two clients act on the same conversation. The
+server owns the current thread, active run, pause and approval state. The client
+hydrates from a snapshot and canonical history, replays the durable event tail,
+and then follows live events.
+
+Use this integration when your UI needs reconnect recovery, pause/resume,
+cancellation, approvals, idempotent sends, or multi-client consistency. For a
+simple chat whose state can be reconstructed from history, start with
+[`useChat`](/reference/react-hooks/use-chat) or
+[`useAgent`](/reference/react-hooks/use-agent).
+
+## What each layer owns
+
+| Layer                | Responsibility                                                                                                                         |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `@inngest/agent-kit` | Runs the agent or network and emits ordered `AgentMessageChunk` events through `streaming.publish`.                                    |
+| Your server adapter  | Authorizes an opaque session, stores canonical history and snapshots, journals events, implements commands, and publishes live events. |
+| `@inngest/use-agent` | Renders the transcript with `useAgent`, or coordinates snapshot, tail, gaps, reconnects, and commands with `useAgentSession`.          |
+
+The TypeScript AgentKit streaming callback is a live, best-effort integration
+point. It is not itself the durable journal or the session state machine. The
+application adapter supplies those pieces and exposes them through its own
+authenticated API.
+
+## The recovery flow
+
+1. Fetch the bounded `AgentStateSnapshot` and canonical completed history.
+2. If a run is active, read durable event pages after the returned cursor.
+3. Buffer live events while those requests are in flight.
+4. Apply replayed and buffered events in `(streamEpoch, sequenceNumber)` order.
+5. Backfill a live sequence gap. Re-snapshot if the requested tail has expired.
+
+The snapshot intentionally contains no transcript. Completed messages come
+from canonical history; an in-flight message comes from the durable tail.
+
+## Server: connect AgentKit to your adapter
+
+<Steps>
+
+1. **Resolve the session scope on the server**
+
+   Authenticate first, then resolve the opaque session ID to the storage keys
+   your application needs. Team and project identifiers may belong in this
+   private adapter context, but they are not fields in AgentKit's command,
+   snapshot, or event contracts.
+
+   ```ts
+   type PersistenceScope = {
+     sessionId: string;
+     actorId: string;
+     teamId: string;
+     projectId: string;
+   };
+
+   async function authorizeSession(
+     request: Request,
+     sessionId: string
+   ): Promise<PersistenceScope> {
+     const actor = await requireAuthenticatedActor(request);
+     return sessionRepository.requireAuthorizedScope(actor.id, sessionId);
+   }
+   ```
+
+   Never accept `team_id` or `project_id` from a generic client command and
+   treat it as authorization. Derive ownership from the authenticated actor and
+   the server-side session lookup.
+
+2. **Journal AgentKit events before live fan-out**
+
+   AgentKit supplies the event name, data, timestamp, sequence number, and step
+   ID. The adapter adds the replay identity required by the standard envelope.
+   `streamEpoch` changes when a new producer takes over and restarts sequence
+   numbering.
+
+   ```ts
+   import type { AgentMessageChunk } from "@inngest/agent-kit";
+   import type { StandardEventEnvelope } from "@inngest/use-agent";
+
+   let activeRunId: string | undefined;
+   const streamEpoch = await sessionRepository.claimStreamEpoch(scope);
+
+   await network.run(userMessage, {
+     state,
+     streaming: {
+       publish: async (chunk: AgentMessageChunk) => {
+         if (
+           chunk.event === "run.started" &&
+           chunk.data.scope === "network" &&
+           typeof chunk.data.runId === "string"
+         ) {
+           activeRunId = chunk.data.runId;
+         }
+         if (!activeRunId) throw new Error("network run ID is unavailable");
+
+         const envelope: StandardEventEnvelope = {
+           ...chunk,
+           eventId: `${activeRunId}:${streamEpoch}:${chunk.sequenceNumber}`,
+           streamEpoch,
+           schemaVersion: 1,
+         };
+
+         try {
+           await sessionRepository.appendEvent(scope, envelope);
+         } catch (error) {
+           await sessionRepository.markReconcileRequired(scope);
+           throw error;
+         }
+         await realtime.publish(scope.sessionId, envelope);
+       },
+     },
+   });
+   ```
+
+   Make the journal append unique on `eventId`, and persist before publishing.
+   Because AgentKit treats publishing as best effort, monitor append failures
+   and mark the session for reconciliation; do not assume this callback is a
+   database transaction around the agent run.
+
+3. **Expose snapshot, tail, and command endpoints**
+
+   Implement the three `IAgentSessionTransport` operations behind your own API:
+
+   | Operation         | Example route                                  | Response                                          |
+   | ----------------- | ---------------------------------------------- | ------------------------------------------------- |
+   | `fetchAgentState` | `GET /api/agent/sessions/:sessionId/state`     | `{ snapshot, messages, cursor }`                  |
+   | `fetchEventTail`  | `GET /api/agent/sessions/:sessionId/events`    | `{ events, next, hasMore, retentionGap? }`        |
+   | `executeCommand`  | `POST /api/agent/sessions/:sessionId/commands` | `{ snapshot, duplicate?, outcomeCode?, cursor? }` |
+
+   Every mutating command has a client-generated `commandId`. Store its payload
+   hash and result atomically. Repeating the same ID and payload returns the
+   recorded result; reusing the ID with a different payload returns
+   `IDEMPOTENCY_KEY_REUSED`.
+
+   Apply `expectedRevision` as a compare-and-swap precondition. On a stale
+   revision, return `STATE_REVISION_MISMATCH` with the authoritative snapshot
+   in the structured error envelope.
+
+</Steps>
+
+## Client: recover an existing `useAgent` transcript
+
+`useAgent` can replay the active run after it installs canonical history. Add a
+run-events endpoint to `DefaultHttpTransport`; the hook deduplicates replayed
+events against subsequent realtime delivery.
+
+```tsx
+import { createDefaultHttpTransport, useAgent } from "@inngest/use-agent";
+
+const transport = createDefaultHttpTransport({
+  api: {
+    sendMessage: "/api/chat",
+    getRealtimeToken: "/api/realtime/token",
+    fetchThreads: "/api/threads",
+    fetchHistory: "/api/threads/{threadId}",
+    fetchRunEvents: "/api/threads/{threadId}/run-events",
+    createThread: "/api/threads",
+    deleteThread: "/api/threads/{threadId}",
+    approveToolCall: "/api/approve-tool",
+    cancelMessage: "/api/chat/cancel",
+  },
+});
+
+export function Conversation() {
+  const agent = useAgent({ transport });
+
+  return (
+    <Chat
+      messages={agent.messages}
+      status={agent.status}
+      onSend={agent.sendMessage}
+    />
+  );
+}
+```
+
+Return `{ events: StandardEventEnvelope[] }` from the configured run-events
+route. This is the smallest migration for an existing `useAgent` UI: canonical
+history remains the completed transcript, and the endpoint returns only the
+current in-flight run.
+
+## Client: use the server-authoritative session API
+
+For pause/resume, cancellation, approvals, conflict reconciliation, or a custom
+transcript owner, implement `IAgentSessionTransport` against the three routes.
+The transport captures the opaque session ID; `useAgentSession` does not put a
+tenancy model into its requests.
+
+```ts
+import {
+  agentTransportErrorFromNetwork,
+  agentTransportErrorFromResponse,
+  isAgentTransportError,
+  type AgentCommand,
+  type AgentCommandResult,
+  type AgentStateResponse,
+  type EventTailPage,
+  type FetchAgentStateParams,
+  type FetchEventTailParams,
+  type IAgentSessionTransport,
+} from "@inngest/use-agent";
+
+export class HttpAgentSessionTransport implements IAgentSessionTransport {
+  constructor(private readonly sessionId: string) {}
+
+  private async request<T>(
+    path: string,
+    operation: string,
+    init?: RequestInit
+  ): Promise<T> {
+    try {
+      const response = await fetch(
+        `/api/agent/sessions/${encodeURIComponent(this.sessionId)}${path}`,
+        { credentials: "include", ...init }
+      );
+      if (!response.ok) {
+        throw await agentTransportErrorFromResponse(response, operation);
+      }
+      return (await response.json()) as T;
+    } catch (error) {
+      if (isAgentTransportError(error)) throw error;
+      throw agentTransportErrorFromNetwork(error, operation);
+    }
+  }
+
+  fetchAgentState(
+    params: FetchAgentStateParams,
+    options?: { signal?: AbortSignal }
+  ): Promise<AgentStateResponse> {
+    const query = new URLSearchParams();
+    if (params.knownRevision !== undefined) {
+      query.set("knownRevision", String(params.knownRevision));
+    }
+    const encoded = query.toString();
+    const suffix = encoded ? `?${encoded}` : "";
+    return this.request(`/state${suffix}`, "fetchAgentState", {
+      signal: options?.signal,
+    });
+  }
+
+  fetchEventTail(
+    params: FetchEventTailParams,
+    options?: { signal?: AbortSignal }
+  ): Promise<EventTailPage> {
+    const query = new URLSearchParams({
+      threadId: params.threadId,
+      runId: params.after.runId,
+      streamEpoch: String(params.after.streamEpoch),
+      after: String(params.after.sequenceNumber),
+    });
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    return this.request(`/events?${query}`, "fetchEventTail", {
+      signal: options?.signal,
+    });
+  }
+
+  executeCommand(
+    command: AgentCommand,
+    options?: { signal?: AbortSignal }
+  ): Promise<AgentCommandResult> {
+    return this.request("/commands", "executeCommand", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(command),
+      signal: options?.signal,
+    });
+  }
+}
+```
+
+Create one transport per opaque session. Feed live envelopes and connection
+state into the hook from your realtime provider. Its callbacks install
+canonical history and apply ordered, deduplicated events to your single
+transcript reducer.
+
+```tsx
+import { useEffect, useMemo } from "react";
+import {
+  useAgentSession,
+  type IAgentSessionTransport,
+  type StandardEventEnvelope,
+} from "@inngest/use-agent";
+
+type RealtimeSource = {
+  state: unknown;
+  subscribe(listener: (event: StandardEventEnvelope) => void): () => void;
+};
+
+export function SessionController({
+  sessionId,
+  realtime,
+  installHistory,
+  reduceEvents,
+}: {
+  sessionId: string;
+  realtime: RealtimeSource;
+  installHistory(messages: readonly unknown[]): void;
+  reduceEvents(events: StandardEventEnvelope[]): void;
+}) {
+  const transport: IAgentSessionTransport = useMemo(
+    () => new HttpAgentSessionTransport(sessionId),
+    [sessionId]
+  );
+  const session = useAgentSession({
+    transport,
+    scope: sessionId,
+    onMessages: installHistory,
+    onEvents: reduceEvents,
+  });
+
+  useEffect(
+    () => realtime.subscribe(session.ingest),
+    [realtime, session.ingest]
+  );
+  useEffect(
+    () => session.reportConnectionState(realtime.state),
+    [realtime.state, session.reportConnectionState]
+  );
+
+  return (
+    <SessionToolbar
+      snapshot={session.snapshot}
+      connectionState={session.connectionState}
+      onPause={session.pause}
+      onResume={session.resume}
+      onCancel={session.cancel}
+    />
+  );
+}
+```
+
+`scope` is only a React identity key: changing it resets and re-hydrates the
+hook. It is never sent over the network. The transport already knows which
+authenticated session it serves.
+
+Do not send the same live stream through both `useAgent` and
+`useAgentSession` unless they feed the same deduplicating transcript owner.
+For an existing `useAgent` UI, start with `fetchRunEvents`. Adopt
+`useAgentSession` when the session controls and snapshot state have a single,
+intentional owner.
+
+## Commands and error handling
+
+The hook exposes stable `send`, `pause`, `resume`, `cancel`, `approve`, `deny`,
+`retry`, `edit`, and `newChat` actions. It automatically includes the current
+thread, active run, pause epoch, and snapshot revision where relevant.
+
+Recoverable transport failures retry with the same command ID, so the server
+must implement idempotency. Revision conflicts do not retry blindly: the hook
+installs the authoritative snapshot from the error and returns the error to the
+caller.
+
+Use `acquireRealtimeToken` when your token provider does not already retry. It
+uses exponential backoff with jitter for transient failures and fails fast for
+401/403 responses:
+
+```ts
+import {
+  acquireRealtimeToken,
+  agentTransportErrorFromResponse,
+} from "@inngest/use-agent";
+
+const token = await acquireRealtimeToken(
+  async (signal) => {
+    const response = await fetch("/api/realtime/token", { signal });
+    if (!response.ok) {
+      throw await agentTransportErrorFromResponse(response, "realtimeToken");
+    }
+    return response.json();
+  },
+  {
+    signal: abortController.signal,
+    onStateChange: session.reportConnectionState,
+  }
+);
+```
+
+## Extending the contracts
+
+The base schemas allow additional properties so an adapter can add
+application-specific metadata without making it mandatory for every AgentKit
+user:
+
+```ts
+import type { AgentCommand, AgentStateSnapshot } from "@inngest/use-agent";
+
+interface AppSnapshot extends AgentStateSnapshot {
+  deploymentRegion?: string;
+  capabilities?: string[];
+}
+
+type AppCommand<T extends Record<string, unknown>> = AgentCommand<T> & {
+  clientVersion?: string;
+};
+```
+
+Keep authorization and persistence keys in the server adapter even when your
+database is keyed by team and project. Extensions should describe optional app
+metadata, not become client assertions of who owns a session.
+
+## Production checklist
+
+- Authorize every state, tail, command, and realtime-token request.
+- Keep the generic wire contract tenancy-neutral; resolve storage scope on the server.
+- Make `eventId` unique and append the event before live fan-out.
+- Replace history during hydration; do not merge it with stale browser state.
+- Store command ID, payload hash, state transition, and result atomically.
+- Increment `revision` once per committed transition.
+- Return `retentionGap: true` when the requested event range is no longer available.
+- Keep snapshots and errors bounded; never put prompts, reasoning, tokens, or tool output in them.
+- Treat connection state as client-local. A disconnected browser does not pause a server run.
