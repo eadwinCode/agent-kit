@@ -11,9 +11,10 @@ import (
 	"github.com/eadwinCode/agent-kit/go/durable"
 )
 
-// AgenticModel wraps a goai language model for agentic use: each Infer is a
-// single non-streaming generation executed inside a durable step, with
-// AgentKit — never goai — owning the tool loop (port decision 9).
+// AgenticModel wraps a goai language model for agentic use. Infer performs a
+// non-streaming generation; InferStream performs a true provider-streamed
+// generation. Both execute inside a durable step, and AgentKit — never goai —
+// owns the tool loop (port decision 9).
 type AgenticModel struct {
 	model        provider.LanguageModel
 	cacheControl bool
@@ -79,7 +80,22 @@ func (m *AgenticModel) Model() provider.LanguageModel { return m.model }
 type InferenceResponse struct {
 	Output []Message
 	Raw    SerializableResult
+
+	// streamEventCount is the number of AgentKit events synchronously emitted
+	// while the durable streaming inference body ran. On replay the body is
+	// skipped; the agent uses this count to advance its shared sequence without
+	// republishing the cached model parts.
+	streamEventCount int
+	// trueStreaming distinguishes new streaming durable results from legacy
+	// GenerateText results cached under the same inference step id.
+	trueStreaming bool
 }
+
+// InferenceChunkFn receives raw GoAI provider chunks synchronously as they
+// arrive. Callbacks should return quickly; they run while the durable inference
+// step is live. ChunkText and ChunkReasoning are the contracts AgentKit uses to
+// publish true text and reasoning deltas.
+type InferenceChunkFn func(provider.StreamChunk)
 
 // Infer runs one generation inside a durable step under stepID. Tools are
 // passed as definitions only — goai returns tool calls unexecuted and the
@@ -89,22 +105,7 @@ func (m *AgenticModel) Infer(ctx context.Context, stepID string, input []Message
 	goaiTools := ToolsToProviderTools(tools)
 
 	raw, err := durable.Run(ctx, m.step, stepID, func(ctx context.Context) (SerializableResult, error) {
-		opts := []goai.Option{goai.WithMessages(conv.Messages...)}
-		if conv.System != "" {
-			opts = append(opts, goai.WithSystem(conv.System))
-		}
-		if m.cacheControl {
-			opts = append(opts, goai.WithPromptCaching(true))
-		}
-		if len(goaiTools) > 0 {
-			opts = append(opts,
-				goai.WithTools(goaiTools...),
-				goai.WithToolChoice(MapToolChoice(toolChoice)),
-			)
-		}
-		opts = append(opts, m.callOptions...)
-
-		res, err := goai.GenerateText(ctx, m.model, opts...)
+		res, err := goai.GenerateText(ctx, m.model, m.inferenceOptions(conv, goaiTools, toolChoice)...)
 		if err != nil {
 			return SerializableResult{}, err
 		}
@@ -115,6 +116,107 @@ func (m *AgenticModel) Infer(ctx context.Context, stepID string, input []Message
 	}
 
 	return &InferenceResponse{Output: ResultToMessages(raw), Raw: raw}, nil
+}
+
+// InferStream runs one true streaming generation inside a durable step. Raw
+// provider chunks are delivered to onChunk before inference completion, while
+// the fully accumulated result still crosses the durable boundary and is
+// converted exactly like Infer's result. Callers that do not opt into streaming
+// continue to use Infer and goai.GenerateText.
+func (m *AgenticModel) InferStream(
+	ctx context.Context,
+	stepID string,
+	input []Message,
+	tools []ToolDef,
+	toolChoice string,
+	onChunk InferenceChunkFn,
+) (*InferenceResponse, error) {
+	return m.inferStream(ctx, stepID, input, tools, toolChoice, onChunk, nil, nil)
+}
+
+type durableInferenceStreamResult struct {
+	SerializableResult
+	StreamEventCount *int `json:"_agentkitStreamEventCount,omitempty"`
+}
+
+func (m *AgenticModel) inferStream(
+	ctx context.Context,
+	stepID string,
+	input []Message,
+	tools []ToolDef,
+	toolChoice string,
+	onChunk InferenceChunkFn,
+	onDone func(error),
+	eventCount func() int,
+) (*InferenceResponse, error) {
+	conv := MessagesToProviderMessages(input)
+	goaiTools := ToolsToProviderTools(tools)
+
+	payload, err := durable.Run(ctx, m.step, stepID, func(ctx context.Context) (durableInferenceStreamResult, error) {
+		stream, err := goai.StreamText(ctx, m.model, m.inferenceOptions(conv, goaiTools, toolChoice)...)
+		if err != nil {
+			if onDone != nil {
+				onDone(err)
+			}
+			return durableInferenceStreamResult{}, err
+		}
+		for chunk := range stream.Stream() {
+			if onChunk != nil {
+				onChunk(chunk)
+			}
+		}
+		res := stream.Result()
+		if err := stream.Err(); err != nil {
+			if onDone != nil {
+				onDone(err)
+			}
+			return durableInferenceStreamResult{}, err
+		}
+		if onDone != nil {
+			onDone(nil)
+		}
+		count := 0
+		if eventCount != nil {
+			count = eventCount()
+		}
+		return durableInferenceStreamResult{
+			SerializableResult: toSerializableStreamResult(res),
+			StreamEventCount:   &count,
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &InferenceResponse{
+		Output: ResultToMessages(payload.SerializableResult), Raw: payload.SerializableResult,
+		streamEventCount: valueOrZero(payload.StreamEventCount),
+		trueStreaming:    payload.StreamEventCount != nil,
+	}, nil
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func (m *AgenticModel) inferenceOptions(conv ConvertedMessages, tools []goai.Tool, toolChoice string) []goai.Option {
+	opts := []goai.Option{goai.WithMessages(conv.Messages...)}
+	if conv.System != "" {
+		opts = append(opts, goai.WithSystem(conv.System))
+	}
+	if m.cacheControl {
+		opts = append(opts, goai.WithPromptCaching(true))
+	}
+	if len(tools) > 0 {
+		opts = append(opts,
+			goai.WithTools(tools...),
+			goai.WithToolChoice(MapToolChoice(toolChoice)),
+		)
+	}
+	return append(opts, m.callOptions...)
 }
 
 // isAnthropicModel detects Anthropic for cacheControl auto mode. goai's

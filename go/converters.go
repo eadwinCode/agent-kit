@@ -325,6 +325,70 @@ func ToSerializableResult(res *goai.TextResult) SerializableResult {
 	return out
 }
 
+// toSerializableStreamResult projects a completed StreamText result without
+// leaking GoAI's historical Text behavior, where Text contains both reasoning
+// and answer tokens. Step text is the text-only equivalent of GenerateText's
+// Text. Streaming reasoning metadata is recovered from ResponseMessages,
+// because providers such as Anthropic deliver signatures on reasoning chunks.
+func toSerializableStreamResult(res *goai.TextResult) SerializableResult {
+	out := ToSerializableResult(res)
+
+	var text strings.Builder
+	for _, step := range res.Steps {
+		text.WriteString(step.Text)
+	}
+	if len(res.Steps) > 0 {
+		out.Text = text.String()
+	} else if responseText, ok := textFromResponseMessages(res.ResponseMessages); ok {
+		out.Text = responseText
+	}
+
+	if details := reasoningDetailsFromResponseMessages(res.ResponseMessages); len(details) > 0 {
+		out.ReasoningDetails = details
+	}
+	return out
+}
+
+func textFromResponseMessages(messages []provider.Message) (string, bool) {
+	var text strings.Builder
+	found := false
+	for _, message := range messages {
+		if message.Role != provider.RoleAssistant {
+			continue
+		}
+		for _, part := range message.Content {
+			if part.Type == provider.PartText {
+				found = true
+				text.WriteString(part.Text)
+			}
+		}
+	}
+	return text.String(), found
+}
+
+func reasoningDetailsFromResponseMessages(messages []provider.Message) []ReasoningDetail {
+	var details []ReasoningDetail
+	for _, message := range messages {
+		if message.Role != provider.RoleAssistant {
+			continue
+		}
+		for _, part := range message.Content {
+			if part.Type != provider.PartReasoning {
+				continue
+			}
+			if data, _ := part.ProviderOptions["redactedData"].(string); data != "" {
+				details = append(details, ReasoningDetail{Type: "redacted", Data: data})
+				continue
+			}
+			signature, _ := part.ProviderOptions["signature"].(string)
+			if signature != "" {
+				details = append(details, ReasoningDetail{Type: "text", Text: part.Text, Signature: signature})
+			}
+		}
+	}
+	return details
+}
+
 // reasoningDetailsFromMetadata extracts thinking blocks (with signatures)
 // from provider metadata. Handles both the in-process shape the Anthropic
 // provider constructs ([]map[string]any) and a JSON-round-tripped []any.

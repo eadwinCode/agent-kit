@@ -16,6 +16,7 @@ package agentkit
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -92,7 +93,9 @@ type StreamingConfig struct {
 	// make delivery exactly-once across Inngest replays.
 	Publish PublishFn
 	// SimulateChunking splits part content into multiple deltas; off emits
-	// one delta per part.
+	// one delta per part. It applies only to AgentKit-owned completed content
+	// such as tool arguments and outputs. Provider reasoning/text chunks are
+	// always forwarded unchanged in real time.
 	SimulateChunking bool
 	// ChunkSize is the simulated delta size (0 = DefaultChunkSize). Larger
 	// → fewer Publish calls, which matters when each publish is a step.
@@ -130,6 +133,14 @@ type SequenceCounter struct {
 // Next returns the next sequence number (starting at 0).
 func (c *SequenceCounter) Next() int {
 	return int(c.n.Add(1) - 1)
+}
+
+// advance reserves sequence numbers for events produced inside a durable
+// inference body that was skipped on replay.
+func (c *SequenceCounter) advance(count int) {
+	if count > 0 {
+		c.n.Add(int64(count))
+	}
 }
 
 // StreamingContext manages event publishing for one run scope.
@@ -251,6 +262,15 @@ func (c *StreamingContext) GeneratePartID() string {
 		ts = ts[len(ts)-8:]
 	}
 	return fmt.Sprintf("tool_%s_%s_%s", shortMsg, ts, randBase36(6))
+}
+
+// stablePartID derives a replay-stable id for a provider-streamed inference
+// part. Unlike GeneratePartID, it needs no durable id-minting step: identical
+// run inputs produce the same id even when a failed inference is retried after
+// already publishing a partial stream.
+func (c *StreamingContext) stablePartID(kind string, iteration, index int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%d", c.RunID, c.MessageID, kind, iteration, index)))
+	return fmt.Sprintf("part_%x", sum[:16])
 }
 
 // ChunkContent splits content into the `*.delta` strings for one part:
