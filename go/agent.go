@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -454,9 +456,38 @@ func (a *Agent[T]) performInference(
 	// migrate between the TS and Go implementations.)
 	stepID := fmt.Sprintf("%s/infer/%d", a.Name, iter)
 
-	resp, err := model.Infer(ctx, stepID, append(append([]Message(nil), prompt...), history...), defs, toolChoice)
+	input := append(append([]Message(nil), prompt...), history...)
+	var inferenceStream *inferencePartStream
+	var resp *InferenceResponse
+	var err error
+	if sc != nil {
+		inferenceStream = newInferencePartStream(ctx, sc, a.Name, iter)
+		resp, err = model.inferStream(
+			ctx, stepID, input, defs, toolChoice,
+			inferenceStream.Handle,
+			func(err error) {
+				if err != nil {
+					inferenceStream.Fail(err)
+					return
+				}
+				inferenceStream.Complete()
+			},
+			inferenceStream.EventCount,
+		)
+	} else {
+		resp, err = model.Infer(ctx, stepID, input, defs, toolChoice)
+	}
 	if err != nil {
+		if inferenceStream != nil {
+			inferenceStream.Fail(err)
+		}
 		return nil, err
+	}
+	if inferenceStream != nil && resp.trueStreaming {
+		// A memoized inference does not execute its body or callbacks. Reserve
+		// the same sequence range its already-published model parts occupied,
+		// keeping every later durable publish id replay-stable.
+		sc.seq.advance(resp.streamEventCount - inferenceStream.EventCount())
 	}
 
 	rawJSON, err := jsonutil.MarshalString(resp.Raw)
@@ -480,24 +511,153 @@ func (a *Agent[T]) performInference(
 		result = moderated
 	}
 
-	// Reasoning parts are forwarded ONLY on explicit opt-in (StreamReasoning);
-	// thinking always runs on the model regardless.
-	if sc != nil && sc.StreamReasoning {
-		reasoningIdx := 0
-		for _, msg := range result.Output {
-			if msg.Type != MessageReasoning {
+	// Backward-compatible replay of an inference cached by the pre-true-
+	// streaming implementation. Its durable value has no streaming marker, so
+	// reproduce the former post-completion events once. New streamed inferences
+	// never enter this simulated fallback and therefore cannot publish twice.
+	if sc != nil && !resp.trueStreaming {
+		if err := a.streamLegacyCompletedInference(ctx, result, sc, step); err != nil {
+			return nil, err
+		}
+	}
+
+	toolCalls, err := a.invokeTools(ctx, result.Output, run, sc, step)
+	if err != nil {
+		return nil, err
+	}
+	result.ToolCalls = append(result.ToolCalls, toolCalls...)
+
+	return result, nil
+}
+
+// inferencePartStream translates raw GoAI reasoning/text chunks into AgentKit
+// parts. Only one provider content part is open at a time; a chunk-type switch
+// completes the current part before creating the next. This handles providers
+// that expose multiple reasoning/text blocks while keeping strict
+// created -> delta(s) -> completed ordering for every stable part id.
+type inferencePartStream struct {
+	ctx       context.Context
+	sc        *StreamingContext
+	agentName string
+	iter      int
+	counts    map[string]int
+	active    *inferenceStreamPart
+	failed    bool
+	events    int
+}
+
+type inferenceStreamPart struct {
+	id      string
+	kind    string
+	content strings.Builder
+}
+
+func newInferencePartStream(ctx context.Context, sc *StreamingContext, agentName string, iter int) *inferencePartStream {
+	return &inferencePartStream{
+		ctx: ctx, sc: sc, agentName: agentName, iter: iter,
+		counts: map[string]int{},
+	}
+}
+
+func (s *inferencePartStream) Handle(chunk provider.StreamChunk) {
+	if s == nil || s.failed {
+		return
+	}
+	switch chunk.Type {
+	case provider.ChunkReasoning:
+		if s.sc.StreamReasoning && chunk.Text != "" {
+			s.delta("reasoning", EventReasoningDelta, chunk.Text)
+		}
+	case provider.ChunkText:
+		if chunk.Text != "" {
+			s.delta("text", EventTextDelta, chunk.Text)
+		}
+	case provider.ChunkFinish:
+		s.Complete()
+	case provider.ChunkError:
+		err := chunk.Error
+		if err == nil {
+			err = errors.New("agentkit: provider stream failed")
+		}
+		s.Fail(err)
+	}
+}
+
+func (s *inferencePartStream) delta(kind, event, delta string) {
+	if s.active == nil || s.active.kind != kind {
+		s.Complete()
+		index := s.counts[kind]
+		s.counts[kind] = index + 1
+		s.active = &inferenceStreamPart{
+			id: s.sc.stablePartID(kind, s.iter, index), kind: kind,
+		}
+		s.sc.PublishEvent(s.ctx, EventPartCreated, map[string]any{
+			"partId": s.active.id, "runId": s.sc.RunID, "messageId": s.sc.MessageID,
+			"type": kind, "metadata": map[string]any{"agentName": s.agentName},
+		})
+		s.events++
+	}
+	s.active.content.WriteString(delta)
+	s.sc.PublishEvent(s.ctx, event, map[string]any{
+		"partId": s.active.id, "messageId": s.sc.MessageID, "delta": delta,
+	})
+	s.events++
+}
+
+func (s *inferencePartStream) Complete() {
+	if s == nil || s.failed || s.active == nil {
+		return
+	}
+	s.sc.PublishEvent(s.ctx, EventPartCompleted, map[string]any{
+		"partId": s.active.id, "runId": s.sc.RunID, "messageId": s.sc.MessageID,
+		"type": s.active.kind, "finalContent": s.active.content.String(),
+	})
+	s.events++
+	s.active = nil
+}
+
+func (s *inferencePartStream) Fail(err error) {
+	if s == nil || s.failed {
+		return
+	}
+	s.failed = true
+	if s.active == nil {
+		return
+	}
+	s.sc.PublishEvent(s.ctx, EventPartFailed, map[string]any{
+		"partId": s.active.id, "runId": s.sc.RunID, "messageId": s.sc.MessageID,
+		"type": s.active.kind, "error": err.Error(),
+	})
+	s.events++
+	s.active = nil
+}
+
+func (s *inferencePartStream) EventCount() int {
+	if s == nil {
+		return 0
+	}
+	return s.events
+}
+
+func (a *Agent[T]) streamLegacyCompletedInference(
+	ctx context.Context,
+	result *AgentResult,
+	sc *StreamingContext,
+	step durable.Step,
+) error {
+	if sc.StreamReasoning {
+		reasoningIndex := 0
+		for _, message := range result.Output {
+			if message.Type != MessageReasoning {
 				continue
 			}
-			content, _ := msg.Content.AsString()
-			// The index MUST be in the step id: one inference can emit
-			// several reasoning parts, and a shared id would drift across
-			// replays and re-publish the part.
+			content, _ := message.Content.AsString()
 			partID, err := a.streamPartID(ctx, sc, step,
-				fmt.Sprintf("generate-reasoning-part-id-%s-%d", sc.MessageID, reasoningIdx))
+				fmt.Sprintf("generate-reasoning-part-id-%s-%d", sc.MessageID, reasoningIndex))
 			if err != nil {
-				return nil, err
+				return err
 			}
-			reasoningIdx++
+			reasoningIndex++
 			sc.PublishEvent(ctx, EventPartCreated, map[string]any{
 				"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
 				"type": "reasoning", "metadata": map[string]any{"agentName": a.Name},
@@ -514,45 +674,35 @@ func (a *Agent[T]) performInference(
 		}
 	}
 
-	// Assistant text: stream the last text message's content as one part.
-	if sc != nil {
-		content := ""
-		for i := len(result.Output) - 1; i >= 0; i-- {
-			m := result.Output[i]
-			if m.Type == MessageText && m.Role == RoleAssistant {
-				content = textOf(m.Content)
-				break
-			}
-		}
-		if content != "" {
-			partID, err := a.streamPartID(ctx, sc, step,
-				fmt.Sprintf("generate-text-part-id-%s", sc.MessageID))
-			if err != nil {
-				return nil, err
-			}
-			sc.PublishEvent(ctx, EventPartCreated, map[string]any{
-				"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
-				"type": "text", "metadata": map[string]any{"agentName": a.Name},
-			})
-			for _, delta := range sc.ChunkContent(content) {
-				sc.PublishEvent(ctx, EventTextDelta, map[string]any{
-					"partId": partID, "messageId": sc.MessageID, "delta": delta,
-				})
-			}
-			sc.PublishEvent(ctx, EventPartCompleted, map[string]any{
-				"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
-				"type": "text", "finalContent": content,
-			})
+	content := ""
+	for i := len(result.Output) - 1; i >= 0; i-- {
+		message := result.Output[i]
+		if message.Type == MessageText && message.Role == RoleAssistant {
+			content = textOf(message.Content)
+			break
 		}
 	}
-
-	toolCalls, err := a.invokeTools(ctx, result.Output, run, sc, step)
+	if content == "" {
+		return nil
+	}
+	partID, err := a.streamPartID(ctx, sc, step, fmt.Sprintf("generate-text-part-id-%s", sc.MessageID))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	result.ToolCalls = append(result.ToolCalls, toolCalls...)
-
-	return result, nil
+	sc.PublishEvent(ctx, EventPartCreated, map[string]any{
+		"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
+		"type": "text", "metadata": map[string]any{"agentName": a.Name},
+	})
+	for _, delta := range sc.ChunkContent(content) {
+		sc.PublishEvent(ctx, EventTextDelta, map[string]any{
+			"partId": partID, "messageId": sc.MessageID, "delta": delta,
+		})
+	}
+	sc.PublishEvent(ctx, EventPartCompleted, map[string]any{
+		"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
+		"type": "text", "finalContent": content,
+	})
+	return nil
 }
 
 // streamPartID mints a streaming part id inside a durable step so it is

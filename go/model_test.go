@@ -22,6 +22,7 @@ type fakeModel struct {
 	queue      []*provider.GenerateResult
 	calls      int
 	err        error
+	streamFn   func(context.Context, provider.GenerateParams) (*provider.StreamResult, error)
 }
 
 func (f *fakeModel) ModelID() string { return f.id }
@@ -42,7 +43,50 @@ func (f *fakeModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 }
 
 func (f *fakeModel) DoStream(ctx context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
-	return nil, errors.New("fakeModel: streaming not expected in AgenticModel.Infer")
+	f.lastParams = params
+	f.allParams = append(f.allParams, params)
+	f.calls++
+	if f.streamFn != nil {
+		return f.streamFn(ctx, params)
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	result := f.result
+	if len(f.queue) > 0 {
+		result = f.queue[0]
+		f.queue = f.queue[1:]
+	}
+	if result == nil {
+		return nil, errors.New("fakeModel: no streaming result configured")
+	}
+
+	chunks := make(chan provider.StreamChunk, 4+len(result.ToolCalls))
+	if result.Reasoning != "" {
+		metadata := map[string]any{}
+		if entries, ok := result.ProviderMetadata["anthropic"]["reasoning"].([]map[string]any); ok && len(entries) > 0 {
+			if signature, _ := entries[0]["signature"].(string); signature != "" {
+				metadata["signature"] = signature
+			}
+		}
+		chunks <- provider.StreamChunk{Type: provider.ChunkReasoning, Text: result.Reasoning, Metadata: metadata}
+	}
+	if result.Text != "" {
+		chunks <- provider.StreamChunk{Type: provider.ChunkText, Text: result.Text}
+	}
+	for _, call := range result.ToolCalls {
+		chunks <- provider.StreamChunk{
+			Type: provider.ChunkToolCall, ToolCallID: call.ID,
+			ToolName: call.Name, ToolInput: string(call.Input), Metadata: call.Metadata,
+		}
+	}
+	chunks <- provider.StreamChunk{
+		Type: provider.ChunkFinish, FinishReason: result.FinishReason,
+		Usage: result.Usage, Response: result.Response,
+		Metadata: map[string]any{"providerMetadata": result.ProviderMetadata},
+	}
+	close(chunks)
+	return &provider.StreamResult{Stream: chunks}, nil
 }
 
 func weatherToolDef() ToolDef {

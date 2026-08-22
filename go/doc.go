@@ -106,9 +106,12 @@
 //
 // Set [StreamingConfig] on a run to emit the AgentKit event protocol:
 // run lifecycle, part created/completed, and text, reasoning and tool
-// deltas. Chunks carry monotonic sequence numbers shared across a network
-// and its agents. StreamReasoning is off by default — thinking still runs
-// on the model, it is simply not forwarded.
+// deltas. Model text and opted-in reasoning are forwarded from GoAI's raw
+// provider chunks before inference completes; simulated chunking is reserved
+// for AgentKit-owned completed content such as tool arguments and outputs.
+// Chunks carry monotonic sequence numbers shared across a network and its
+// agents. StreamReasoning is off by default — thinking still runs on the
+// model, it is simply not forwarded.
 //
 // Publishing is the caller's concern: hand [StreamingConfig.Publish] any
 // function, and wrap it in [DurablePublish] to make delivery exactly-once

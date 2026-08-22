@@ -157,7 +157,10 @@ tests rather than first in a production replay.
 
 Set `StreamingConfig` on a run to emit the AgentKit event protocol: run
 lifecycle, part created/completed, and text, reasoning and tool deltas, with
-monotonic sequence numbers shared across a network and its agents.
+monotonic sequence numbers shared across a network and its agents. Model text
+and opted-in reasoning are forwarded from GoAI's raw provider chunks before
+inference completes; `SimulateChunking` applies only to AgentKit-owned completed
+content such as tool arguments and outputs.
 
 ```go
 run, err := net.Run(ctx, input, &agentkit.NetworkRunOptions[state]{
