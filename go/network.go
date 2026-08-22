@@ -47,6 +47,11 @@ type Network[T any] struct {
 	// History persists conversation state across runs.
 	History *HistoryConfig[T]
 
+	// Ports supplies the default runtime contracts (journal, state,
+	// control, approvals, structured sink, finalizer). NetworkRunOptions.
+	// Ports overrides it per run.
+	Ports *RuntimePorts
+
 	// agents in insertion order (order is prompt-visible in the default
 	// router's system prompt and must be deterministic), with a name index.
 	agents     []*Agent[T]
@@ -67,6 +72,7 @@ type NetworkConfig[T any] struct {
 	StopWhen            StopWhen[T]
 	MaxIter             int
 	History             *HistoryConfig[T]
+	Ports               *RuntimePorts
 	// DefaultState seeds each run's state (optional).
 	DefaultState *State[T]
 }
@@ -82,6 +88,7 @@ func NewNetwork[T any](cfg NetworkConfig[T]) *Network[T] {
 		StopWhen:            cfg.StopWhen,
 		MaxIter:             cfg.MaxIter,
 		History:             cfg.History,
+		Ports:               cfg.Ports,
 		agentIndex:          map[string]int{},
 		defaultState:        cfg.DefaultState,
 	}
@@ -162,6 +169,11 @@ type RouterArgs[T any] struct {
 	CallCount int
 	// LastResult is the network's most recent inference result.
 	LastResult *AgentResult
+	// Stream is the router's typed structured emitter: semantic status,
+	// domain data parts, progress and safe boundaries, published into the
+	// run's ordered stream with stable part identity. Never nil — a run
+	// without streaming supplies a no-op.
+	Stream StructuredStream
 }
 
 // NetworkStop is returned by StopWhen to end a run early.
@@ -200,6 +212,8 @@ type NetworkRunOptions[T any] struct {
 	Step durable.Step
 	// Streaming enables event emission for this run.
 	Streaming *StreamingConfig
+	// Ports overrides the network's runtime contracts for this run.
+	Ports *RuntimePorts
 }
 
 // Run handles a request using the network of agents. The network template
@@ -239,6 +253,14 @@ type NetworkRun[T any] struct {
 	// extraAgents are router-introduced agents not in the network template
 	// (run-scoped: the template stays immutable).
 	extraAgents map[string]*Agent[T]
+
+	// ports, controller, approvals and stream are the run's wiring to the
+	// public runtime contracts. All four are safe to use when nil-valued:
+	// the controllers degrade to no-ops.
+	ports      *RuntimePorts
+	controller *RunController
+	approvals  *ApprovalController
+	stream     *StreamingContext
 }
 
 // newNetworkRun binds a network to a run state.
@@ -305,6 +327,16 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		stopWhen = r.Network.StopWhen
 	}
 
+	ports := opts.Ports
+	if ports == nil {
+		ports = r.Network.Ports
+	}
+	r.ports = ports
+	controller := newRunController(ports, nil, nil)
+	approvals := newApprovalController(ports, nil)
+	r.controller = controller
+	r.approvals = approvals
+
 	inputContent := input
 	if opts.UserMessage != nil && opts.UserMessage.Content != "" {
 		inputContent = opts.UserMessage.Content
@@ -321,14 +353,16 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 
 	// Persist the user's message up front for resilience (enables
 	// "regenerate" even when the run fails).
+	var acceptedUserMessage *UserMessageRecord
 	if r.History != nil && r.History.AppendUserMessage != nil {
 		record, err := r.buildUserMessageRecord(ctx, input, opts.UserMessage, step)
 		if err != nil {
 			return err
 		}
-		if err := r.History.AppendUserMessage(ctx, topCfg.historyContext(), record); err != nil {
+		if err := appendUserMessage(ctx, topCfg, record); err != nil {
 			return err
 		}
+		acceptedUserMessage = &record
 	}
 
 	if hadClientThreadID {
@@ -340,31 +374,43 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 	// Streaming starts after thread initialization so events carry the
 	// resolved threadId.
 	var sc *StreamingContext
-	if opts.Streaming != nil && opts.Streaming.Publish != nil {
-		sc = streamingContextFromState(r.State, *opts.Streaming, networkRunID, networkRunID, "network")
+	if opts.Streaming != nil && (opts.Streaming.Publish != nil || ports.wantsStream()) {
+		sc = streamingContextFromState(r.State, *opts.Streaming, ports, networkRunID, networkRunID, "network")
+		r.stream = sc
+		controller.stream = sc
+		controller.journal = sc.journal
+		approvals.stream = sc
 		sc.PublishEvent(ctx, EventRunStarted, map[string]any{
 			"runId": networkRunID, "scope": "network", "name": r.Name, "messageId": networkRunID,
 		})
-		// Single terminal emitter for EVERY exit path (normal drain,
-		// stopWhen, unknown agent, even after run.failed) so subscribers
-		// reliably unstick. An early stop's reason annotates both events.
+		r.markRunning(ctx, ports, networkRunID)
+
+		// Publish the server-accepted user turn as a standard event so every
+		// authorized client — not only the tab that sent it — renders it
+		// immediately, under the one stable message ID history will use.
+		if acceptedUserMessage != nil {
+			sc.PublishEvent(ctx, EventUserMessage, map[string]any{
+				"messageId": acceptedUserMessage.ID,
+				"runId":     networkRunID,
+				"role":      string(acceptedUserMessage.Role),
+				"content":   acceptedUserMessage.Content,
+				"timestamp": acceptedUserMessage.Timestamp,
+			})
+		}
+
+		// ONE terminal emitter for EVERY exit path (normal drain, stopWhen,
+		// unknown agent, cancel, even after a failure) so subscribers
+		// reliably unstick and exactly-one-terminal holds structurally. The
+		// Finalizer — when configured — settles history, billing, repository
+		// state and live drain BEFORE the terminal is published.
+		terminal := newTerminalEmitter(sc, ports, sc.journal, controller, "network", r.Name, networkRunID)
 		defer func() {
-			if err != nil {
-				sc.PublishEvent(ctx, EventRunFailed, map[string]any{
-					"runId": networkRunID, "scope": "network", "name": r.Name,
-					"messageId": networkRunID, "error": err.Error(), "recoverable": false,
-				})
-			}
-			completed := map[string]any{
-				"runId": networkRunID, "scope": "network", "name": r.Name, "messageId": networkRunID,
-			}
-			ended := map[string]any{"scope": "network", "messageId": networkRunID}
+			extra := map[string]any{"messageId": networkRunID}
+			reason := ""
 			if r.StoppedBy != nil {
-				completed["reason"] = r.StoppedBy.Reason
-				ended["reason"] = r.StoppedBy.Reason
+				reason = r.StoppedBy.Reason
 			}
-			sc.PublishEvent(ctx, EventRunCompleted, completed)
-			sc.PublishEvent(ctx, EventStreamEnded, ended)
+			terminal.Emit(ctx, err, reason, extra)
 		}()
 	}
 
@@ -378,6 +424,14 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 
 	initialResultCount := len(r.State.results)
 
+	// Run-start boundary: a pause or cancel accepted before any inference
+	// began costs nothing to honor here.
+	if err := controller.Checkpoint(ctx, Checkpoint{
+		Kind: CheckpointRunStart, Resumable: true,
+	}); err != nil {
+		return err
+	}
+
 	next, err := r.getNextAgents(ctx, inputContent, opts.UserMessage, r.effectiveRouter(opts), step)
 	if err != nil {
 		return err
@@ -390,6 +444,15 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 	}
 
 	for len(r.stack) > 0 && (r.MaxIter == 0 || r.counter < r.MaxIter) {
+		// Safe boundary between agents: every persisted AgentResult is
+		// complete here, so a pause parks with nothing half-done and a
+		// cancel is terminal without abandoning work mid-inference.
+		if err := controller.Checkpoint(ctx, Checkpoint{
+			Kind: CheckpointNetworkIteration, Resumable: true,
+		}); err != nil {
+			return err
+		}
+
 		// Stop policy: before popping/inferring, at the safe boundary.
 		if stopWhen != nil {
 			decision, err := stopWhen(ctx, StopWhenArgs[T]{
@@ -490,6 +553,46 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 	return saveThreadToStorage(ctx, topCfg, initialResultCount)
 }
 
+// structuredStream returns the run's public typed emitter, scoped to a
+// tool name when one applies. It is never nil, so callers need no guards.
+func (r *NetworkRun[T]) structuredStream(toolName string) StructuredStream {
+	if r == nil || r.stream == nil {
+		return noopStream{}
+	}
+	return newRunStream(r.stream, r.controller, r.Name, toolName)
+}
+
+// markRunning records that the run is executing, together with the cursor
+// a client should tail from. Observation writes degrade: a state store that
+// is briefly unreachable must not fail a run.
+func (r *NetworkRun[T]) markRunning(ctx context.Context, ports *RuntimePorts, runID string) {
+	if ports == nil || ports.State == nil {
+		return
+	}
+	now := time.Now().UTC()
+	epoch := ports.epoch()
+	_, _ = mutateState(ctx, ports.State, ports.Scope, "run.executing", func(s *SessionState) {
+		s.SchemaVersion = ContractSchemaVersion
+		s.Scope = ports.Scope
+		if r.State.ThreadID != "" {
+			s.CurrentThreadID = r.State.ThreadID
+		}
+		if s.ActiveRun == nil || s.ActiveRun.RunID != runID {
+			s.ActiveRun = &ActiveRun{RunID: runID, AcceptedAt: now}
+		}
+		s.ActiveRun.Lifecycle = LifecycleExecuting
+		s.ActiveRun.Outcome = OutcomeNone
+		if s.StreamEpoch != epoch {
+			// Epoch change resets the sequence cursor: a client must not
+			// wait for a number the new epoch will never produce.
+			s.StreamEpoch = epoch
+			s.LastSequenceNumber = JournalStart
+		}
+		s.Activity = Activity{Kind: ActivityPreparing, Source: ActivityFromServer}
+		s.UpdatedAt = now
+	})
+}
+
 type agentIterationIDs struct {
 	RunID     string `json:"agentRunId"`
 	MessageID string `json:"agentMessageId"`
@@ -562,6 +665,7 @@ func (r *NetworkRun[T]) getNextAgents(ctx context.Context, inputContent string, 
 		Stack:       stack,
 		CallCount:   r.counter,
 		LastResult:  r.lastResult(),
+		Stream:      r.structuredStream(""),
 	})
 	if err != nil {
 		return nil, err

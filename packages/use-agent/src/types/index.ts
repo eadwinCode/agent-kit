@@ -58,7 +58,149 @@ export interface AgentMessageChunk {
   sequenceNumber: number;
   /** Suggested Inngest step ID for optional developer use */
   id: string;
+  /**
+   * Replay-stable identity for one logical event, `<runId>:<epoch>:<seq>`.
+   * It is the dedupe key: the same event can arrive live, in a backfill page
+   * and again after a reconnect, and all three must collapse to one.
+   * Optional so envelopes from a runtime predating epochs still reduce.
+   */
+  eventId?: string;
+  /**
+   * Production epoch. Sequence numbers are monotonic *within* an epoch and
+   * restart when it changes, so a client can discard a stale tail instead of
+   * waiting forever for a number the new epoch will never emit.
+   */
+  streamEpoch?: number;
+  /** Contract version the producing runtime stamped. */
+  schemaVersion?: number;
 }
+
+/**
+ * The standard event envelope as the frozen contract defines it
+ * (contracts/schemas/standard-event.schema.json). Identical in shape to
+ * AgentMessageChunk; the alias exists so replay/snapshot APIs can say what
+ * they carry without implying a live socket delivered it.
+ */
+export type StandardEventEnvelope = AgentMessageChunk;
+
+// =============================================================================
+// SERVER-AUTHORITATIVE AGENT STATE
+// =============================================================================
+
+/** Coarse machine state of the session's active run. */
+export type RunLifecycle =
+  | "accepted"
+  | "executing"
+  | "waiting"
+  | "terminalizing";
+
+/** Terminal classification of a finished run. */
+export type RunOutcome = "completed" | "failed" | "cancelled";
+
+/** The pause dimension. A requested pause is an intent, not a stopped run. */
+export type PauseState = "none" | "requested" | "paused" | "resuming";
+
+/**
+ * Truthful semantic activity.
+ *
+ * `thinking` requires a provider-returned reasoning part that is actively
+ * streaming. Elapsed time, a slow model, or a generic wait is never evidence
+ * of thinking — use `preparing` or the real tool activity instead.
+ */
+export type ActivityKind =
+  | "none"
+  | "preparing"
+  | "thinking"
+  | "responding"
+  | "reading"
+  | "writing"
+  | "tool"
+  | "waiting_external"
+  | "finalizing";
+
+/** Human-in-the-loop dimension. */
+export type ApprovalStatus =
+  | "none"
+  | "pending"
+  | "settling"
+  | "approved"
+  | "denied"
+  | "expired";
+
+/**
+ * The bounded server record a client hydrates from. It carries no transcript:
+ * messages come from canonical history and deltas from the event tail.
+ *
+ * Its dimensions are orthogonal by design. A paused run with a pending
+ * approval on a reconnecting socket is three independent facts, and
+ * collapsing them into one status is what makes an assistant lie about what
+ * it is doing.
+ */
+export interface AgentStateSnapshot {
+  schemaVersion: 1;
+  /**
+   * Opaque identity of this conversation session.
+   *
+   * AgentKit never parses or decomposes it. Applications may extend this base
+   * interface with their own fields using an intersection or derived
+   * interface; those fields remain adapter-owned.
+   */
+  sessionId: string;
+  /** The explicit server-owned current thread. Never browser-owned. */
+  currentThreadId?: string;
+  activeRun: null | {
+    runId: string;
+    lifecycle: RunLifecycle;
+    outcome?: RunOutcome;
+    /** Server wall-clock turn start; the UI timer runs from here. */
+    acceptedAt: string;
+  };
+  pause: {
+    state: PauseState;
+    requestedAt?: string;
+    pausedAt?: string;
+    expiresAt?: string;
+    accumulatedPausedMs: number;
+    epoch?: number;
+  };
+  activity: {
+    kind: ActivityKind;
+    /** Short user-safe text. Never prompt or tool content. */
+    label?: string;
+    source?: "provider" | "tool" | "server";
+  };
+  approval: {
+    status: ApprovalStatus;
+    approvalId?: string;
+    expiresAt?: string;
+  };
+  /** Monotonic CAS token; increases once per committed transition. */
+  revision: number;
+  cursor: null | {
+    runId: string;
+    streamEpoch: number;
+    sequenceNumber: number;
+  };
+  /**
+   * The durable tail has holes. Reconcile from canonical history rather than
+   * trusting a backfill.
+   */
+  reconcileRequired: boolean;
+  lastErrorCode?: string;
+  checkpointKind?: string;
+}
+
+/**
+ * Client-local connection state. It is never written to the server and never
+ * implies anything about the run: a reconnecting socket does not pause a run,
+ * and a connected socket does not mean a run is healthy.
+ */
+export type ClientConnectionState =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected"
+  | "error";
 
 /**
  * Type alias for streaming events - mirrors StreamingEvent from AgentKit
@@ -97,8 +239,18 @@ export type PartCreated = EventBase & {
   data: WithThread & {
     messageId: string;
     partId: string;
-    type: "text" | "tool-call" | "reasoning";
-    metadata?: { toolName?: string; agentName?: string };
+    type:
+      | "text"
+      | "tool-call"
+      | "reasoning"
+      | "data"
+      | "status"
+      | "file"
+      | "source"
+      | "error"
+      | "hitl";
+    content?: unknown;
+    metadata?: JsonObject;
   };
 };
 
@@ -109,7 +261,57 @@ export type TextDelta = EventBase & {
 
 export type ReasoningDelta = EventBase & {
   event: "reasoning.delta";
-  data: WithThread & { messageId: string; partId: string; delta: string };
+  data: WithThread & {
+    messageId: string;
+    partId: string;
+    delta: string;
+    metadata?: JsonObject;
+  };
+};
+
+export type DataDelta = EventBase & {
+  event: "data.delta";
+  data: WithThread & {
+    messageId: string;
+    partId: string;
+    delta: unknown;
+    metadata?: JsonObject;
+  };
+};
+
+export type ErrorEvent = EventBase & {
+  event: "error";
+  data: WithThread & {
+    messageId?: string;
+    partId?: string;
+    error: string;
+    recoverable?: boolean;
+    agentId?: string;
+  };
+};
+
+export type HitlRequested = EventBase & {
+  event: "hitl.requested";
+  data: WithThread & {
+    messageId: string;
+    partId?: string;
+    requestId?: string;
+    toolCalls: HitlUIPart["toolCalls"];
+    expiresAt?: string;
+    metadata?: HitlUIPart["metadata"];
+  };
+};
+
+export type HitlResolved = EventBase & {
+  event: "hitl.resolved";
+  data: WithThread & {
+    partId?: string;
+    requestId?: string;
+    status?: HitlUIPart["status"];
+    approved?: boolean;
+    resolvedBy?: string;
+    resolvedAt?: string;
+  };
 };
 
 export type ToolArgsDelta = EventBase & {
@@ -129,17 +331,27 @@ export type ToolOutputDelta = EventBase & {
 };
 
 type PartCompletedBasePayload<
-  TType extends "text" | "tool-call" | "tool-output" | "reasoning",
+  TType extends
+    | "text"
+    | "tool-call"
+    | "tool-output"
+    | "reasoning"
+    | StructuredPartType,
 > = WithThread & {
   messageId: string;
   partId: string;
   type: TType;
   toolName?: string;
-  metadata?: { toolName?: string };
+  metadata?: JsonObject;
 };
 
 type PartCompletedEventBase<
-  TType extends "text" | "tool-call" | "tool-output" | "reasoning",
+  TType extends
+    | "text"
+    | "tool-call"
+    | "tool-output"
+    | "reasoning"
+    | StructuredPartType,
   TExtra extends Record<string, unknown> = Record<string, unknown>,
 > = EventBase & {
   event: "part.completed";
@@ -201,12 +413,32 @@ type ManifestToolOutputEvent<TManifest extends ToolManifest> =
         >;
       }[keyof TManifest & string];
 
+export type StructuredPartType =
+  | "data"
+  | "status"
+  | "file"
+  | "source"
+  | "error"
+  | "hitl";
+
+type PartCompletedStructuredEvent = EventBase & {
+  event: "part.completed";
+  data: WithThread & {
+    messageId: string;
+    partId: string;
+    type: StructuredPartType;
+    finalContent?: unknown;
+    metadata?: JsonObject;
+  };
+};
+
 export type TypedPartCompletedEvent<TManifest extends ToolManifest> =
   | PartCompletedTextEvent
   | PartCompletedReasoningEvent
   | PartCompletedToolCallEvent<TManifest>
   | ManifestToolOutputEvent<TManifest>
-  | PartCompletedToolOutputFallbackEvent;
+  | PartCompletedToolOutputFallbackEvent
+  | PartCompletedStructuredEvent;
 
 export type PartCompleted = TypedPartCompletedEvent<ToolManifest>;
 
@@ -217,6 +449,10 @@ export type AgentKitEvent<TManifest extends ToolManifest = ToolManifest> =
   | PartCreated
   | TextDelta
   | ReasoningDelta
+  | DataDelta
+  | ErrorEvent
+  | HitlRequested
+  | HitlResolved
   | ToolArgsDelta
   | ToolOutputDelta
   | TypedPartCompletedEvent<TManifest>
@@ -228,6 +464,11 @@ type KnownEventNames =
   | "stream.ended"
   | "part.created"
   | "text.delta"
+  | "reasoning.delta"
+  | "data.delta"
+  | "error"
+  | "hitl.requested"
+  | "hitl.resolved"
   | "tool_call.arguments.delta"
   | "tool_call.output.delta"
   | "part.completed";
@@ -914,6 +1155,8 @@ export interface ThreadState<
   historyLoaded?: boolean;
   /** Whether a run is currently active for this thread (from run.started to run.completed/stream.ended). */
   runActive?: boolean;
+  /** Event identities already accepted for this thread, used for realtime deduplication. */
+  processedEventIds?: Set<string>;
 
   // Error handling (per thread)
   /** Thread-specific error information. */

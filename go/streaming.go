@@ -43,6 +43,17 @@ type AgentMessageChunk struct {
 	SequenceNumber int `json:"sequenceNumber"`
 	// ID is the suggested Inngest step id for durable publishing.
 	ID string `json:"id"`
+	// EventID is stable for the same logical event across replays and
+	// retries: it is the client's dedupe key and the journal's identity.
+	// Distinct epochs never reuse one.
+	EventID string `json:"eventId"`
+	// StreamEpoch is the production epoch. Sequence numbers are monotonic
+	// within an epoch and restart when it changes, so a client can discard
+	// a stale tail instead of waiting forever for a number that will never
+	// arrive.
+	StreamEpoch int `json:"streamEpoch"`
+	// SchemaVersion is ContractSchemaVersion at production time.
+	SchemaVersion int `json:"schemaVersion"`
 }
 
 // PublishFn delivers one chunk to the client transport.
@@ -151,6 +162,18 @@ type StreamingContext struct {
 	chunkSize           int
 	maxChunksPerMessage int
 
+	// ports carries the durability/control adapters; nil disables them.
+	ports *RuntimePorts
+	// journal appends every envelope BEFORE live fan-out. Shared with the
+	// sibling scopes of one run so ReconcileRequired is run-wide.
+	journal *journalWriter
+	// streamEpoch is this execution's production epoch.
+	streamEpoch int
+	// lastSeq is the highest sequence number produced in this epoch. It is
+	// shared with every sibling scope of the run, so the cursor a client
+	// resumes from covers network and agent events alike.
+	lastSeq *atomic.Int64
+
 	// StreamReasoning mirrors StreamingConfig.StreamReasoning.
 	StreamReasoning bool
 
@@ -164,8 +187,9 @@ type StreamingContext struct {
 }
 
 // newStreamingContext builds a context from config; threadID/userID are
-// stamped onto every event's data.
-func newStreamingContext(cfg StreamingConfig, runID, messageID, scope, threadID, userID string) *StreamingContext {
+// stamped onto every event's data. ports supplies the journal, sink and
+// epoch when the consumer wired the runtime contracts.
+func newStreamingContext(cfg StreamingConfig, ports *RuntimePorts, runID, messageID, scope, threadID, userID string) *StreamingContext {
 	chunkSize := cfg.ChunkSize
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
@@ -174,12 +198,22 @@ func newStreamingContext(cfg StreamingConfig, runID, messageID, scope, threadID,
 	if maxChunks == 0 {
 		maxChunks = DefaultMaxChunksPerMessage
 	}
-	return &StreamingContext{
-		publish:             cfg.Publish,
+	publish := cfg.Publish
+	if sink := ports.sink(); sink != nil {
+		// A configured sink owns delivery: it replaces Publish so an
+		// adapter can batch and apply backpressure without AgentKit
+		// fanning out twice.
+		publish = sink.Deliver
+	}
+	sc := &StreamingContext{
+		publish:             publish,
 		seq:                 &SequenceCounter{},
 		simulateChunking:    cfg.SimulateChunking,
 		chunkSize:           chunkSize,
 		maxChunksPerMessage: maxChunks,
+		ports:               ports,
+		journal:             &journalWriter{journal: ports.journal()},
+		streamEpoch:         ports.epoch(),
 		StreamReasoning:     cfg.StreamReasoning,
 		RunID:               runID,
 		MessageID:           messageID,
@@ -187,11 +221,14 @@ func newStreamingContext(cfg StreamingConfig, runID, messageID, scope, threadID,
 		ThreadID:            threadID,
 		UserID:              userID,
 	}
+	sc.lastSeq = new(atomic.Int64)
+	sc.lastSeq.Store(int64(JournalStart))
+	return sc
 }
 
 // streamingContextFromState extracts threadId (and a userId, when the
 // typed state carries one under a `userId` JSON key) from the run state.
-func streamingContextFromState[T any](s *State[T], cfg StreamingConfig, runID, messageID, scope string) *StreamingContext {
+func streamingContextFromState[T any](s *State[T], cfg StreamingConfig, ports *RuntimePorts, runID, messageID, scope string) *StreamingContext {
 	userID := ""
 	if b, err := jsonutil.Marshal(s.Data); err == nil {
 		var probe struct {
@@ -200,27 +237,47 @@ func streamingContextFromState[T any](s *State[T], cfg StreamingConfig, runID, m
 		_ = json.Unmarshal(b, &probe)
 		userID = probe.UserID
 	}
-	return newStreamingContext(cfg, runID, messageID, scope, s.ThreadID, userID)
+	return newStreamingContext(cfg, ports, runID, messageID, scope, s.ThreadID, userID)
 }
 
 // WithSharedSequence derives a context for a child scope (an agent inside
 // a network run): new run/message ids, same sequence counter, parent run
 // recorded.
 func (c *StreamingContext) WithSharedSequence(runID, messageID, scope string) *StreamingContext {
-	child := *c
-	child.RunID = runID
-	child.MessageID = messageID
-	child.Scope = scope
-	child.ParentRunID = c.RunID
-	return &child
+	child := &StreamingContext{
+		publish:             c.publish,
+		seq:                 c.seq,
+		simulateChunking:    c.simulateChunking,
+		chunkSize:           c.chunkSize,
+		maxChunksPerMessage: c.maxChunksPerMessage,
+		ports:               c.ports,
+		journal:             c.journal,
+		streamEpoch:         c.streamEpoch,
+		StreamReasoning:     c.StreamReasoning,
+		RunID:               runID,
+		ParentRunID:         c.RunID,
+		MessageID:           messageID,
+		ThreadID:            c.ThreadID,
+		UserID:              c.UserID,
+		Scope:               scope,
+		lastSeq:             c.lastSeq,
+	}
+	return child
 }
 
-// PublishEvent stamps sequence number, timestamp and the suggested step id
-// onto the event and hands it to the publisher. ThreadID/UserID are
-// auto-attached to data. Failures are logged and swallowed — streaming is
-// best-effort by contract.
+// PublishEvent stamps identity, sequence number, timestamp and the
+// suggested step id onto the event, appends it to the EventJournal, and
+// only then hands it to the publisher. ThreadID/UserID are auto-attached to
+// data.
+//
+// Journal-before-fan-out is the ordering that makes recovery possible: a
+// client that missed the live envelope can still replay it. A journal
+// failure does not break the run — it latches ReconcileRequired so clients
+// reconcile from canonical history instead of trusting a tail with holes.
+// Publish failures are logged and swallowed: delivery is best-effort by
+// contract.
 func (c *StreamingContext) PublishEvent(ctx context.Context, event string, data map[string]any) {
-	if c == nil || c.publish == nil {
+	if c == nil || (c.publish == nil && !c.journal.enabled()) {
 		return
 	}
 	seq := c.seq.Next()
@@ -241,12 +298,117 @@ func (c *StreamingContext) PublishEvent(ctx context.Context, event string, data 
 		Data:           enriched,
 		Timestamp:      time.Now().UnixMilli(),
 		SequenceNumber: seq,
-		ID:             fmt.Sprintf("publish-%d:%s", seq, event),
+		ID:             c.stepID(seq, event),
+		EventID:        c.eventID(seq),
+		StreamEpoch:    c.streamEpoch,
+		SchemaVersion:  ContractSchemaVersion,
+	}
+
+	if err := c.journal.append(ctx, c.journalRecord(chunk)); err != nil {
+		slog.WarnContext(ctx, "agentkit: failed to journal streaming event; marking reconcile required",
+			"event", chunk.Event, "sequenceNumber", chunk.SequenceNumber, "code", ErrorCode(err), "error", err)
+	}
+	c.advanceCursor(seq)
+
+	if c.publish == nil {
+		return
 	}
 	if err := c.publish(ctx, chunk); err != nil {
 		slog.WarnContext(ctx, "agentkit: failed to publish streaming event; continuing",
 			"event", chunk.Event, "sequenceNumber", chunk.SequenceNumber, "error", err)
 	}
+}
+
+// stepID is the suggested Inngest step id. Epoch 0 keeps the original
+// format so ids stay stable for runs that predate epochs.
+func (c *StreamingContext) stepID(seq int, event string) string {
+	if c.streamEpoch == 0 {
+		return fmt.Sprintf("publish-%d:%s", seq, event)
+	}
+	return fmt.Sprintf("publish-e%d-%d:%s", c.streamEpoch, seq, event)
+}
+
+// eventID is replay-stable for one logical event: the run id and sequence
+// number are both minted durably, and the epoch keeps a resumed run's
+// events distinct from the ones it is replacing.
+func (c *StreamingContext) eventID(seq int) string {
+	return fmt.Sprintf("%s:%d:%d", c.RunID, c.streamEpoch, seq)
+}
+
+func (c *StreamingContext) journalRecord(chunk AgentMessageChunk) JournalRecord {
+	rec := JournalRecord{
+		SchemaVersion:  chunk.SchemaVersion,
+		EventID:        chunk.EventID,
+		Event:          chunk.Event,
+		ThreadID:       c.ThreadID,
+		RunID:          c.RunID,
+		StreamEpoch:    chunk.StreamEpoch,
+		SequenceNumber: chunk.SequenceNumber,
+		Timestamp:      chunk.Timestamp,
+	}
+	if c.ports != nil {
+		rec.Scope = c.ports.Scope
+	}
+	if payload, err := jsonutil.Marshal(chunk.Data); err == nil {
+		rec.Data = payload
+	}
+	return rec
+}
+
+func (c *StreamingContext) advanceCursor(seq int) {
+	if c.lastSeq == nil {
+		return
+	}
+	for {
+		current := c.lastSeq.Load()
+		if int64(seq) <= current || c.lastSeq.CompareAndSwap(current, int64(seq)) {
+			return
+		}
+	}
+}
+
+// Identity returns the stream identity of this scope's current epoch.
+func (c *StreamingContext) Identity() StreamIdentity {
+	if c == nil {
+		return StreamIdentity{}
+	}
+	return StreamIdentity{ThreadID: c.ThreadID, RunID: c.RunID, StreamEpoch: c.streamEpoch}
+}
+
+// Cursor returns the highest position this run has produced, which is what
+// a reconnecting client resumes its tail from.
+func (c *StreamingContext) Cursor() JournalCursor {
+	if c == nil {
+		return JournalCursor{SequenceNumber: JournalStart}
+	}
+	seq := JournalStart
+	if c.lastSeq != nil {
+		seq = int(c.lastSeq.Load())
+	}
+	return JournalCursor{RunID: c.RunID, StreamEpoch: c.streamEpoch, SequenceNumber: seq}
+}
+
+// ReconcileRequired reports that at least one journal append failed during
+// this run, so the durable tail has holes.
+func (c *StreamingContext) ReconcileRequired() bool {
+	return c != nil && c.journal.ReconcileRequired()
+}
+
+// recordActivity mirrors a semantic activity change into the StateStore so
+// a client that hydrates mid-turn sees the same activity the live stream
+// just announced. Observation writes degrade: they never fail a run.
+func (c *StreamingContext) recordActivity(ctx context.Context, activity Activity) {
+	if c == nil || c.ports == nil || c.ports.State == nil {
+		return
+	}
+	cursor := c.Cursor()
+	_, _ = mutateState(ctx, c.ports.State, c.ports.Scope, "activity", func(s *SessionState) {
+		s.Activity = activity
+		s.StreamEpoch = cursor.StreamEpoch
+		if cursor.SequenceNumber > s.LastSequenceNumber {
+			s.LastSequenceNumber = cursor.SequenceNumber
+		}
+	})
 }
 
 // GeneratePartID mints a part id ≤ 40 chars (OpenAI tool-call id limit):

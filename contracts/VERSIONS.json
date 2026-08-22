@@ -1,0 +1,51 @@
+{
+  "$comment": "A0 baseline. Regenerate with `node scripts/freeze-contract-baseline.mjs` after an intentional dependency, schema or fixture change; CI runs it with --check.",
+  "contractSchemaVersion": 1,
+  "packages": {
+    "@inngest/use-agent": {
+      "version": "0.4.0",
+      "dependencies": {
+        "@inngest/realtime": "^0.4.7",
+        "@tanstack/react-query": "^5.87.4"
+      },
+      "peerDependencies": {
+        "react": ">=18.0.0",
+        "react-dom": ">=18.0.0",
+        "uuid": ">=9.0.0"
+      },
+      "artifact": {
+        "dist/index.js": "sha256:f2c11fdfc0f60a00c9904cf37971c8e8ad547f7da72ce72e4cbd55d1962ce467",
+        "dist/index.d.ts": "sha256:5d29dd6e9390fc4069afdc783c10c184b8a1ecf66538320ffb826a4ef4132df8"
+      }
+    },
+    "@inngest/agent-kit": {
+      "version": "0.14.0-alpha.0"
+    }
+  },
+  "goModule": {
+    "module": "github.com/eadwinCode/agent-kit/go",
+    "goVersion": "1.26.2",
+    "require": {
+      "github.com/cespare/xxhash/v2": "v2.3.0",
+      "github.com/google/uuid": "v1.6.0",
+      "github.com/inngest/inngestgo": "v0.16.0",
+      "github.com/zendev-sh/goai": "v0.9.0"
+    }
+  },
+  "schemas": {
+    "agent-state-snapshot.schema.json": "sha256:1978062ca4006c8e0d60c8725b1a9ac814871065acfb4c7332ac84fc048dddcd",
+    "command-request.schema.json": "sha256:13fbda75645a7d9b49186ffba3da68c3255bc5bb4be47114c13f3942e9493790",
+    "error-envelope.schema.json": "sha256:e5fd46d1cfea7b7b85947db736c2552cbc6c8c8ccd91fcf26606d771238f68cf",
+    "journal-record.schema.json": "sha256:f9e0994a566003666a4151d1e623096745cd10096b8acd231f9f7e1cd09aed13",
+    "standard-event.schema.json": "sha256:c5930809445df64caa704b54cd0064ef36c645c500a8b50051d51e3af4e7a7d5"
+  },
+  "fixtures": {
+    "cancel-turn.json": "sha256:bf36c29175d1197fbf6702a33fc22e5a2468d8a5811a222ea0900b489a2e0164",
+    "error-turn.json": "sha256:d0fcb4df0e15f64b64f234cec04247fc2411f7ceb97dfd8e5e988d9a65275ecc",
+    "hitl-turn.json": "sha256:e296d5ad44139fa08c9ab470c2757fd4f1efb9ae21a984ddd1b49441bad53730",
+    "paused-turn.json": "sha256:e0e39e22ff7d39256262504905501c0c2619bddd7bdfa78d7528a9eca05ddd95",
+    "structured-turn.json": "sha256:6650e36adbe47d98ac710dcac4bbe841eb2ac85d8a6db6c96d8d94e0bae1b285",
+    "text-turn.json": "sha256:2ebbe89db3436dff13a3d8529fb0192791c859ff3c2c894bf24b8b3770d49435",
+    "tool-turn.json": "sha256:57346cc4fea9bbb6312a7924d7b4c94d0afe631c9ea9da27c2da087530ee9e8d"
+  }
+}

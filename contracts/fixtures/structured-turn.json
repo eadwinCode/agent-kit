@@ -1,0 +1,321 @@
+{
+  "name": "structured-turn",
+  "description": "Tool-emitted semantic status, a structured data part lifecycle, and progress.",
+  "schemaVersion": 1,
+  "events": [
+    {
+      "event": "run.started",
+      "data": {
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 0,
+      "id": "publish-0:run.started",
+      "eventId": "<msg:1>:0:0",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "user.message",
+      "data": {
+        "content": "hello",
+        "messageId": "user_msg_1",
+        "role": "user",
+        "runId": "<msg:1>",
+        "threadId": "thread_1",
+        "timestamp": "<time>"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 1,
+      "id": "publish-1:user.message",
+      "eventId": "<msg:1>:0:1",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.started",
+      "data": {
+        "messageId": "<msg:2>",
+        "name": "assistant",
+        "parentRunId": "<msg:1>",
+        "runId": "<run:1>",
+        "scope": "agent",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 2,
+      "id": "publish-2:run.started",
+      "eventId": "<msg:1>:0:2",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.created",
+      "data": {
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant",
+          "toolName": "scan"
+        },
+        "partId": "<part:1>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "tool-call"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 3,
+      "id": "publish-3:part.created",
+      "eventId": "<run:1>:0:3",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "tool_call.arguments.delta",
+      "data": {
+        "delta": "{}",
+        "messageId": "<msg:2>",
+        "partId": "<part:1>",
+        "threadId": "thread_1",
+        "toolName": "scan"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 4,
+      "id": "publish-4:tool_call.arguments.delta",
+      "eventId": "<run:1>:0:4",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.completed",
+      "data": {
+        "finalContent": {},
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant",
+          "toolName": "scan"
+        },
+        "partId": "<part:1>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "tool-call"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 5,
+      "id": "publish-5:part.completed",
+      "eventId": "<run:1>:0:5",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "status.updated",
+      "data": {
+        "agentName": "assistant",
+        "kind": "reading",
+        "label": "Reading project files",
+        "messageId": "<msg:2>",
+        "runId": "<run:1>",
+        "source": "tool",
+        "threadId": "thread_1",
+        "toolName": "scan"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 6,
+      "id": "publish-6:status.updated",
+      "eventId": "<run:1>:0:6",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.created",
+      "data": {
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant",
+          "toolName": "scan"
+        },
+        "partId": "<part:2>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "file-list"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 7,
+      "id": "publish-7:part.created",
+      "eventId": "<run:1>:0:7",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "data.delta",
+      "data": {
+        "delta": {
+          "files": [
+            "a.ts"
+          ]
+        },
+        "messageId": "<msg:2>",
+        "partId": "<part:2>",
+        "threadId": "thread_1",
+        "type": "file-list"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 8,
+      "id": "publish-8:data.delta",
+      "eventId": "<run:1>:0:8",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "status.updated",
+      "data": {
+        "completed": 1,
+        "label": "a.ts",
+        "messageId": "<msg:2>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "toolName": "scan",
+        "total": 2
+      },
+      "timestamp": 0,
+      "sequenceNumber": 9,
+      "id": "publish-9:status.updated",
+      "eventId": "<run:1>:0:9",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.completed",
+      "data": {
+        "finalContent": {
+          "files": [
+            "a.ts",
+            "b.ts"
+          ]
+        },
+        "messageId": "<msg:2>",
+        "partId": "<part:2>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "file-list"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 10,
+      "id": "publish-10:part.completed",
+      "eventId": "<run:1>:0:10",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.created",
+      "data": {
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant",
+          "toolName": "scan"
+        },
+        "partId": "<part:3>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "tool-output"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 11,
+      "id": "publish-11:part.created",
+      "eventId": "<run:1>:0:11",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "tool_call.output.delta",
+      "data": {
+        "delta": "{\"data\":{\"files\":2}}",
+        "messageId": "<msg:2>",
+        "partId": "<part:3>",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 12,
+      "id": "publish-12:tool_call.output.delta",
+      "eventId": "<run:1>:0:12",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.completed",
+      "data": {
+        "finalContent": {
+          "data": {
+            "files": 2
+          }
+        },
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant",
+          "toolName": "scan"
+        },
+        "partId": "<part:3>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "tool-output"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 13,
+      "id": "publish-13:part.completed",
+      "eventId": "<run:1>:0:13",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.completed",
+      "data": {
+        "messageId": "<msg:2>",
+        "name": "assistant",
+        "runId": "<run:1>",
+        "scope": "agent",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 14,
+      "id": "publish-14:run.completed",
+      "eventId": "<run:1>:0:14",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.completed",
+      "data": {
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "outcome": "completed",
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 15,
+      "id": "publish-15:run.completed",
+      "eventId": "<msg:1>:0:15",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "stream.ended",
+      "data": {
+        "messageId": "<msg:1>",
+        "outcome": "completed",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 16,
+      "id": "publish-16:stream.ended",
+      "eventId": "<msg:1>:0:16",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    }
+  ]
+}

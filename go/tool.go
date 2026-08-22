@@ -86,6 +86,28 @@ type ToolOptions[T any] struct {
 
 	// Step is the run's durability seam.
 	Step durable.Step
+
+	// Stream is the typed structured emitter for this tool call: semantic
+	// status, domain data parts, progress, and the tool's own declared
+	// safe boundaries (before_side_effect, after_side_effect,
+	// between_items). It is never nil — a run without streaming supplies a
+	// no-op — so handlers may call it unconditionally.
+	//
+	// Use Stream.Checkpoint to make a long or iterative tool pausable:
+	// completed items stay checkpointed and are not repeated on resume,
+	// and an atomic side effect that has already begun finishes before the
+	// pause takes effect.
+	Stream StructuredStream
+
+	// Approvals runs the human-in-the-loop lifecycle for a tool that must
+	// not act without a decision. It is nil when no ApprovalStore is
+	// configured; a tool that requires approval MUST refuse to act in that
+	// case rather than proceeding unapproved.
+	Approvals *ApprovalController
+
+	// ToolCallID is the provider's id for this call, used to correlate
+	// approvals and transcript parts.
+	ToolCallID string
 }
 
 // NewTool builds a typed tool: the input schema is generated from In's

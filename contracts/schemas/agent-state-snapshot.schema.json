@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eadwinCode/agent-kit/contracts/agent-state-snapshot.schema.json",
+  "title": "Agent state snapshot",
+  "description": "The server-authoritative base record a client hydrates from before replaying a tail. It never carries the transcript: messages live in canonical history and deltas live in the event journal. Application-specific identity and authorization stay in adapter context or extension properties. Lifecycle, pause, activity, approval and connection are orthogonal dimensions \u2014 none may be inferred from another, and none from elapsed time.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "sessionId",
+    "activeRun",
+    "pause",
+    "activity",
+    "approval",
+    "revision",
+    "cursor",
+    "reconcileRequired"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "sessionId": {
+      "type": "string",
+      "description": "Opaque identity of this conversation session. AgentKit never parses or decomposes it."
+    },
+    "currentThreadId": {
+      "type": "string",
+      "description": "The explicit server-owned current thread. Never inferred from an updated_at ordering, and never owned by browser storage."
+    },
+    "activeRun": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": ["runId", "lifecycle", "acceptedAt"],
+          "additionalProperties": true,
+          "properties": {
+            "runId": {
+              "type": "string"
+            },
+            "lifecycle": {
+              "type": "string",
+              "enum": ["accepted", "executing", "waiting", "terminalizing"]
+            },
+            "outcome": {
+              "type": "string",
+              "enum": ["completed", "failed", "cancelled"]
+            },
+            "acceptedAt": {
+              "type": "string",
+              "description": "Server wall-clock turn start. The UI timer runs from here through tools, approvals and pause until the terminal."
+            }
+          }
+        }
+      ]
+    },
+    "pause": {
+      "type": "object",
+      "required": ["state", "accumulatedPausedMs"],
+      "additionalProperties": true,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["none", "requested", "paused", "resuming"]
+        },
+        "requestedAt": {
+          "type": "string"
+        },
+        "pausedAt": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "accumulatedPausedMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "activity": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": true,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "none",
+            "preparing",
+            "thinking",
+            "responding",
+            "reading",
+            "writing",
+            "tool",
+            "waiting_external",
+            "finalizing"
+          ],
+          "description": "thinking requires a provider-returned reasoning signal that is actively streaming. A slow model is not thinking."
+        },
+        "label": {
+          "type": "string",
+          "description": "Short user-safe text. Never prompt content, tool output, or provider payloads."
+        },
+        "source": {
+          "type": "string",
+          "enum": ["provider", "tool", "server"]
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "none",
+            "pending",
+            "settling",
+            "approved",
+            "denied",
+            "expired"
+          ]
+        },
+        "approvalId": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        }
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic CAS token. Increases exactly once per committed transition; revision 0 means 'no precondition' in a command."
+    },
+    "cursor": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": ["runId", "streamEpoch", "sequenceNumber"],
+          "additionalProperties": false,
+          "properties": {
+            "runId": {
+              "type": "string"
+            },
+            "streamEpoch": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sequenceNumber": {
+              "type": "integer",
+              "minimum": -1
+            }
+          }
+        }
+      ]
+    },
+    "reconcileRequired": {
+      "type": "boolean",
+      "description": "The durable tail has holes. Clients must reconcile from canonical history rather than trusting backfill."
+    },
+    "lastErrorCode": {
+      "type": "string"
+    },
+    "checkpointKind": {
+      "type": "string"
+    },
+    "streamEpoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lastSequenceNumber": {
+      "type": "integer",
+      "minimum": -1
+    },
+    "updatedAt": {
+      "type": "string"
+    }
+  }
+}

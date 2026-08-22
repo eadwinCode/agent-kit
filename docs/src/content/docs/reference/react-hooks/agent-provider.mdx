@@ -3,8 +3,8 @@ title: "AgentProvider API Reference"
 description: "Complete API documentation for AgentProvider - shared connections and configuration management"
 ---
 
-import { LinkCard, CardGrid } from '@astrojs/starlight/components';
-import ParamField from '../../../../components/ParamField.astro';
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+import ParamField from "../../../../components/ParamField.astro";
 
 The `AgentProvider` is a React context provider that enables **shared WebSocket connections** and **centralized configuration** across your entire AgentKit application. It significantly improves performance and simplifies setup.
 
@@ -266,28 +266,26 @@ function App() {
 
 ## Advanced Usage Patterns
 
-### Multi-tenant Applications
+### Application-defined ownership
 
 ```typescript
-function TenantApp({ tenantId, userId }) {
-  const tenantTransport = useMemo(() =>
+function ScopedApp({ userId, sessionToken, authorizedChannel }) {
+  const scopedTransport = useMemo(() =>
     createDefaultAgentTransport({
       headers: {
-        'X-Tenant-ID': tenantId,
-        'Authorization': `Bearer ${getTenantToken(tenantId)}`
-      },
-      baseURL: `https://${tenantId}.api.myapp.com`
-    }), [tenantId]
+        'Authorization': `Bearer ${sessionToken}`
+      }
+    }), [sessionToken]
   );
 
   return (
     <AgentProvider
       userId={userId}
-      channelKey={`tenant-${tenantId}-user-${userId}`}
-      transport={tenantTransport}
+      channelKey={authorizedChannel}
+      transport={scopedTransport}
       debug={false}
     >
-      <TenantChatInterface />
+      <ChatInterface />
     </AgentProvider>
   );
 }
@@ -347,10 +345,9 @@ function AuthenticatedProvider({ children }) {
   const transport = useMemo(() =>
     createDefaultAgentTransport({
       headers: {
-        'Authorization': `Bearer ${token}`,
-        'X-User-Role': user?.role || 'guest'
+        'Authorization': `Bearer ${token}`
       }
-    }), [token, user?.role]
+    }), [token]
   );
 
   if (isLoading) return <LoadingSpinner />;
@@ -534,30 +531,30 @@ function CustomerSupportApp({ customerId }) {
 }
 ```
 
-### Team Collaboration Platform
+### Authorized collaborative channel
 
 ```typescript
-function TeamWorkspace({ teamId, currentUserId }) {
+function CollaborativeWorkspace() {
+  // Issued by the server after it authenticates the user and checks access.
+  const { userId, channelKey, accessToken } = useChatGrant();
   return (
     <AgentProvider
-      channelKey={`team-${teamId}`}  // All team members share this channel
-      userId={currentUserId}         // Individual user attribution
+      channelKey={channelKey}
+      userId={userId}
       transport={{
         headers: {
-          'X-Team-ID': teamId,
-          'X-User-Role': getUserRole(currentUserId, teamId)
+          'Authorization': `Bearer ${accessToken}`
         }
       }}
     >
-      <TeamChatInterface />      {/* Shared team conversations */}
+      <CollaborativeChat />      {/* Shared conversation */}
       <PersonalAssistant />      {/* Personal AI assistant */}
       <ProjectDiscussions />     {/* Project-specific chats */}
     </AgentProvider>
   );
 }
 
-// All components receive events from the same team channel
-// but can create isolated threads for different discussions
+// The server grant authorizes the channel; its string is only a routing key.
 ```
 
 ### Development vs Production
@@ -708,7 +705,7 @@ function IsolatedFeatures() {
       {/* Isolated admin panel */}
       <AgentProvider
         userId="user-123"
-        channelKey="admin-secure"  // Separate channel for security
+        channelKey="admin-connection" // Separate connection; authorization is server-side
         transport={adminSecureTransport}
       >
         <AdminPanel />
@@ -845,19 +842,17 @@ function SecureProvider({ children }) {
 ### Channel Security
 
 ```typescript
-// Ensure channel keys are properly scoped for security
-function SecureChannelProvider({ userId, tenantId, children }) {
-  // Include tenant context in channel key to prevent cross-tenant access
-  const secureChannelKey = `tenant-${tenantId}-user-${userId}`;
+// Fetch a short-lived grant from an authenticated server endpoint.
+function SecureChannelProvider({ children }) {
+  const { userId, channelKey, accessToken } = useChatGrant();
 
   return (
     <AgentProvider
       userId={userId}
-      channelKey={secureChannelKey}
+      channelKey={channelKey}
       transport={{
         headers: {
-          'X-Tenant-ID': tenantId,
-          'X-Security-Context': 'verified'
+          'Authorization': `Bearer ${accessToken}`
         }
       }}
     >
@@ -866,6 +861,11 @@ function SecureChannelProvider({ userId, tenantId, children }) {
   );
 }
 ```
+
+`channelKey` selects a stream; it is not an authorization boundary. Never
+construct a supposedly secure channel solely from client-controlled IDs, and
+never trust client-supplied role or ownership headers. The server must verify
+the grant when issuing realtime tokens and on every HTTP operation.
 
 ## Best Practices
 
@@ -884,7 +884,7 @@ function SecureChannelProvider({ userId, tenantId, children }) {
 - **Recreate transport** configuration on every render
 - **Hardcode sensitive values** - use environment variables
 - **Ignore connection sharing** - it significantly improves performance
-- **Mix channelKeys carelessly** - understand security implications
+- **Treat channelKey as authorization** - it is a routing key, not a grant
 
 ### Performance Tips
 

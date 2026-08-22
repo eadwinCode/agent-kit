@@ -66,6 +66,11 @@ type Agent[T any] struct {
 	// History persists standalone-run conversations.
 	History *HistoryConfig[T]
 
+	// Ports supplies the default runtime contracts (journal, state,
+	// control, approvals, structured sink, finalizer) for standalone runs.
+	// RunOptions.Ports overrides it per run.
+	Ports *RuntimePorts
+
 	// tools in insertion order (order is request-visible: it affects the
 	// provider tool list and hence prompt-cache stability), plus an index.
 	tools     []Tool[T]
@@ -91,6 +96,7 @@ type AgentConfig[T any] struct {
 	MaxIterPerRun int
 	MCPServers    []MCPServer
 	History       *HistoryConfig[T]
+	Ports         *RuntimePorts
 }
 
 // NewAgent creates an agent.
@@ -108,6 +114,7 @@ func NewAgent[T any](cfg AgentConfig[T]) *Agent[T] {
 		MaxIterPerRun: cfg.MaxIterPerRun,
 		MCPServers:    cfg.MCPServers,
 		History:       cfg.History,
+		Ports:         cfg.Ports,
 		toolIndex:     map[string]int{},
 	}
 	for _, t := range cfg.Tools {
@@ -242,6 +249,10 @@ type RunOptions[T any] struct {
 	// a network (the network controls streaming).
 	Streaming *StreamingConfig
 
+	// Ports overrides the agent's runtime contracts for this run. Ignored
+	// inside a network, which supplies its own.
+	Ports *RuntimePorts
+
 	// streamingContext is set by the network to let the agent emit
 	// part/text/tool events into the run's stream.
 	streamingContext *StreamingContext
@@ -307,11 +318,29 @@ func (a *Agent[T]) Run(ctx context.Context, input string, opts *RunOptions[T]) (
 		userSystemPrompt = opts.UserMessage.SystemPrompt
 	}
 
+	// Runtime contracts: a network supplies its own, a standalone run takes
+	// them from RunOptions or the agent's default.
+	ports := run.ports
+	if opts.Network == nil {
+		ports = opts.Ports
+		if ports == nil {
+			ports = a.Ports
+		}
+	}
+	controller := run.controller
+	approvals := run.approvals
+	if opts.Network == nil {
+		controller = newRunController(ports, nil, nil)
+		approvals = newApprovalController(ports, nil)
+		run.ports, run.controller, run.approvals = ports, controller, approvals
+	}
+
 	// Standalone streaming (ignored inside a network — the network provides
 	// its own context and emits the agent's run lifecycle itself).
 	sc := opts.streamingContext
 	standaloneStreaming := false
-	if sc == nil && opts.Network == nil && opts.Streaming != nil && opts.Streaming.Publish != nil {
+	if sc == nil && opts.Network == nil && opts.Streaming != nil &&
+		(opts.Streaming.Publish != nil || ports.wantsStream()) {
 		ids, idErr := durable.Run(ctx, step, "generate-standalone-agent-ids",
 			func(ctx context.Context) (agentIterationIDs, error) {
 				return agentIterationIDs{RunID: generateRunID(), MessageID: uuid.NewString()}, nil
@@ -319,27 +348,28 @@ func (a *Agent[T]) Run(ctx context.Context, input string, opts *RunOptions[T]) (
 		if idErr != nil {
 			return nil, idErr
 		}
-		sc = streamingContextFromState(s, *opts.Streaming, ids.RunID, ids.MessageID, "agent")
+		sc = streamingContextFromState(s, *opts.Streaming, ports, ids.RunID, ids.MessageID, "agent")
 		standaloneStreaming = true
+		controller.stream = sc
+		controller.journal = sc.journal
+		approvals.stream = sc
 		sc.PublishEvent(ctx, EventRunStarted, map[string]any{
 			"runId": sc.RunID, "scope": "agent", "name": a.Name, "messageId": sc.MessageID,
 		})
-		// Single terminal emitter for every exit path, failure included, so
-		// subscribers reliably unstick.
+		// ONE terminal emitter for every exit path, failure included, so
+		// subscribers reliably unstick — and so a configured Finalizer
+		// settles the application's durable facts before it is published.
+		terminal := newTerminalEmitter(sc, ports, sc.journal, controller, "agent", a.Name, sc.MessageID)
 		defer func() {
-			if err != nil {
-				sc.PublishEvent(ctx, EventRunFailed, map[string]any{
-					"runId": sc.RunID, "scope": "agent", "name": a.Name,
-					"error": err.Error(), "recoverable": false,
-				})
-			}
-			sc.PublishEvent(ctx, EventRunCompleted, map[string]any{
-				"runId": sc.RunID, "scope": "agent", "name": a.Name,
-			})
-			sc.PublishEvent(ctx, EventStreamEnded, map[string]any{
-				"scope": "agent", "messageId": sc.MessageID,
-			})
+			terminal.Emit(ctx, err, "", nil)
 		}()
+	}
+	if sc != nil && controller.stream == nil {
+		controller.stream = sc
+		controller.journal = sc.journal
+	}
+	if sc != nil && approvals.stream == nil {
+		approvals.stream = sc
 	}
 
 	topCfg := threadOpConfig[T]{State: s, History: a.History, Input: inputContent, Network: run, Step: step}
@@ -380,6 +410,14 @@ func (a *Agent[T]) Run(ctx context.Context, input string, opts *RunOptions[T]) (
 			}
 			prompt = modified.Prompt
 			history = modified.History
+		}
+
+		// Safe boundary before the provider call: a pause accepted here
+		// costs nothing, because no inference is in flight yet.
+		if err := controller.Checkpoint(ctx, Checkpoint{
+			Kind: CheckpointBeforeInference, AgentName: a.Name, Resumable: true,
+		}); err != nil {
+			return nil, err
 		}
 
 		inference, err := a.performInference(ctx, model, iter, prompt, history, run, sc, step)
@@ -473,6 +511,7 @@ func (a *Agent[T]) performInference(
 				inferenceStream.Complete()
 			},
 			inferenceStream.EventCount,
+			inferenceStream.StreamedToolCalls,
 		)
 	} else {
 		resp, err = model.Infer(ctx, stepID, input, defs, toolChoice)
@@ -521,7 +560,17 @@ func (a *Agent[T]) performInference(
 		}
 	}
 
-	toolCalls, err := a.invokeTools(ctx, result.Output, run, sc, step)
+	// Safe boundary after inference: the provider's complete result is
+	// recorded and no returned tool has run yet. A pause requested DURING
+	// inference takes effect exactly here — v1 never aborts mid-token, and
+	// never starts a tool it was told to stop before.
+	if err := run.controller.Checkpoint(ctx, Checkpoint{
+		Kind: CheckpointAfterInference, AgentName: a.Name, Resumable: true,
+	}); err != nil {
+		return nil, err
+	}
+
+	toolCalls, err := a.invokeTools(ctx, result.Output, run, sc, step, streamedToolCallSet(resp))
 	if err != nil {
 		return nil, err
 	}
@@ -544,18 +593,28 @@ type inferencePartStream struct {
 	active    *inferenceStreamPart
 	failed    bool
 	events    int
+
+	// toolParts holds the tool-call parts the provider is streaming
+	// arguments for, keyed by provider tool-call id. Tool parts live
+	// alongside — not inside — the single active content part: a provider
+	// may interleave text and tool-call argument chunks.
+	toolParts map[string]*inferenceStreamPart
+	// toolOrder preserves first-seen order so ids stay deterministic.
+	toolOrder []string
 }
 
 type inferenceStreamPart struct {
 	id      string
 	kind    string
+	name    string
 	content strings.Builder
 }
 
 func newInferencePartStream(ctx context.Context, sc *StreamingContext, agentName string, iter int) *inferencePartStream {
 	return &inferencePartStream{
 		ctx: ctx, sc: sc, agentName: agentName, iter: iter,
-		counts: map[string]int{},
+		counts:    map[string]int{},
+		toolParts: map[string]*inferenceStreamPart{},
 	}
 }
 
@@ -572,6 +631,12 @@ func (s *inferencePartStream) Handle(chunk provider.StreamChunk) {
 		if chunk.Text != "" {
 			s.delta("text", EventTextDelta, chunk.Text)
 		}
+	case provider.ChunkToolCallStreamStart:
+		s.openToolCall(chunk.ToolCallID, chunk.ToolName)
+	case provider.ChunkToolCallDelta:
+		s.toolArgsDelta(chunk.ToolCallID, chunk.ToolName, chunk.ToolInput)
+	case provider.ChunkToolCall:
+		s.completeToolCall(chunk.ToolCallID, chunk.ToolName, chunk.ToolInput)
 	case provider.ChunkFinish:
 		s.Complete()
 	case provider.ChunkError:
@@ -581,6 +646,115 @@ func (s *inferencePartStream) Handle(chunk provider.StreamChunk) {
 		}
 		s.Fail(err)
 	}
+}
+
+// openToolCall starts a tool-call part as soon as the provider announces
+// one — before its arguments have finished arriving, and before inference
+// completes. Any open text/reasoning part is closed first so the transcript
+// keeps strict created -> delta(s) -> completed ordering per part.
+func (s *inferencePartStream) openToolCall(callID, toolName string) *inferenceStreamPart {
+	if callID == "" {
+		return nil
+	}
+	if part, ok := s.toolParts[callID]; ok {
+		return part
+	}
+	s.Complete()
+	index := len(s.toolOrder)
+	part := &inferenceStreamPart{
+		id: s.sc.stablePartID("tool-call", s.iter, index), kind: "tool-call", name: toolName,
+	}
+	s.toolParts[callID] = part
+	s.toolOrder = append(s.toolOrder, callID)
+	s.sc.PublishEvent(s.ctx, EventPartCreated, map[string]any{
+		"partId": part.id, "runId": s.sc.RunID, "messageId": s.sc.MessageID,
+		"type": "tool-call", "metadata": map[string]any{"toolName": toolName, "agentName": s.agentName},
+	})
+	s.events++
+	return part
+}
+
+// toolArgsDelta forwards one provider argument fragment. This is real
+// argument streaming: the chunk arrives while the model is still producing
+// the call, not a post-completion split of an already-complete input.
+func (s *inferencePartStream) toolArgsDelta(callID, toolName, delta string) {
+	if delta == "" {
+		return
+	}
+	part := s.openToolCall(callID, toolName)
+	if part == nil {
+		return
+	}
+	part.content.WriteString(delta)
+	data := map[string]any{
+		"partId": part.id, "messageId": s.sc.MessageID, "delta": delta,
+	}
+	if part.content.Len() == len(delta) {
+		// toolName rides only the first delta, matching the TS contract.
+		data["toolName"] = part.name
+	}
+	s.sc.PublishEvent(s.ctx, EventToolArgsDelta, data)
+	s.events++
+}
+
+// completeToolCall closes the part with the provider's authoritative final
+// input. When the deltas did not reconstruct that input exactly — a
+// provider that streams a summary, or one that emits only a complete
+// ChunkToolCall — the remainder is emitted as one final delta first, so the
+// concatenated deltas always equal the parsed input the tool will receive.
+func (s *inferencePartStream) completeToolCall(callID, toolName, input string) {
+	if callID == "" {
+		return
+	}
+	part := s.openToolCall(callID, toolName)
+	if part == nil {
+		return
+	}
+	if part.name == "" {
+		part.name = toolName
+	}
+	if streamed := part.content.String(); streamed != input {
+		remainder := input
+		if strings.HasPrefix(input, streamed) {
+			remainder = input[len(streamed):]
+		} else {
+			// Deltas disagreed with the final input: restart the part's
+			// content rather than concatenating two different renderings.
+			part.content.Reset()
+			remainder = input
+		}
+		if remainder != "" {
+			part.content.WriteString(remainder)
+			data := map[string]any{
+				"partId": part.id, "messageId": s.sc.MessageID, "delta": remainder,
+			}
+			if part.content.Len() == len(remainder) {
+				data["toolName"] = part.name
+			}
+			s.sc.PublishEvent(s.ctx, EventToolArgsDelta, data)
+			s.events++
+		}
+	}
+	final := part.content.String()
+	if final == "" {
+		final = "{}"
+	}
+	s.sc.PublishEvent(s.ctx, EventPartCompleted, map[string]any{
+		"partId": part.id, "runId": s.sc.RunID, "messageId": s.sc.MessageID,
+		"type": "tool-call", "finalContent": json.RawMessage(final),
+		"metadata": map[string]any{"toolName": part.name, "agentName": s.agentName},
+	})
+	s.events++
+}
+
+// StreamedToolCalls returns the provider tool-call ids whose argument parts
+// this stream already published, so the tool loop does not publish them a
+// second time.
+func (s *inferencePartStream) StreamedToolCalls() []string {
+	if s == nil {
+		return nil
+	}
+	return append([]string(nil), s.toolOrder...)
 }
 
 func (s *inferencePartStream) delta(kind, event, delta string) {
@@ -626,7 +800,7 @@ func (s *inferencePartStream) Fail(err error) {
 	}
 	s.sc.PublishEvent(s.ctx, EventPartFailed, map[string]any{
 		"partId": s.active.id, "runId": s.sc.RunID, "messageId": s.sc.MessageID,
-		"type": s.active.kind, "error": err.Error(),
+		"type": s.active.kind, "error": "The provider stream ended unexpectedly.",
 	})
 	s.events++
 	s.active = nil
@@ -715,7 +889,21 @@ func (a *Agent[T]) streamPartID(ctx context.Context, sc *StreamingContext, step 
 
 // invokeTools executes every tool call in the inference output, in order,
 // streaming tool-call arguments and outputs when a context is present.
-func (a *Agent[T]) invokeTools(ctx context.Context, msgs []Message, run *NetworkRun[T], sc *StreamingContext, step durable.Step) ([]Message, error) {
+// streamedToolCallSet indexes the tool-call ids whose argument parts the
+// provider stream already published, so the tool loop skips them. Replays
+// see the same set: it crosses the durable inference boundary.
+func streamedToolCallSet(resp *InferenceResponse) map[string]bool {
+	if resp == nil || len(resp.streamedToolCalls) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(resp.streamedToolCalls))
+	for _, id := range resp.streamedToolCalls {
+		set[id] = true
+	}
+	return set
+}
+
+func (a *Agent[T]) invokeTools(ctx context.Context, msgs []Message, run *NetworkRun[T], sc *StreamingContext, step durable.Step, streamedArgs map[string]bool) ([]Message, error) {
 	var output []Message
 
 	for _, msg := range msgs {
@@ -739,7 +927,11 @@ func (a *Agent[T]) invokeTools(ctx context.Context, msgs []Message, run *Network
 				argsJSON = "{}"
 			}
 
-			if sc != nil {
+			// A provider that streamed this call's arguments already
+			// published the whole tool-call part (created -> deltas ->
+			// completed) before inference finished. Re-emitting it here
+			// would duplicate the part and contradict the streamed content.
+			if sc != nil && !streamedArgs[call.ID] {
 				partID, err := a.streamPartID(ctx, sc, step,
 					fmt.Sprintf("generate-tool-part-id-%s-%s-%d", sc.MessageID, call.Name, callIdx))
 				if err != nil {
@@ -767,7 +959,25 @@ func (a *Agent[T]) invokeTools(ctx context.Context, msgs []Message, run *Network
 				})
 			}
 
-			result := a.runToolHandler(ctx, tool, call, run, step)
+			// Safe boundary before the tool runs: nothing irreversible has
+			// happened yet, so a pause here is free and a cancel is clean.
+			if err := run.controller.Checkpoint(ctx, Checkpoint{
+				Kind: CheckpointBeforeTool, AgentName: a.Name, ToolName: call.Name, Resumable: true,
+			}); err != nil {
+				return nil, err
+			}
+
+			result := a.runToolHandler(ctx, tool, call, run, sc, step)
+
+			// Safe boundary after the tool's result is recorded. A tool that
+			// began an atomic side effect declares its own non-resumable
+			// boundary through opts.Stream.Checkpoint; by the time execution
+			// reaches here the effect is complete and checkpointed.
+			if err := run.controller.Checkpoint(ctx, Checkpoint{
+				Kind: CheckpointAfterTool, AgentName: a.Name, ToolName: call.Name, Resumable: true,
+			}); err != nil {
+				return nil, err
+			}
 
 			content, err := result.marshal()
 			if err != nil {
@@ -775,6 +985,13 @@ func (a *Agent[T]) invokeTools(ctx context.Context, msgs []Message, run *Network
 			}
 
 			if sc != nil {
+				publicContent := content
+				if result.IsError() {
+					// The model may need the handler's diagnostic to recover, but
+					// public subscribers must not receive raw database errors,
+					// paths, tool inputs or credentials embedded in it.
+					publicContent = json.RawMessage(`{"error":{"name":"Error","message":"Tool execution failed."}}`)
+				}
 				partID, err := a.streamPartID(ctx, sc, step,
 					fmt.Sprintf("generate-output-part-id-%s-%s-%d", sc.MessageID, call.Name, callIdx))
 				if err != nil {
@@ -784,14 +1001,14 @@ func (a *Agent[T]) invokeTools(ctx context.Context, msgs []Message, run *Network
 					"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
 					"type": "tool-output", "metadata": map[string]any{"toolName": call.Name, "agentName": a.Name},
 				})
-				for _, delta := range sc.ChunkContent(string(content)) {
+				for _, delta := range sc.ChunkContent(string(publicContent)) {
 					sc.PublishEvent(ctx, EventToolOutDelta, map[string]any{
 						"partId": partID, "delta": delta, "messageId": sc.MessageID,
 					})
 				}
 				sc.PublishEvent(ctx, EventPartCompleted, map[string]any{
 					"partId": partID, "runId": sc.RunID, "messageId": sc.MessageID,
-					"type": "tool-output", "finalContent": json.RawMessage(content),
+					"type": "tool-output", "finalContent": json.RawMessage(publicContent),
 					"metadata": map[string]any{"toolName": call.Name, "agentName": a.Name},
 				})
 			}
@@ -891,9 +1108,19 @@ func errResult(err error) ToolHandlerResult {
 // ManualStep tools run inline and own their durability (WaitForEvent,
 // Invoke, multi-checkpoint subagents). Outside Inngest the durable seam
 // executes inline on its own — no caller-side detection needed.
-func (a *Agent[T]) runToolHandler(ctx context.Context, tool Tool[T], call ToolMessage, run *NetworkRun[T], step durable.Step) ToolHandlerResult {
+func (a *Agent[T]) runToolHandler(ctx context.Context, tool Tool[T], call ToolMessage, run *NetworkRun[T], sc *StreamingContext, step durable.Step) ToolHandlerResult {
+	// The tool's public emitter: typed status/data/progress plus its own
+	// declared safe boundaries. Tools use this instead of wrapping the
+	// publish function and injecting envelopes into someone else's stream.
+	var stream StructuredStream = noopStream{}
+	if sc != nil {
+		stream = newRunStream(sc, run.controller, a.Name, call.Name)
+	}
 	invoke := func(ctx context.Context) ToolHandlerResult {
-		r, err := tool.Handler(ctx, call.Input, ToolOptions[T]{Agent: a, Network: run, State: run.State, Step: step})
+		r, err := tool.Handler(ctx, call.Input, ToolOptions[T]{
+			Agent: a, Network: run, State: run.State, Step: step,
+			Stream: stream, Approvals: run.approvals, ToolCallID: call.ID,
+		})
 		if err != nil {
 			return errResult(err)
 		}

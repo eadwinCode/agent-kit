@@ -9,10 +9,10 @@ The `AgentProvider` is a React component that creates a shared context for all `
 
 By wrapping your agent-driven components in `AgentProvider`, you get several key benefits:
 
--   **Performance**: A single WebSocket connection is established and shared across all components, reducing network overhead.
--   **Consistency**: A shared transport configuration, user context, and channel key are used by all hooks, preventing inconsistencies.
--   **Flexibility**: Individual hooks can still override the shared configuration if needed for specific cases.
--   **Anonymous Users**: The provider automatically generates and persists a unique ID for anonymous users, allowing them to have a consistent experience across page loads.
+- **Performance**: A single WebSocket connection is established and shared across all components, reducing network overhead.
+- **Consistency**: A shared transport configuration, user context, and channel key are used by all hooks, preventing inconsistencies.
+- **Flexibility**: Individual hooks can still override the shared configuration if needed for specific cases.
+- **Anonymous Users**: The provider automatically generates and persists a unique ID for anonymous users, allowing them to have a consistent experience across page loads.
 
 ## How It Works
 
@@ -62,15 +62,23 @@ function App() {
 
 ### Collaborative Sessions
 
-To create shared, collaborative sessions (e.g., a chat where multiple users interact with the same agent in a shared context), you can use the `channelKey` prop. All users who connect with the same `channelKey` will be subscribed to the same real-time channel.
+To create shared, collaborative sessions, pass a server-authorized
+`channelKey`. The key selects a real-time channel; it does not grant access to
+one. Your token endpoint and HTTP handlers must independently authenticate the
+caller and authorize that channel.
 
 ```tsx
 import { AgentProvider } from "@inngest/use-agent";
 import { CollaborativeChat } from "./CollaborativeChat";
 
-function ProjectChat({ projectId }) {
+function CollaborativeChatView({ channelGrant }) {
   return (
-    <AgentProvider channelKey={`project-${projectId}`}>
+    <AgentProvider
+      channelKey={channelGrant.channelKey}
+      transport={{
+        headers: { Authorization: `Bearer ${channelGrant.accessToken}` },
+      }}
+    >
       <CollaborativeChat />
     </AgentProvider>
   );
@@ -90,12 +98,12 @@ function App({ userId, getAuthToken }) {
       userId={userId}
       transport={{
         api: {
-          sendMessage: '/api/v2/chat',
-          fetchThreads: '/api/v2/threads'
+          sendMessage: "/api/v2/chat",
+          fetchThreads: "/api/v2/threads",
         },
         headers: () => ({
-          'Authorization': `Bearer ${getAuthToken()}`,
-        })
+          Authorization: `Bearer ${getAuthToken()}`,
+        }),
       }}
     >
       <ChatApp />

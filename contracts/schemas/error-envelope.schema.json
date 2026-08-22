@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eadwinCode/agent-kit/contracts/error-envelope.schema.json",
+  "title": "Structured error envelope",
+  "description": "The one error shape every assistant endpoint returns. It exists so a client can act on a failure — retry, reauthenticate, reconcile — instead of parsing a message string. It must never contain prompts, reasoning, file contents, tool payloads, secrets, or realtime tokens.",
+  "type": "object",
+  "required": ["error"],
+  "additionalProperties": false,
+  "properties": {
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "recoverable"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Bounded machine code, e.g. STATE_REVISION_MISMATCH, IDEMPOTENCY_KEY_REUSED, RESOURCE_BUSY, RUN_TERMINAL."
+        },
+        "message": { "type": "string", "description": "User-safe text." },
+        "recoverable": { "type": "boolean" },
+        "correlationId": { "type": "string" },
+        "retryAfterMs": { "type": "integer", "minimum": 0 },
+        "details": { "type": "object" }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "description": "The authoritative state, returned with a conflict so the client reconciles without a side channel."
+    }
+  }
+}

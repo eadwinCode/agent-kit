@@ -8,6 +8,9 @@ dist
 # Node packages
 node_modules
 
+# Local Graphify knowledge graphs and caches
+graphify-out/
+
 # Nix
 /.direnv/
 .DS_Store

@@ -32,17 +32,10 @@ export const stringifyError = (e: unknown): string => {
  * Attempts to retrieve the step tools from the async context.
  */
 export const getStepTools = async (): Promise<
-  AsyncContext["ctx"]["step"] | undefined
+  NonNullable<AsyncContext["execution"]>["ctx"]["step"] | undefined
 > => {
-  // The shape of the experimental async context changed across versions.
-  // This is now stable, but we support both shapes here for compatibility.
   const asyncCtx = await getAsyncCtx();
-
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
-  const ctx = asyncCtx?.ctx || (asyncCtx as any)?.execution?.ctx;
-
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-member-access
-  return ctx?.step;
+  return asyncCtx?.execution?.ctx.step;
 };
 
 export const isInngestFn = (fn: unknown): fn is InngestFunction.Any => {

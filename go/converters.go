@@ -247,8 +247,8 @@ func MapToolChoice(choice string) string {
 
 // SerializableResult is the serializable subset of a generation result that
 // survives the durable step and feeds AgentResult.Raw. The JSON shape is
-// the TS SerializableResult — Clevix's parseUsageFromRaw reads
-// raw.usage's snake_case keys.
+// the TS SerializableResult, whose consumers read raw.usage's snake_case
+// keys for billing.
 type SerializableResult struct {
 	Text      string                 `json:"text"`
 	ToolCalls []SerializableToolCall `json:"toolCalls"`
@@ -280,8 +280,8 @@ type SerializableToolCall struct {
 // Divergence from TS: the cache fields are always present (0 when the
 // provider has no cache concept) rather than conditionally omitted; and
 // total_tokens is goai's input+output (cache-exclusive input) rather than
-// the AI SDK's cache-inclusive total. Clevix billing reads input + the two
-// cache buckets and is unaffected by either.
+// the AI SDK's cache-inclusive total. Billing that reads input plus the two
+// cache buckets is unaffected by either.
 type SerializableUsage struct {
 	InputTokens              int `json:"input_tokens"`
 	OutputTokens             int `json:"output_tokens"`

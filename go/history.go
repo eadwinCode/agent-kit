@@ -18,8 +18,7 @@ import (
 // `step: undefined` into hooks that are already inside a step — the Step
 // here is always usable: nested durable.Run calls collapse to inline
 // execution automatically, so a hook can wrap its DB work in durable.Run
-// unconditionally (the manual nesting-avoidance in Clevix's
-// history-adapter.ts becomes unnecessary).
+// unconditionally — no manual nesting-avoidance is needed in the adapter.
 type HistoryConfig[T any] struct {
 	// CreateThread creates (or upserts) a conversation thread. Called
 	// before any agents run when no ThreadID exists — or when one does,
@@ -65,8 +64,25 @@ type UserMessageRecord struct {
 	Timestamp jsonutil.Time `json:"timestamp"`
 }
 
-// FinalAppendStepID is the deterministic step id for the end-of-run save.
-const FinalAppendStepID = "agent-kit/history/append-results/final"
+// Deterministic step ids for the history lifecycle.
+//
+// Every write is memoized under one of these so an Inngest replay — which
+// re-executes the function body from the top — cannot create a second thread
+// or append the user's turn twice. Get is deliberately NOT memoized: its
+// result is the whole conversation, and step outputs share a bounded
+// per-run budget, so re-reading on replay is cheaper than carrying history
+// through step state.
+const (
+	// FinalAppendStepID is the deterministic step id for the end-of-run save.
+	FinalAppendStepID = "agent-kit/history/append-results/final"
+
+	// CreateThreadStepID memoizes thread creation, so the thread id a run
+	// commits to is the same one every replay sees.
+	CreateThreadStepID = "agent-kit/history/create-thread"
+
+	// AppendUserMessageStepID memoizes the user-turn write.
+	AppendUserMessageStepID = "agent-kit/history/append-user-message"
+)
 
 // IncrementalAppendStepID builds the deterministic step id for an
 // incremental (per-iteration) save. key MUST be replay-stable — an
@@ -113,7 +129,7 @@ func initializeThread[T any](ctx context.Context, cfg threadOpConfig[T]) error {
 	// ThreadID stays the source of truth.
 	if cfg.State.ThreadID != "" {
 		if h.CreateThread != nil {
-			_, err := h.CreateThread(ctx, cfg.historyContext())
+			_, err := createThread(ctx, cfg)
 			return err
 		}
 		return nil
@@ -121,7 +137,7 @@ func initializeThread[T any](ctx context.Context, cfg threadOpConfig[T]) error {
 
 	switch {
 	case h.CreateThread != nil:
-		res, err := h.CreateThread(ctx, cfg.historyContext())
+		res, err := createThread(ctx, cfg)
 		if err != nil {
 			return err
 		}
@@ -135,6 +151,43 @@ func initializeThread[T any](ctx context.Context, cfg threadOpConfig[T]) error {
 		cfg.State.ThreadID = id
 	}
 	return nil
+}
+
+// createThread runs the CreateThread hook inside ONE durable step under a
+// deterministic id. The step is owned here, not by the adapter: an unmemoized
+// creation would run again on every replay, and an adapter that inserts
+// rather than upserts would leave a trail of orphan threads.
+func createThread[T any](ctx context.Context, cfg threadOpConfig[T]) (CreateThreadResult, error) {
+	step := cfg.Step
+	if step == nil {
+		step = durable.Inngest()
+	}
+	return durable.Run(ctx, step, CreateThreadStepID,
+		func(ctx context.Context) (CreateThreadResult, error) {
+			return cfg.History.CreateThread(ctx, cfg.historyContext())
+		})
+}
+
+// appendUserMessage persists the user's turn inside ONE durable step, so a
+// replay re-reads the memoized result instead of appending the message again.
+// The record's id is already replay-stable; the step makes the write
+// exactly-once even for an adapter that does not dedupe on it.
+func appendUserMessage[T any](ctx context.Context, cfg threadOpConfig[T], msg UserMessageRecord) error {
+	if cfg.History == nil || cfg.History.AppendUserMessage == nil {
+		return nil
+	}
+	step := cfg.Step
+	if step == nil {
+		step = durable.Inngest()
+	}
+	_, err := durable.Run(ctx, step, AppendUserMessageStepID,
+		func(ctx context.Context) (bool, error) {
+			if err := cfg.History.AppendUserMessage(ctx, cfg.historyContext(), msg); err != nil {
+				return false, err
+			}
+			return true, nil
+		})
+	return err
 }
 
 // loadThreadFromStorage hydrates the state from History.Get — unless the
