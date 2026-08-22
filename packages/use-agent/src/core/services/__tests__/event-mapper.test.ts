@@ -5,24 +5,12 @@ import type { ToolManifest } from "../../../types/index.js";
 
 describe("event-mapper", () => {
   it("maps valid chunks", () => {
-    const evt = mapToNetworkEvent({
-      event: "x",
-      data: { a: 1 },
-      timestamp: 1,
-      sequenceNumber: 1,
-      id: "a",
-    });
+    const evt = mapToNetworkEvent({ event: "x", data: { a: 1 }, timestamp: 1, sequenceNumber: 1, id: "a" });
     expect(evt?.event).toBe("x");
   });
 
   it("filters by threadId", () => {
-    const evt = mapToNetworkEvent({
-      event: "x",
-      data: { threadId: "t1" },
-      timestamp: 1,
-      sequenceNumber: 1,
-      id: "a",
-    })!;
+    const evt = mapToNetworkEvent({ event: "x", data: { threadId: "t1" }, timestamp: 1, sequenceNumber: 1, id: "a" })!;
     expect(shouldProcessEvent(evt, { threadId: "t2" })).toBe(false);
     expect(shouldProcessEvent(evt, { threadId: "t1" })).toBe(true);
   });
@@ -59,44 +47,6 @@ describe("mapToNetworkEvent extra", () => {
     expect(evt?.event).toBe("part.created");
     expect(typeof evt?.id).toBe("string");
   });
-
-  it("normalizes structured parts and delta events without dropping metadata", () => {
-    const created = mapToNetworkEvent({
-      event: "part.created",
-      data: {
-        threadId: "t1",
-        messageId: "m1",
-        partId: "d1",
-        type: "data",
-        content: { initial: true },
-        metadata: { name: "progress", ui: { component: "meter" } },
-      },
-      timestamp: 1,
-      sequenceNumber: 1,
-      id: "created-data",
-    });
-    const delta = mapToNetworkEvent({
-      event: "data.delta",
-      data: {
-        threadId: "t1",
-        messageId: "m1",
-        partId: "d1",
-        delta: { progress: 75 },
-        metadata: { name: "progress" },
-      },
-      timestamp: 2,
-      sequenceNumber: 2,
-      id: "delta-data",
-    });
-
-    expect(created?.data).toMatchObject({
-      type: "data",
-      content: { initial: true },
-      metadata: { name: "progress", ui: { component: "meter" } },
-    });
-    expect(delta?.data).toMatchObject({
-      delta: { progress: 75 },
-      metadata: { name: "progress" },
-    });
-  });
 });
+
+

@@ -3,17 +3,12 @@ import { describe, it, expect } from "vitest";
 import React from "react";
 import { render } from "@testing-library/react";
 import { AgentProvider } from "../../../components/AgentProvider.js";
-import {
-  useProviderContext,
-  resolveIdentity,
-  resolveTransport,
-} from "../provider-context.js";
+import { useProviderContext, resolveIdentity, resolveTransport } from "../provider-context.js";
 
 describe("provider-context", () => {
   it("returns nulls outside provider", () => {
     function Probe() {
       const ctx = useProviderContext();
-      expect(ctx.hasProvider).toBe(false);
       expect(ctx.userId).toBeNull();
       expect(ctx.channelKey).toBeNull();
       expect(ctx.resolvedChannelKey).toBeNull();
@@ -29,7 +24,6 @@ describe("provider-context", () => {
     const fakeConnection: any = { id: "connection" };
     function Probe() {
       const ctx = useProviderContext();
-      expect(ctx.hasProvider).toBe(true);
       expect(ctx.userId).toBe("u1");
       expect(ctx.channelKey).toBe("c1");
       expect(typeof ctx.resolvedChannelKey).toBe("string");
@@ -38,34 +32,16 @@ describe("provider-context", () => {
       return null;
     }
     render(
-      <AgentProvider
-        userId="u1"
-        channelKey="c1"
-        transport={fakeTransport}
-        connection={fakeConnection}
-        debug={false}
-      >
+      <AgentProvider userId="u1" channelKey="c1" transport={fakeTransport} connection={fakeConnection} debug={false}>
         <Probe />
       </AgentProvider>
     );
   });
 
   it("resolveIdentity prefers config over provider", () => {
-    const provider = {
-      hasProvider: true,
-      userId: "pu",
-      channelKey: "pc",
-      resolvedChannelKey: null,
-      transport: null,
-      connection: null,
-    };
-    expect(
-      resolveIdentity({ configUserId: "cu", configChannelKey: "cc", provider })
-    ).toEqual({ userId: "cu", channelKey: "cc" });
-    expect(resolveIdentity({ provider })).toEqual({
-      userId: "pu",
-      channelKey: "pc",
-    });
+    const provider = { userId: "pu", channelKey: "pc", resolvedChannelKey: null, transport: null, connection: null };
+    expect(resolveIdentity({ configUserId: "cu", configChannelKey: "cc", provider })).toEqual({ userId: "cu", channelKey: "cc" });
+    expect(resolveIdentity({ provider })).toEqual({ userId: "pu", channelKey: "pc" });
   });
 
   it("resolveTransport prefers provided then provider then null", () => {
@@ -76,3 +52,5 @@ describe("provider-context", () => {
     expect(resolveTransport()).toBeNull();
   });
 });
+
+

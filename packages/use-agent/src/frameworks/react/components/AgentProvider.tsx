@@ -12,6 +12,7 @@ import type {
   IConnection,
   IConnectionTokenProvider,
 } from "../../../core/ports/connection.js";
+import { createInngestConnection } from "../../../core/adapters/inngest-connection.js";
 
 /**
  * Context type for AgentProvider - contains shared agent instance and configuration.
@@ -31,7 +32,7 @@ interface AgentContextType {
   /** Computed channel key actually used for subscriptions */
   resolvedChannelKey: string;
   /** Internal: connection instance for realtime subscriptions (hex port) */
-  connection: IConnection | null;
+  connection?: IConnection;
 }
 
 export const AgentContext = createContext<AgentContextType | null>(null);
@@ -162,6 +163,7 @@ export function AgentProvider({
   debug = true,
   transport: transportConfig,
   connection: providedConnection,
+  tokenProvider,
   queryClient,
 }: AgentProviderProps) {
   // Create a stable fallback threadId that only gets generated once
@@ -224,12 +226,36 @@ export function AgentProvider({
     );
   }, [transportConfig]);
 
-  // A connection is an explicit override. Without one, useAgent retains the
-  // official realtime-hook path and obtains tokens from the transport.
-  const connection = useMemo(
-    () => providedConnection ?? null,
-    [providedConnection]
-  );
+  // Hex port seam: create a connection instance (not yet used by hooks)
+  const connection = useMemo<IConnection>(() => {
+    // Default token provider pulls from transport per Inngest hooks pattern
+    const effectiveTokenProvider: IConnectionTokenProvider | undefined =
+      tokenProvider ||
+      (transport
+        ? {
+            getToken: async (params: {
+              userId?: string;
+              threadId: string;
+              channelKey: string;
+            }) => {
+              const res = await transport.getRealtimeToken({
+                userId: params.userId ?? userId,
+                threadId: params.threadId,
+                channelKey: params.channelKey,
+              });
+              return {
+                token: res.token,
+                expires: res.expires,
+              };
+            },
+          }
+        : undefined);
+
+    return (
+      providedConnection ??
+      createInngestConnection({ tokenProvider: effectiveTokenProvider })
+    );
+  }, [providedConnection, tokenProvider, transport, userId]);
 
   // 🔍 DIAGNOSTIC
   if (debug) {

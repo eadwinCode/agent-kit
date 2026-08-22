@@ -16,14 +16,6 @@ import type {
   ToolResultPayload,
   ReasoningDelta,
   ReasoningUIPart,
-  DataDelta,
-  DataUIPart,
-  ErrorEvent,
-  HitlRequested,
-  HitlResolved,
-  HitlUIPart,
-  MessagePart,
-  StructuredPartType,
 } from "../../types/index.js";
 
 // Safe accessor for typed event.data
@@ -87,24 +79,6 @@ export function reduceStreamingState<
 
         // Ensure thread exists
         const thread = ensureThread<TManifest, TState>(next, threadId);
-
-        // Deduplicate exact realtime deliveries even after they have drained from
-        // the sequence buffer. Some transports replay the last item on reconnect.
-        const eventIdentity =
-          typeof evt.id === "string" && evt.id
-            ? evt.id
-            : `${evt.sequenceNumber}:${evt.event}`;
-        thread.processedEventIds ??= new Set<string>();
-        if (thread.processedEventIds.has(eventIdentity)) {
-          if (_debug)
-            console.log("[ordering] dedup: already processed", {
-              threadId,
-              eventIdentity,
-              event: evt.event,
-            });
-          continue;
-        }
-        thread.processedEventIds.add(eventIdentity);
 
         // Per-thread dedup by sequenceNumber
         if (thread.eventBuffer.has(evt.sequenceNumber)) {
@@ -314,7 +288,6 @@ export function reduceStreamingState<
         ...thread,
         messages: [],
         eventBuffer: new Map(),
-        processedEventIds: new Set(),
         nextExpectedSequence: 0,
         agentStatus: "ready",
         error: undefined,
@@ -534,9 +507,6 @@ function applyEvent<
         (evt as ReasoningDelta).data
       );
     }
-    case "data.delta": {
-      return applyDataDelta<TManifest, TState>(thread, (evt as DataDelta).data);
-    }
     case "tool_call.arguments.delta": {
       return applyToolArgumentsDelta<TManifest, TState>(
         thread,
@@ -555,26 +525,6 @@ function applyEvent<
         (evt as PartCompleted).data
       );
     }
-    case "error": {
-      return applyErrorEvent<TManifest, TState>(
-        thread,
-        (evt as ErrorEvent).data,
-        evt.id
-      );
-    }
-    case "hitl.requested": {
-      return applyHitlRequested<TManifest, TState>(
-        thread,
-        (evt as HitlRequested).data,
-        evt.id
-      );
-    }
-    case "hitl.resolved": {
-      return applyHitlResolved<TManifest, TState>(
-        thread,
-        (evt as HitlResolved).data
-      );
-    }
     case "run.completed": {
       // Do not mark ready on run.completed; only finalize tool outputs.
       // We will transition to "ready" exclusively on stream.ended.
@@ -588,7 +538,7 @@ function applyEvent<
       const finalized = finalizeToolsWithOutput<TManifest, TState>(thread);
       return {
         ...finalized,
-        agentStatus: finalized.error ? "error" : "ready",
+        agentStatus: "ready",
         runActive: false,
         lastActivity: new Date(),
       } as ThreadState<TManifest, TState>;
@@ -616,7 +566,6 @@ function ensureThread<
     lastActivity: new Date(),
     historyLoaded: false,
     runActive: false, // Default to inactive
-    processedEventIds: new Set(),
   } as ThreadState<TManifest, TState>;
   state.threads[threadId] = created;
   return created;
@@ -691,7 +640,7 @@ function ensureReasoningPart<
 >(
   message: ConversationMessage<TManifest, TState>,
   partId: string,
-  metadata?: Record<string, unknown>
+  agentName?: string
 ): ReasoningUIPart {
   let part = message.parts.find(
     (p) => p.type === "reasoning" && p.id === partId
@@ -700,177 +649,13 @@ function ensureReasoningPart<
     part = {
       type: "reasoning",
       id: partId,
-      agentName: stringValue(metadata?.agentName),
+      agentName: agentName || "",
       content: "",
       status: "streaming",
     } as ReasoningUIPart;
     message.parts = [...message.parts, part];
   }
   return part;
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
-function stringValue(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function statusValue(
-  value: unknown,
-  fallback:
-    | "started"
-    | "thinking"
-    | "calling-tool"
-    | "responding"
-    | "completed"
-    | "error" = "started"
-) {
-  switch (value) {
-    case "started":
-    case "thinking":
-    case "calling-tool":
-    case "responding":
-    case "completed":
-    case "error":
-      return value;
-    default:
-      return fallback;
-  }
-}
-
-function hitlStatusValue(
-  value: unknown,
-  fallback: HitlUIPart["status"] = "pending"
-): HitlUIPart["status"] {
-  switch (value) {
-    case "pending":
-    case "approved":
-    case "denied":
-    case "expired":
-      return value;
-    default:
-      return fallback;
-  }
-}
-
-function ensureDataPart<
-  TManifest extends ToolManifest = ToolManifest,
-  TState = Record<string, unknown>,
->(
-  message: ConversationMessage<TManifest, TState>,
-  partId: string,
-  metadata?: Record<string, unknown>
-): DataUIPart {
-  let part = message.parts.find(
-    (candidate) => candidate.type === "data" && candidate.id === partId
-  ) as DataUIPart | undefined;
-  if (!part) {
-    part = {
-      type: "data",
-      id: partId,
-      name: stringValue(
-        metadata?.dataType,
-        stringValue(metadata?.name, partId)
-      ),
-      data: undefined,
-      ui: metadata?.ui,
-    };
-    message.parts = [...message.parts, part];
-  }
-  return part;
-}
-
-function structuredPart<TManifest extends ToolManifest = ToolManifest>(
-  type: StructuredPartType,
-  partId: string,
-  value: unknown,
-  metadata?: Record<string, unknown>
-): MessagePart<TManifest> | undefined {
-  const content = asRecord(value);
-  switch (type) {
-    case "data":
-      return {
-        type,
-        id: partId,
-        name: stringValue(
-          metadata?.dataType,
-          stringValue(metadata?.name, partId)
-        ),
-        data: value,
-        ui: metadata?.ui,
-      };
-    case "status":
-      return {
-        type,
-        id: partId,
-        status: statusValue(content.status ?? metadata?.status),
-        agentId: stringValue(content.agentId ?? metadata?.agentId) || undefined,
-        message: stringValue(content.message ?? metadata?.message) || undefined,
-      };
-    case "file":
-      return {
-        type,
-        id: partId,
-        url: stringValue(content.url),
-        mediaType: stringValue(content.mediaType, "application/octet-stream"),
-        title: stringValue(content.title) || undefined,
-        size: typeof content.size === "number" ? content.size : undefined,
-      };
-    case "source":
-      return {
-        type,
-        id: partId,
-        subtype: content.subtype === "document" ? "document" : "url",
-        url: stringValue(content.url) || undefined,
-        title: stringValue(content.title, "Source"),
-        mediaType: stringValue(content.mediaType) || undefined,
-        excerpt: stringValue(content.excerpt) || undefined,
-      };
-    case "error":
-      return {
-        type,
-        id: partId,
-        error: stringValue(
-          content.error,
-          stringValue(content.message, "Agent run failed")
-        ),
-        agentId: stringValue(content.agentId) || undefined,
-        recoverable:
-          typeof content.recoverable === "boolean"
-            ? content.recoverable
-            : undefined,
-      };
-    case "hitl": {
-      const rawMetadata = asRecord(content.metadata);
-      const riskLevel = rawMetadata.riskLevel;
-      return {
-        type,
-        id: partId,
-        toolCalls: Array.isArray(content.toolCalls)
-          ? (content.toolCalls as HitlUIPart["toolCalls"])
-          : [],
-        status: hitlStatusValue(content.status),
-        expiresAt: stringValue(content.expiresAt) || undefined,
-        resolvedBy: stringValue(content.resolvedBy) || undefined,
-        resolvedAt: stringValue(content.resolvedAt) || undefined,
-        metadata: {
-          reason: stringValue(rawMetadata.reason) || undefined,
-          riskLevel:
-            riskLevel === "low" ||
-            riskLevel === "medium" ||
-            riskLevel === "high"
-              ? riskLevel
-              : undefined,
-        },
-      };
-    }
-    default:
-      return undefined;
-  }
 }
 
 function applyPartCreated<
@@ -892,7 +677,11 @@ function applyPartCreated<
   if (type === "text") {
     ensureTextPart<TManifest, TState>(msg, partId);
   } else if (type === "reasoning") {
-    ensureReasoningPart<TManifest, TState>(msg, partId, data.metadata);
+    ensureReasoningPart<TManifest, TState>(
+      msg,
+      partId,
+      (data?.metadata as { agentName?: string } | undefined)?.agentName
+    );
   } else if (type === "tool-call") {
     const tool: ToolCallUIPart<TManifest> = {
       type: "tool-call",
@@ -903,17 +692,6 @@ function applyPartCreated<
       output: undefined,
     } as ToolCallUIPart<TManifest>;
     msg.parts = [...msg.parts, tool];
-  } else if (type === "data") {
-    const part = ensureDataPart<TManifest, TState>(msg, partId, data.metadata);
-    if (data.content !== undefined) part.data = data.content;
-  } else {
-    const part = structuredPart<TManifest>(
-      type,
-      partId,
-      data.content,
-      data.metadata
-    );
-    if (part) msg.parts = [...msg.parts, part];
   }
   return {
     ...thread,
@@ -939,44 +717,9 @@ function applyReasoningDelta<
     thread.messages,
     data
   );
-  const part = ensureReasoningPart<TManifest, TState>(
-    msg,
-    partId,
-    data.metadata
-  );
+  const part = ensureReasoningPart<TManifest, TState>(msg, partId);
   part.content = (part.content || "") + delta;
   part.status = "streaming";
-  return {
-    ...thread,
-    messages: list,
-    agentStatus: "streaming",
-    lastActivity: new Date(),
-  };
-}
-
-function applyDataDelta<
-  TManifest extends ToolManifest = ToolManifest,
-  TState = Record<string, unknown>,
->(
-  thread: ThreadState<TManifest, TState>,
-  data: DataDelta["data"]
-): ThreadState<TManifest, TState> {
-  if (!data) return thread;
-  const partId = data.partId;
-  const messageId = data.messageId;
-  if (
-    !partId ||
-    !messageId ||
-    !Object.prototype.hasOwnProperty.call(data, "delta")
-  ) {
-    return { ...thread };
-  }
-  const { list, msg } = getOrCreateAssistantMessage<TManifest, TState>(
-    thread.messages,
-    data
-  );
-  const part = ensureDataPart<TManifest, TState>(msg, partId, data.metadata);
-  part.data = data.delta;
   return {
     ...thread,
     messages: list,
@@ -1031,52 +774,22 @@ function applyPartCompleted<
   );
 
   if (type === "text") {
-    const text = ensureTextPart<TManifest, TState>(msg, partId);
-    if (typeof finalContent === "string") text.content = finalContent;
-    text.status = "complete";
+    const text = msg.parts.find((p) => p.type === "text" && p.id === partId) as
+      | TextUIPart
+      | undefined;
+    if (text) text.status = "complete";
     return { ...thread, messages: list, lastActivity: new Date() };
   }
 
   if (type === "reasoning") {
-    const part = ensureReasoningPart<TManifest, TState>(
-      msg,
-      partId,
-      data.metadata
-    );
-    if (typeof finalContent === "string") part.content = finalContent;
-    part.status = "complete";
-    return { ...thread, messages: list, lastActivity: new Date() };
-  }
-
-  if (type === "data") {
-    const part = ensureDataPart<TManifest, TState>(msg, partId, data.metadata);
-    if (finalContent !== undefined) part.data = finalContent;
-    return { ...thread, messages: list, lastActivity: new Date() };
-  }
-
-  if (
-    type === "status" ||
-    type === "file" ||
-    type === "source" ||
-    type === "error" ||
-    type === "hitl"
-  ) {
-    const part = structuredPart<TManifest>(
-      type,
-      partId,
-      finalContent,
-      data.metadata
-    );
+    const part = msg.parts.find(
+      (p) => p.type === "reasoning" && p.id === partId
+    ) as ReasoningUIPart | undefined;
     if (part) {
-      const existing = msg.parts.findIndex(
-        (candidate) => candidate.type === type && candidate.id === partId
-      );
-      msg.parts =
-        existing >= 0
-          ? msg.parts.map((candidate, index) =>
-              index === existing ? part : candidate
-            )
-          : [...msg.parts, part];
+      if (typeof finalContent === "string" && finalContent) {
+        part.content = finalContent;
+      }
+      part.status = "complete";
     }
     return { ...thread, messages: list, lastActivity: new Date() };
   }
@@ -1086,15 +799,12 @@ function applyPartCompleted<
       (p) => p.type === "tool-call" && p.toolCallId === partId
     ) as ToolCallUIPart<TManifest> | undefined;
     if (!tool) {
-      const rawData = asRecord(data);
-      const rawMetadata = asRecord(rawData.metadata);
       tool = {
         type: "tool-call",
         toolCallId: partId,
-        toolName: stringValue(
-          rawData.toolName,
-          stringValue(rawMetadata.toolName)
-        ) as keyof TManifest & string,
+        toolName: (data?.toolName ||
+          data?.metadata?.toolName ||
+          "") as keyof TManifest & string,
         state: "input-available",
         input: {} as ToolCallUIPart<TManifest>["input"],
       } as ToolCallUIPart<TManifest>;
@@ -1147,153 +857,6 @@ function applyPartCompleted<
 
   // Fallback: if unknown type, keep thread unchanged except activity
   return { ...thread, messages: list, lastActivity: new Date() };
-}
-
-function applyErrorEvent<
-  TManifest extends ToolManifest = ToolManifest,
-  TState = Record<string, unknown>,
->(
-  thread: ThreadState<TManifest, TState>,
-  data: ErrorEvent["data"],
-  eventId?: string
-): ThreadState<TManifest, TState> {
-  const payload = asRecord(data);
-  const message = stringValue(
-    payload.error,
-    stringValue(payload.message, "Agent run failed")
-  );
-  let messages = thread.messages;
-  const messageId = stringValue(payload.messageId);
-
-  if (messageId) {
-    const result = getOrCreateAssistantMessage<TManifest, TState>(
-      messages,
-      payload
-    );
-    const partId = stringValue(
-      payload.partId,
-      stringValue(eventId, `error-${messageId}`)
-    );
-    const part = structuredPart<TManifest>(
-      "error",
-      partId,
-      { ...payload, error: message },
-      asRecord(payload.metadata)
-    );
-    const existing = result.msg.parts.findIndex(
-      (candidate) => candidate.type === "error" && candidate.id === partId
-    );
-    if (part) {
-      result.msg.parts =
-        existing >= 0
-          ? result.msg.parts.map((candidate, index) =>
-              index === existing ? part : candidate
-            )
-          : [...result.msg.parts, part];
-    }
-    messages = result.list;
-  }
-
-  return {
-    ...thread,
-    messages,
-    agentStatus: "error",
-    error: {
-      message,
-      recoverable:
-        typeof payload.recoverable === "boolean" ? payload.recoverable : false,
-      timestamp: new Date(),
-    },
-    lastActivity: new Date(),
-  };
-}
-
-function applyHitlRequested<
-  TManifest extends ToolManifest = ToolManifest,
-  TState = Record<string, unknown>,
->(
-  thread: ThreadState<TManifest, TState>,
-  data: HitlRequested["data"],
-  eventId?: string
-): ThreadState<TManifest, TState> {
-  const payload = asRecord(data);
-  const messageId = stringValue(payload.messageId);
-  if (!messageId) return thread;
-  const { list, msg } = getOrCreateAssistantMessage<TManifest, TState>(
-    thread.messages,
-    payload
-  );
-  const partId = stringValue(
-    payload.partId,
-    stringValue(payload.requestId, stringValue(eventId))
-  );
-  if (!partId) return thread;
-  const part = structuredPart<TManifest>(
-    "hitl",
-    partId,
-    { ...payload, status: "pending" },
-    asRecord(payload.metadata)
-  );
-  if (part) {
-    msg.parts = [
-      ...msg.parts.filter(
-        (candidate) => !(candidate.type === "hitl" && candidate.id === partId)
-      ),
-      part,
-    ];
-  }
-  return {
-    ...thread,
-    messages: list,
-    agentStatus: "streaming",
-    lastActivity: new Date(),
-  };
-}
-
-function applyHitlResolved<
-  TManifest extends ToolManifest = ToolManifest,
-  TState = Record<string, unknown>,
->(
-  thread: ThreadState<TManifest, TState>,
-  data: HitlResolved["data"]
-): ThreadState<TManifest, TState> {
-  const payload = asRecord(data);
-  const partId = stringValue(payload.partId, stringValue(payload.requestId));
-  if (!partId) return thread;
-
-  let changed = false;
-  const messages = thread.messages.map((message) => {
-    let messageChanged = false;
-    const parts = message.parts.map((part) => {
-      if (part.type !== "hitl" || part.id !== partId) return part;
-      changed = true;
-      messageChanged = true;
-      return {
-        ...part,
-        status: hitlStatusValue(
-          payload.status,
-          payload.approved === true
-            ? "approved"
-            : payload.approved === false
-              ? "denied"
-              : part.status
-        ),
-        resolvedBy: stringValue(payload.resolvedBy) || part.resolvedBy,
-        resolvedAt: stringValue(payload.resolvedAt) || part.resolvedAt,
-      } satisfies HitlUIPart;
-    });
-    return messageChanged ? { ...message, parts } : message;
-  });
-
-  return changed
-    ? {
-        ...thread,
-        messages,
-        agentStatus: "streaming",
-        runActive: true,
-        lastActivity: new Date(),
-      }
-    : thread;
 }
 
 function applyToolArgumentsDelta<

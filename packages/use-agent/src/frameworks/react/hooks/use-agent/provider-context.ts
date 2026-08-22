@@ -1,8 +1,6 @@
 "use client";
 
-import { useContext } from "react";
 import {
-  AgentContext,
   useOptionalGlobalTransport,
   useOptionalGlobalUserId,
   useOptionalGlobalChannelKey,
@@ -14,7 +12,6 @@ import type { IClientTransport } from "../../../../core/ports/transport.js";
 import type { IConnection } from "../../../../core/ports/connection.js";
 
 export interface ProviderContext {
-  hasProvider: boolean;
   userId: string | null;
   channelKey: string | null;
   resolvedChannelKey: string | null;
@@ -28,21 +25,13 @@ export interface ProviderContext {
  * when there is no enclosing AgentProvider.
  */
 export function useProviderContext(): ProviderContext {
-  const context = useContext(AgentContext);
   const userId = useOptionalGlobalUserId();
   const channelKey = useOptionalGlobalChannelKey();
   const resolvedChannelKey = useOptionalGlobalResolvedChannelKey();
   const transport = useOptionalGlobalTransport();
   const connection = useOptionalGlobalConnection();
 
-  return {
-    hasProvider: context !== null,
-    userId,
-    channelKey,
-    resolvedChannelKey,
-    transport,
-    connection,
-  };
+  return { userId, channelKey, resolvedChannelKey, transport, connection };
 }
 
 /**
