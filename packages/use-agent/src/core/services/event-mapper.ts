@@ -68,17 +68,7 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
       const type = data.type;
       const messageId = data.messageId;
       const partId = data.partId;
-      if (
-        type === "text" ||
-        type === "tool-call" ||
-        type === "reasoning" ||
-        type === "data" ||
-        type === "status" ||
-        type === "file" ||
-        type === "source" ||
-        type === "error" ||
-        type === "hitl"
-      ) {
+      if (type === "text" || type === "tool-call" || type === "reasoning") {
         if (typeof messageId === "string" && typeof partId === "string") {
           return {
             event: obj.event,
@@ -87,11 +77,10 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
               messageId,
               partId,
               type,
-              content: data.content,
-              metadata:
-                typeof data.metadata === "object" && data.metadata !== null
-                  ? (data.metadata as JsonObject)
-                  : undefined,
+              metadata: (typeof data.metadata === "object" &&
+              data.metadata !== null
+                ? (data.metadata as JsonObject)
+                : undefined) as { toolName?: string } | undefined,
             },
             timestamp: obj.timestamp,
             sequenceNumber: obj.sequenceNumber,
@@ -119,10 +108,6 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
             messageId,
             partId,
             delta,
-            metadata:
-              typeof data.metadata === "object" && data.metadata !== null
-                ? (data.metadata as JsonObject)
-                : undefined,
           },
           timestamp: obj.timestamp,
           sequenceNumber: obj.sequenceNumber,
@@ -130,46 +115,6 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
         } as AgentKitEvent<TManifest>;
       }
       break;
-    }
-    case "data.delta": {
-      const { messageId, partId } = data as {
-        messageId?: unknown;
-        partId?: unknown;
-      };
-      if (
-        typeof messageId === "string" &&
-        typeof partId === "string" &&
-        Object.prototype.hasOwnProperty.call(data, "delta")
-      ) {
-        return {
-          event: obj.event,
-          data: {
-            threadId: data.threadId as string | undefined,
-            messageId,
-            partId,
-            delta: data.delta,
-            metadata:
-              typeof data.metadata === "object" && data.metadata !== null
-                ? (data.metadata as JsonObject)
-                : undefined,
-          },
-          timestamp: obj.timestamp,
-          sequenceNumber: obj.sequenceNumber,
-          id,
-        } as AgentKitEvent<TManifest>;
-      }
-      break;
-    }
-    case "error":
-    case "hitl.requested":
-    case "hitl.resolved": {
-      return {
-        event: obj.event,
-        data,
-        timestamp: obj.timestamp,
-        sequenceNumber: obj.sequenceNumber,
-        id,
-      } as AgentKitEvent<TManifest>;
     }
     case "text.delta": {
       const { messageId, partId, delta } = data as {
@@ -248,13 +193,7 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
         (type === "text" ||
           type === "tool-call" ||
           type === "tool-output" ||
-          type === "reasoning" ||
-          type === "data" ||
-          type === "status" ||
-          type === "file" ||
-          type === "source" ||
-          type === "error" ||
-          type === "hitl") &&
+          type === "reasoning") &&
         typeof messageId === "string" &&
         typeof partId === "string"
       ) {
@@ -278,10 +217,10 @@ export function mapToNetworkEvent<TManifest extends ToolManifest>(
             type,
             finalContent: (data as { finalContent?: unknown }).finalContent,
             toolName: normalizedToolName,
-            metadata:
-              typeof data.metadata === "object" && data.metadata !== null
-                ? (data.metadata as JsonObject)
-                : undefined,
+            metadata: (typeof data.metadata === "object" &&
+            data.metadata !== null
+              ? (data.metadata as JsonObject)
+              : undefined) as { toolName?: string } | undefined,
           },
           timestamp: obj.timestamp,
           sequenceNumber: obj.sequenceNumber,
