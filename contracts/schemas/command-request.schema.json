@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eadwinCode/agent-kit/contracts/command-request.schema.json",
+  "title": "Command request",
+  "description": "The base shape of a mutating assistant request. AgentKit defines no application identity or authorization fields; adapters derive trusted scope from their authenticated server context and may add their own extension properties.",
+  "type": "object",
+  "required": ["commandId", "type"],
+  "additionalProperties": true,
+  "properties": {
+    "commandId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Idempotency key. The same id with the same payload hash returns the recorded result; the same id with a different payload is rejected as IDEMPOTENCY_KEY_REUSED."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "send",
+        "pause",
+        "resume",
+        "cancel",
+        "approve",
+        "deny",
+        "retry",
+        "edit",
+        "new_chat"
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "approvalId": {
+      "type": "string"
+    },
+    "pauseEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Correlates a resume with the pause it answers, so a stale resume cannot wake a later pause."
+    },
+    "expectedRevision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional CAS precondition. Zero means none."
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}

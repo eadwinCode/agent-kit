@@ -14,7 +14,9 @@ import (
 	"github.com/zendev-sh/goai/provider/anthropic"
 
 	agentkit "github.com/eadwinCode/agent-kit/go"
+	"github.com/eadwinCode/agent-kit/go/conformance"
 	"github.com/eadwinCode/agent-kit/go/durable"
+	"github.com/eadwinCode/agent-kit/go/memadapter"
 )
 
 type state struct {
@@ -118,4 +120,62 @@ func TestStreamingAndServerDocsCompile(t *testing.T) {
 	if err != nil || handler == nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+}
+
+// Runtime ports (README "Runtime ports"). Compile-checks the port wiring and
+// the tool-side structured stream / approval example, so the documented
+// contract cannot drift from the API without a test failure.
+func TestRuntimePortsCompile(t *testing.T) {
+	ports := &agentkit.RuntimePorts{
+		Journal:   memadapter.NewJournal(),
+		State:     memadapter.NewStateStore(),
+		Control:   memadapter.NewControlStore(),
+		Approvals: memadapter.NewApprovalStore(),
+		Finalizer: memadapter.NewFinalizer(),
+		Sink:      memadapter.NewSink(),
+		// The scope is opaque: compose whatever identifies the conversation
+		// owner in your own model.
+		Scope:       agentkit.SessionScope("owner-scope-1"),
+		StreamEpoch: 1,
+	}
+
+	publish := agentkit.NewTool[state]("publish", "Publish the site.",
+		func(ctx context.Context, in struct{}, opts agentkit.ToolOptions[state]) (any, error) {
+			opts.Stream.Status(ctx, agentkit.StatusUpdate{
+				Kind: agentkit.ActivityWriting, Label: "Publishing",
+			})
+			if err := opts.Stream.Checkpoint(ctx, agentkit.CheckpointBeforeSideEffect); err != nil {
+				return nil, err
+			}
+			if _, err := opts.Approvals.Require(ctx, agentkit.ApprovalRequest{
+				RequestID: "approval_" + opts.ToolCallID,
+				ToolName:  "publish",
+				Summary:   "Publish the site",
+			}); err != nil {
+				return nil, err
+			}
+			return map[string]any{"published": true}, nil
+		})
+
+	agent := agentkit.NewAgent(agentkit.AgentConfig[state]{
+		Name: "publisher", Model: anthropic.Chat("claude-sonnet-4-5"),
+		Tools: []agentkit.Tool[state]{publish},
+	})
+	net := agentkit.NewNetwork(agentkit.NetworkConfig[state]{
+		Name: "site", Agents: []*agentkit.Agent[state]{agent}, Ports: ports,
+	})
+
+	opts := &agentkit.NetworkRunOptions[state]{
+		Ports:     ports,
+		Streaming: &agentkit.StreamingConfig{Publish: func(context.Context, agentkit.AgentMessageChunk) error { return nil }},
+	}
+	_, _ = net, opts
+}
+
+// Adapter conformance (README "Runtime ports"). The suite an application's own
+// adapter runs against its own storage.
+func TestConformanceSuiteCompiles(t *testing.T) {
+	conformance.VerifyEventJournal(t, func() agentkit.EventJournal {
+		return memadapter.NewJournal()
+	})
 }

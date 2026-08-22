@@ -1,4 +1,4 @@
-import { generateText, type LanguageModel } from "ai";
+import { generateText, type LanguageModel, type SystemModelMessage } from "ai";
 import {
   messagesToCoreMessages,
   resultToMessages,
@@ -46,13 +46,30 @@ export class AgenticModel {
     tool_choice: Tool.Choice
   ): Promise<AgenticModel.InferenceResponse> {
     const convertOpts = { cacheControl: this.#cacheControl };
-    const messages = messagesToCoreMessages(input, convertOpts);
+    const convertedMessages = messagesToCoreMessages(input, convertOpts);
+    // AI SDK v6 treats system instructions as a privileged input and warns when
+    // they are mixed into `messages`. Keep the internal Message API flexible,
+    // but separate system messages at the SDK boundary. This also preserves
+    // provider options such as Anthropic cache-control markers.
+    const system = convertedMessages.filter(
+      (message): message is SystemModelMessage => message.role === "system"
+    );
+    const messages = convertedMessages.filter(
+      (message) => message.role !== "system"
+    );
+    // The SDK requires at least one conversational message. Preserve AgentKit's
+    // documented system-only invocation by supplying an empty user turn rather
+    // than demoting the system instruction back into the untrusted message list.
+    if (messages.length === 0) {
+      messages.push({ role: "user", content: "" });
+    }
     const aiTools =
       tools.length > 0 ? toolsToAiTools(tools, convertOpts) : undefined;
 
     const doInference = async (): Promise<SerializableResult> => {
       const result = await generateText({
         model: this.#model,
+        system: system.length > 0 ? system : undefined,
         messages,
         tools: aiTools,
         toolChoice: aiTools ? mapToolChoice(tool_choice) : undefined,

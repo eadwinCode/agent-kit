@@ -1,0 +1,222 @@
+{
+  "name": "text-turn",
+  "description": "Reasoning and text deltas for a single-agent turn, with the accepted user message and one terminal.",
+  "schemaVersion": 1,
+  "events": [
+    {
+      "event": "run.started",
+      "data": {
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 0,
+      "id": "publish-0:run.started",
+      "eventId": "<msg:1>:0:0",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "user.message",
+      "data": {
+        "content": "hello",
+        "messageId": "user_msg_1",
+        "role": "user",
+        "runId": "<msg:1>",
+        "threadId": "thread_1",
+        "timestamp": "<time>"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 1,
+      "id": "publish-1:user.message",
+      "eventId": "<msg:1>:0:1",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.started",
+      "data": {
+        "messageId": "<msg:2>",
+        "name": "assistant",
+        "parentRunId": "<msg:1>",
+        "runId": "<run:1>",
+        "scope": "agent",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 2,
+      "id": "publish-2:run.started",
+      "eventId": "<msg:1>:0:2",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.created",
+      "data": {
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant"
+        },
+        "partId": "<part:1>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "reasoning"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 3,
+      "id": "publish-3:part.created",
+      "eventId": "<run:1>:0:3",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "reasoning.delta",
+      "data": {
+        "delta": "The user greeted me.",
+        "messageId": "<msg:2>",
+        "partId": "<part:1>",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 4,
+      "id": "publish-4:reasoning.delta",
+      "eventId": "<run:1>:0:4",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.completed",
+      "data": {
+        "finalContent": "The user greeted me.",
+        "messageId": "<msg:2>",
+        "partId": "<part:1>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "reasoning"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 5,
+      "id": "publish-5:part.completed",
+      "eventId": "<run:1>:0:5",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.created",
+      "data": {
+        "messageId": "<msg:2>",
+        "metadata": {
+          "agentName": "assistant"
+        },
+        "partId": "<part:2>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "text"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 6,
+      "id": "publish-6:part.created",
+      "eventId": "<run:1>:0:6",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "text.delta",
+      "data": {
+        "delta": "Hello",
+        "messageId": "<msg:2>",
+        "partId": "<part:2>",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 7,
+      "id": "publish-7:text.delta",
+      "eventId": "<run:1>:0:7",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "text.delta",
+      "data": {
+        "delta": " there.",
+        "messageId": "<msg:2>",
+        "partId": "<part:2>",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 8,
+      "id": "publish-8:text.delta",
+      "eventId": "<run:1>:0:8",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "part.completed",
+      "data": {
+        "finalContent": "Hello there.",
+        "messageId": "<msg:2>",
+        "partId": "<part:2>",
+        "runId": "<run:1>",
+        "threadId": "thread_1",
+        "type": "text"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 9,
+      "id": "publish-9:part.completed",
+      "eventId": "<run:1>:0:9",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.completed",
+      "data": {
+        "messageId": "<msg:2>",
+        "name": "assistant",
+        "runId": "<run:1>",
+        "scope": "agent",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 10,
+      "id": "publish-10:run.completed",
+      "eventId": "<run:1>:0:10",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.completed",
+      "data": {
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "outcome": "completed",
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 11,
+      "id": "publish-11:run.completed",
+      "eventId": "<msg:1>:0:11",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "stream.ended",
+      "data": {
+        "messageId": "<msg:1>",
+        "outcome": "completed",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 12,
+      "id": "publish-12:stream.ended",
+      "eventId": "<msg:1>:0:12",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    }
+  ]
+}

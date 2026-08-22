@@ -123,3 +123,99 @@ export type {
   IConnectionSubscription,
   IConnectionTokenProvider,
 } from "./core/ports/connection.js";
+
+// =============================================================================
+// SERVER-AUTHORITATIVE SESSION, RECOVERY, AND TYPED ERRORS
+// =============================================================================
+//
+// These are the package-owned replacements for the recovery and adaptation
+// code applications used to keep around the hook: polling loops for active
+// runs, a side variable holding a structured 409, ad-hoc token-refresh
+// retries, and hand-rolled snapshot merging. Every one of them is a contract
+// here, so the behavior is tested once instead of reimplemented per app.
+
+export {
+  AgentTransportError,
+  AgentErrorCodes,
+  isAgentTransportError,
+  isRecoverableStatus,
+  agentTransportErrorFromResponse,
+  agentTransportErrorFromNetwork,
+} from "./core/errors/agent-transport-error.js";
+export type {
+  AgentErrorCode,
+  AgentErrorEnvelope,
+  AgentTransportErrorInit,
+} from "./core/errors/agent-transport-error.js";
+
+export {
+  STREAM_START,
+  supportsAgentSession,
+} from "./core/ports/agent-session.js";
+export type {
+  IAgentSessionTransport,
+  StreamCursor,
+  FetchAgentStateParams,
+  AgentStateResponse,
+  FetchEventTailParams,
+  EventTailPage,
+  AgentCommand,
+  AgentCommandType,
+  AgentCommandResult,
+} from "./core/ports/agent-session.js";
+
+export {
+  hydrateAgentSession,
+  LiveEventBuffer,
+  SequenceGapTracker,
+  sortEnvelopes,
+  envelopeKey,
+  envelopeOrder,
+} from "./core/services/hydration.js";
+export type {
+  HydrationOptions,
+  HydrationResult,
+  HydrationOutcome,
+  SequenceGap,
+  GapAction,
+  GapTrackerOptions,
+} from "./core/services/hydration.js";
+
+export {
+  acquireRealtimeToken,
+  backoffDelay,
+  isAuthFailure,
+  isTransientFailure,
+  normalizeConnectionState,
+  TokenRefreshError,
+} from "./core/services/token-refresh.js";
+export type { TokenRefreshOptions } from "./core/services/token-refresh.js";
+
+export {
+  buildCommand,
+  createCommandId,
+  executeCommand,
+} from "./core/services/commands.js";
+
+export { useAgentSession } from "./frameworks/react/hooks/use-agent-session.js";
+export type {
+  UseAgentSessionConfig,
+  UseAgentSessionReturn,
+  AgentSessionStatus,
+} from "./frameworks/react/hooks/use-agent-session.js";
+export type {
+  BuildCommandParams,
+  ExecuteCommandOptions,
+} from "./core/services/commands.js";
+
+export type {
+  AgentStateSnapshot,
+  StandardEventEnvelope,
+  AgentMessageChunk,
+  ClientConnectionState,
+  RunLifecycle,
+  RunOutcome,
+  PauseState,
+  ActivityKind,
+  ApprovalStatus,
+} from "./types/index.js";

@@ -42,7 +42,7 @@ graph TD
   UI -->|Get subscription token| TokenRoute
   TokenRoute -->|Returns token| UI
   UI -->|Connect and subscribe| Realtime
-  
+
   UI -->|Send message| ChatRoute
   ChatRoute -->|Triggers function| InngestFn
   InngestFn -->|Publishes events| Realtime
@@ -58,6 +58,7 @@ This is a **client-side transport** that manages threads and messages for the cu
 It's important to understand that the session transport still relies on the default HTTP transport to communicate with your backend to initiate agent runs. It doesn't change how the server-side streaming works; it only affects how the conversation history is stored on the client.
 
 This is useful for:
+
 - Building live playgrounds of your agents.
 - Creating temporary chat sessions that are discarded when the browser tab is closed.
 - Reducing database load for non-essential conversations.
@@ -77,29 +78,29 @@ If you provide a partial configuration, it will be merged with the default trans
 ```tsx
 import { AgentProvider } from "@inngest/use-agent";
 
-function App({ userId, getAuthToken, getTenantId }) {
+function App({ userId, getAuthToken }) {
   return (
     <AgentProvider
       userId={userId}
       transport={{
         // Use a different base URL for all API calls
-        baseURL: 'https://api.example.com/v2',
+        baseURL: "https://api.example.com/v2",
 
         // Override the default API endpoints
         api: {
-          sendMessage: '/chat',
-          fetchThreads: '/threads'
+          sendMessage: "/chat",
+          fetchThreads: "/threads",
         },
-        
+
         // Add dynamic Authorization header to all requests
         headers: () => ({
-          'Authorization': `Bearer ${getAuthToken()}`,
+          Authorization: `Bearer ${getAuthToken()}`,
         }),
 
-        // Add a tenantId to the body of all requests
-        body: () => ({
-          tenantId: getTenantId(),
-        })
+        // Add only non-authoritative application metadata here. The server
+        // derives identity and authorization scope from the authenticated
+        // session; request-body identifiers are never trusted.
+        body: () => ({ clientVersion: "web-2" }),
       }}
     >
       <ChatApp />
@@ -108,11 +109,17 @@ function App({ userId, getAuthToken, getTenantId }) {
 }
 ```
 
+Transport bodies are extensible, but extension fields are application data,
+not proof of identity or access. Resolve the authorized owner on the server
+from the bearer token or secure session cookie and verify every thread,
+channel, and run against it.
+
 ## Transport API Reference
 
 The `IClientTransport` interface defines the methods that a transport must implement. Here is a reference for each method and its associated data structures.
 
 ### `sendMessage(params, options?)`
+
 Sends a message from the user to the agent.
 
 - `params`: `SendMessageParams`
@@ -131,6 +138,7 @@ Sends a message from the user to the agent.
 - **Returns**: `Promise<{ success: boolean; threadId: string }>`
 
 ### `getRealtimeToken(params, options?)`
+
 Fetches a token for connecting to the real-time service.
 
 - `params`: `GetRealtimeTokenParams`
@@ -144,6 +152,7 @@ Fetches a token for connecting to the real-time service.
   - `channel?`: `string` - Optional channel information.
 
 ### `fetchHistory(params, options?)`
+
 Fetches the message history for a specific thread.
 
 - `params`: `FetchHistoryParams`
@@ -154,6 +163,7 @@ Fetches the message history for a specific thread.
 ## Experimental Methods
 
 ### `fetchThreads(params, options?)`
+
 Fetches a paginated list of conversation threads.
 
 - `params`: `FetchThreadsParams`
@@ -170,6 +180,7 @@ Fetches a paginated list of conversation threads.
   - `total`: `number` - The total number of threads.
 
 ### `createThread(params, options?)`
+
 Creates a new conversation thread.
 
 - `params`: `CreateThreadParams`
@@ -181,6 +192,7 @@ Creates a new conversation thread.
 - **Returns**: `Promise<{ threadId: string; title: string }>`
 
 ### `deleteThread(params, options?)`
+
 Deletes a conversation thread.
 
 - `params`: `DeleteThreadParams`

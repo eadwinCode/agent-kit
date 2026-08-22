@@ -201,6 +201,91 @@ net := agentkit.NewNetwork(agentkit.NetworkConfig[state]{
 > return them from `Get`. See `examples/go-chat/server/store.go` for a
 > SQLite implementation.
 
+## Runtime ports
+
+`HistoryConfig` answers "where do messages live". The runtime ports answer the
+questions that only matter once a run outlives the browser tab that started
+it: what happens when the socket drops mid-turn, when a second tab joins, when
+the user hits Pause, when a tool needs a human decision, and when the
+application still has billing and cleanup to settle before anyone should see a
+terminal.
+
+Every port is an interface AgentKit publishes and invokes; the application
+supplies an implementation backed by its own database, workflow engine and
+policy. Each one is independently optional — a nil field just disables that
+capability.
+
+| Port               | AgentKit's lifecycle role                                                                            |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| `EventJournal`     | Every standard envelope is appended **before** live fan-out, so a reconnecting client can replay it.  |
+| `StateStore`       | Versioned session state with compare-and-swap, so concurrent commands serialize instead of clobbering. |
+| `ControlStore`     | Pause/resume/cancel intent, consulted at every safe boundary.                                          |
+| `ApprovalStore`    | Issue → wait → resolve once → consume once, replay-safe at each step.                                  |
+| `StreamSink`       | Outbound delivery, when the application owns transport and backpressure.                               |
+| `Finalizer`        | Holds the terminal until the application's durable facts have settled.                                 |
+
+```go
+ports := &agentkit.RuntimePorts{
+	Journal:   myJournal,   // agentkit.EventJournal
+	State:     myState,     // agentkit.StateStore
+	Control:   myControl,   // agentkit.ControlStore
+	Approvals: myApprovals, // agentkit.ApprovalStore
+	Finalizer: myFinalizer, // agentkit.Finalizer
+	// Scope is an OPAQUE owner token. AgentKit never parses it and assumes
+	// no tenancy model: compose whatever identifies the conversation owner
+	// in yours — a composite key, a UUID, an opaque handle. Structured
+	// context an adapter needs travels in context.Context, which every port
+	// method already receives.
+	Scope: agentkit.SessionScope(ownerKey),
+	// Bump on a resumed or restarted run so clients discard a stale tail.
+	StreamEpoch: epoch,
+}
+
+run, err := net.Run(ctx, input, &agentkit.NetworkRunOptions[state]{
+	Ports:     ports,
+	Streaming: &agentkit.StreamingConfig{Publish: publish},
+})
+```
+
+Pause takes effect at the next **safe boundary** — after the active inference
+records its complete result, before a returned tool executes, or between
+network iterations. A provider request cannot be frozen mid-token, so v1 never
+tries; a tool that has begun an atomic side effect finishes it first. Tools
+declare their own boundaries:
+
+```go
+tool := agentkit.NewTool[state]("publish", "Publish the site.",
+	func(ctx context.Context, in struct{}, opts agentkit.ToolOptions[state]) (any, error) {
+		opts.Stream.Status(ctx, agentkit.StatusUpdate{
+			Kind: agentkit.ActivityWriting, Label: "Publishing",
+		})
+		// A pause accepted here costs nothing: nothing irreversible has run.
+		if err := opts.Stream.Checkpoint(ctx, agentkit.CheckpointBeforeSideEffect); err != nil {
+			return nil, err
+		}
+		if _, err := opts.Approvals.Require(ctx, agentkit.ApprovalRequest{
+			RequestID: "approval_" + opts.ToolCallID,
+			ToolName:  "publish",
+			Summary:   "Publish the site",
+		}); err != nil {
+			return nil, err // denied, expired, or already consumed
+		}
+		return publishSite(ctx)
+	})
+```
+
+Testing an adapter: [`go/conformance`](./conformance) exports a suite for each
+port, and [`go/memadapter`](./memadapter) is an in-memory reference that runs
+it.
+
+```go
+func TestMyJournal(t *testing.T) {
+	conformance.VerifyEventJournal(t, func() agentkit.EventJournal {
+		return newMyJournal(t)
+	})
+}
+```
+
 ## Serving on Inngest
 
 ```go

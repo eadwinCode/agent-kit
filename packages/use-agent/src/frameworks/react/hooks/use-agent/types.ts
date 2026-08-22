@@ -75,6 +75,8 @@ export type UseAgentsConfig<
     nextCursorId?: string | null;
   }>;
   fetchHistory?: (threadId: string) => Promise<unknown[]>;
+  /** Fetch standard envelopes for the current active run, in reducer order. */
+  fetchRunEvents?: (threadId: string) => Promise<unknown[]>;
   createThread?: (
     userId: string
   ) => Promise<{ threadId: string; title: string }>;

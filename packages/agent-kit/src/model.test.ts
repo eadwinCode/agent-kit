@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/require-await */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { z } from "zod";
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import { AgenticModel, createAgenticModelFromLanguageModel } from "./model";
@@ -26,6 +26,35 @@ function systemPromptMessage(options: LanguageModelV3CallOptions) {
 }
 
 describe("AgenticModel", () => {
+  it("uses the privileged system channel and supports a system-only prompt", async () => {
+    let captured: LanguageModelV3CallOptions | undefined;
+    const model = createMockModel({
+      text: "Hello",
+      onGenerate: (options) => {
+        captured = options;
+      },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const agentic = new AgenticModel(model);
+      await agentic.infer(
+        "test-step",
+        [{ type: "text", role: "system", content: "You are helpful." }],
+        [],
+        "auto"
+      );
+
+      expect(warning).not.toHaveBeenCalled();
+      expect(captured?.prompt).toEqual([
+        { role: "system", content: "You are helpful." },
+        { role: "user", content: [{ type: "text", text: "" }] },
+      ]);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it("infers a text response", async () => {
     const model = createMockModel({ text: "Hello world" });
     const agentic = new AgenticModel(model);

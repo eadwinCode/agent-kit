@@ -23,8 +23,15 @@ export default tseslint.config(
       parserOptions: {
         projectService: true,
         tsconfigRootDir: import.meta.dirname,
-        allowDefaultProject: true,
       },
+    },
+  },
+  {
+    ...tseslint.configs.disableTypeChecked,
+    files: ["**/*.mjs"],
+    languageOptions: {
+      ...tseslint.configs.disableTypeChecked.languageOptions,
+      globals: { console: "readonly", process: "readonly" },
     },
   },
   eslintPluginPrettierRecommended,

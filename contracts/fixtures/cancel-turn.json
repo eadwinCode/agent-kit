@@ -1,0 +1,91 @@
+{
+  "name": "cancel-turn",
+  "description": "A cancel accepted before the first inference: one cancelled terminal, no partial output claimed as success.",
+  "schemaVersion": 1,
+  "events": [
+    {
+      "event": "run.started",
+      "data": {
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 0,
+      "id": "publish-0:run.started",
+      "eventId": "<msg:1>:0:0",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "user.message",
+      "data": {
+        "content": "hello",
+        "messageId": "user_msg_1",
+        "role": "user",
+        "runId": "<msg:1>",
+        "threadId": "thread_1",
+        "timestamp": "<time>"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 1,
+      "id": "publish-1:user.message",
+      "eventId": "<msg:1>:0:1",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.failed",
+      "data": {
+        "cancelled": true,
+        "error": "agentkit: run cancelled",
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "recoverable": false,
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 2,
+      "id": "publish-2:run.failed",
+      "eventId": "<msg:1>:0:2",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "run.completed",
+      "data": {
+        "messageId": "<msg:1>",
+        "name": "editor",
+        "outcome": "cancelled",
+        "runId": "<msg:1>",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 3,
+      "id": "publish-3:run.completed",
+      "eventId": "<msg:1>:0:3",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    },
+    {
+      "event": "stream.ended",
+      "data": {
+        "messageId": "<msg:1>",
+        "outcome": "cancelled",
+        "scope": "network",
+        "threadId": "thread_1"
+      },
+      "timestamp": 0,
+      "sequenceNumber": 4,
+      "id": "publish-4:stream.ended",
+      "eventId": "<msg:1>:0:4",
+      "streamEpoch": 0,
+      "schemaVersion": 1
+    }
+  ]
+}

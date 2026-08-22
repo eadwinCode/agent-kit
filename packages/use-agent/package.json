@@ -51,17 +51,27 @@
     "@types/node": "^22.9.1",
     "@types/react": "^18.2.0",
     "@types/uuid": "^10.0.0",
-    "eslint": "^9.15.0",
+    "eslint": "^9.39.5",
     "jsdom": "^26.1.0",
-    "tsup": "^8.0.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.8"
+    "vitest": "^3.2.7"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@inngest/realtime": ">=0.4.0",
+    "@inngest/realtime": "^0.4.7",
     "@tanstack/react-query": "^5.87.4"
+  },
+  "pnpm": {
+    "overrides": {
+      "brace-expansion@>=2.0.0 <2.1.4": "2.1.4",
+      "esbuild@>=0.27.3 <0.28.1": "0.28.1",
+      "glob@>=10.2.0 <10.5.0": "10.5.0",
+      "minimatch@>=9.0.0 <9.0.7": "9.0.7",
+      "uuid@>=11.0.0 <11.1.1": "11.1.1",
+      "ws@>=8.0.0 <8.21.0": "8.21.0"
+    }
   }
 }

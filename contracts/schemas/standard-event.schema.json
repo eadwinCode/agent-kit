@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eadwinCode/agent-kit/contracts/standard-event.schema.json",
+  "title": "Standard event envelope",
+  "description": "The wire envelope every AgentKit runtime produces and every client reduces. Identity fields are what make recovery possible: eventId dedupes, streamEpoch discards a stale tail, and sequenceNumber is gapless within an epoch.",
+  "type": "object",
+  "required": [
+    "event",
+    "data",
+    "timestamp",
+    "sequenceNumber",
+    "id",
+    "eventId",
+    "streamEpoch",
+    "schemaVersion"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "event": {
+      "type": "string",
+      "enum": [
+        "run.started",
+        "run.completed",
+        "run.failed",
+        "run.interrupted",
+        "step.started",
+        "step.completed",
+        "step.failed",
+        "part.created",
+        "part.completed",
+        "part.failed",
+        "text.delta",
+        "tool_call.arguments.delta",
+        "tool_call.output.delta",
+        "reasoning.delta",
+        "data.delta",
+        "data.part",
+        "hitl.requested",
+        "hitl.resolved",
+        "usage.updated",
+        "metadata.updated",
+        "state.updated",
+        "status.updated",
+        "user.message",
+        "stream.ended",
+        "error"
+      ]
+    },
+    "data": {
+      "type": "object",
+      "description": "Event-specific payload. Carried opaquely end to end: a journal must round-trip it byte for byte."
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds. Zero in frozen fixtures."
+    },
+    "sequenceNumber": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Gapless and monotonic within one streamEpoch, shared by a network run and its agents."
+    },
+    "id": {
+      "type": "string",
+      "description": "Suggested durable-publish step id: publish-<seq>:<event>, or publish-e<epoch>-<seq>:<event> once epochs are in use."
+    },
+    "eventId": {
+      "type": "string",
+      "description": "Replay-stable identity for one logical event: <runId>:<streamEpoch>:<sequenceNumber>. The client's dedupe key."
+    },
+    "streamEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Production epoch. A resumed or restarted run increments it and resets sequenceNumber."
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    }
+  }
+}

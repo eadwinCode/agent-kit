@@ -146,7 +146,7 @@ func waitSignal(t *testing.T, signal <-chan struct{}, name string) {
 
 func TestChunkEnvelopeWireShape(t *testing.T) {
 	cap := &capturePublisher{}
-	sc := newStreamingContext(StreamingConfig{Publish: cap.publish}, "run_1", "msg_1", "network", "th_1", "user_1")
+	sc := newStreamingContext(StreamingConfig{Publish: cap.publish}, nil, "run_1", "msg_1", "network", "th_1", "user_1")
 	sc.PublishEvent(context.Background(), EventRunStarted, map[string]any{"runId": "run_1"})
 
 	c := cap.chunks[0]
@@ -175,8 +175,7 @@ func TestChunkEnvelopeWireShape(t *testing.T) {
 
 func TestChunkContentBudget(t *testing.T) {
 	// Chunking off: one delta regardless of size.
-	off := newStreamingContext(StreamingConfig{Publish: func(ctx context.Context, c AgentMessageChunk) error { return nil }},
-		"r", "m", "agent", "", "")
+	off := newStreamingContext(StreamingConfig{Publish: func(ctx context.Context, c AgentMessageChunk) error { return nil }}, nil, "r", "m", "agent", "", "")
 	if got := off.ChunkContent(strings.Repeat("x", 10_000)); len(got) != 1 {
 		t.Errorf("chunking off must emit one delta, got %d", len(got))
 	}
@@ -188,7 +187,7 @@ func TestChunkContentBudget(t *testing.T) {
 	on := newStreamingContext(StreamingConfig{
 		Publish:          func(ctx context.Context, c AgentMessageChunk) error { return nil },
 		SimulateChunking: true, ChunkSize: 10, MaxChunksPerMessage: 5,
-	}, "r", "m", "agent", "", "")
+	}, nil, "r", "m", "agent", "", "")
 	if got := on.ChunkContent(strings.Repeat("x", 30)); len(got) != 3 {
 		t.Errorf("30 chars / size 10 = 3 chunks, got %d", len(got))
 	}
@@ -204,7 +203,7 @@ func TestChunkContentBudget(t *testing.T) {
 
 func TestSharedSequenceAcrossScopes(t *testing.T) {
 	cap := &capturePublisher{}
-	network := newStreamingContext(StreamingConfig{Publish: cap.publish}, "net_run", "net_run", "network", "", "")
+	network := newStreamingContext(StreamingConfig{Publish: cap.publish}, nil, "net_run", "net_run", "network", "", "")
 	agent := network.WithSharedSequence("agent_run", "agent_msg", "agent")
 
 	network.PublishEvent(context.Background(), EventRunStarted, map[string]any{})
@@ -222,8 +221,7 @@ func TestSharedSequenceAcrossScopes(t *testing.T) {
 }
 
 func TestGeneratePartIDLength(t *testing.T) {
-	sc := newStreamingContext(StreamingConfig{Publish: func(ctx context.Context, c AgentMessageChunk) error { return nil }},
-		"r", "0195b2aa-7cf3-7893-a2bc-0123456789ab", "agent", "", "")
+	sc := newStreamingContext(StreamingConfig{Publish: func(ctx context.Context, c AgentMessageChunk) error { return nil }}, nil, "r", "0195b2aa-7cf3-7893-a2bc-0123456789ab", "agent", "", "")
 	id := sc.GeneratePartID()
 	if len(id) > 40 {
 		t.Errorf("part id exceeds OpenAI's 40-char limit: %q (%d)", id, len(id))
@@ -600,7 +598,7 @@ func TestTrueModelStreamingCancellationAndErrors(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancellation error = %v", err)
 		}
-		assertFailedOpenPart(t, cap.snapshot(), context.Canceled.Error())
+		assertFailedOpenPart(t, cap.snapshot(), "The provider stream ended unexpectedly.")
 	})
 
 	t.Run("provider stream error fails the open part", func(t *testing.T) {
@@ -618,7 +616,7 @@ func TestTrueModelStreamingCancellationAndErrors(t *testing.T) {
 		if !errors.Is(err, boom) {
 			t.Fatalf("stream error = %v", err)
 		}
-		assertFailedOpenPart(t, cap.snapshot(), boom.Error())
+		assertFailedOpenPart(t, cap.snapshot(), "The provider stream ended unexpectedly.")
 	})
 }
 
@@ -653,8 +651,8 @@ func assertFailedOpenPart(t *testing.T, chunks []AgentMessageChunk, errorText st
 }
 
 func TestStableProviderPartIdentity(t *testing.T) {
-	a := newStreamingContext(StreamingConfig{}, "run", "message", "agent", "", "")
-	b := newStreamingContext(StreamingConfig{}, "run", "message", "agent", "", "")
+	a := newStreamingContext(StreamingConfig{}, nil, "run", "message", "agent", "", "")
+	b := newStreamingContext(StreamingConfig{}, nil, "run", "message", "agent", "", "")
 	if a.stablePartID("text", 2, 3) != b.stablePartID("text", 2, 3) {
 		t.Fatal("identical inference coordinates must produce replay-stable part ids")
 	}
@@ -745,7 +743,7 @@ func TestDurablePublishUsesChunkID(t *testing.T) {
 	// Inline step still routes through the JSON round-trip, proving the
 	// chunk survives memoization.
 	pub := DurablePublish(inlineStepRecorder{}, cap.publish)
-	sc := newStreamingContext(StreamingConfig{Publish: pub}, "r", "m", "agent", "", "")
+	sc := newStreamingContext(StreamingConfig{Publish: pub}, nil, "r", "m", "agent", "", "")
 	sc.PublishEvent(context.Background(), EventTextDelta, map[string]any{"delta": "x"})
 	if len(cap.chunks) != 1 || cap.chunks[0].Data["delta"] != "x" {
 		t.Fatalf("durable publish did not deliver: %+v", cap.chunks)

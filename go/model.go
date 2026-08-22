@@ -46,7 +46,7 @@ func WithCacheControl(enabled bool) AgenticModelOption {
 //	)
 //
 // (This replaces the TS wrapLanguageModel + defaultSettingsMiddleware
-// pattern Clevix uses; note thinking keys are AI-SDK camelCase.)
+// pattern; note thinking keys are AI-SDK camelCase.)
 func WithCallOptions(opts ...goai.Option) AgenticModelOption {
 	return func(m *AgenticModel) { m.callOptions = append(m.callOptions, opts...) }
 }
@@ -89,6 +89,12 @@ type InferenceResponse struct {
 	// trueStreaming distinguishes new streaming durable results from legacy
 	// GenerateText results cached under the same inference step id.
 	trueStreaming bool
+
+	// streamedToolCalls lists the provider tool-call ids whose argument
+	// parts the inference stream already published. It crosses the durable
+	// boundary so a replay — whose callbacks never run — knows the same
+	// parts were emitted and does not publish them twice.
+	streamedToolCalls []string
 }
 
 // InferenceChunkFn receives raw GoAI provider chunks synchronously as they
@@ -131,12 +137,13 @@ func (m *AgenticModel) InferStream(
 	toolChoice string,
 	onChunk InferenceChunkFn,
 ) (*InferenceResponse, error) {
-	return m.inferStream(ctx, stepID, input, tools, toolChoice, onChunk, nil, nil)
+	return m.inferStream(ctx, stepID, input, tools, toolChoice, onChunk, nil, nil, nil)
 }
 
 type durableInferenceStreamResult struct {
 	SerializableResult
-	StreamEventCount *int `json:"_agentkitStreamEventCount,omitempty"`
+	StreamEventCount  *int     `json:"_agentkitStreamEventCount,omitempty"`
+	StreamedToolCalls []string `json:"_agentkitStreamedToolCalls,omitempty"`
 }
 
 func (m *AgenticModel) inferStream(
@@ -148,6 +155,7 @@ func (m *AgenticModel) inferStream(
 	onChunk InferenceChunkFn,
 	onDone func(error),
 	eventCount func() int,
+	streamedToolCalls func() []string,
 ) (*InferenceResponse, error) {
 	conv := MessagesToProviderMessages(input)
 	goaiTools := ToolsToProviderTools(tools)
@@ -179,9 +187,14 @@ func (m *AgenticModel) inferStream(
 		if eventCount != nil {
 			count = eventCount()
 		}
+		var streamed []string
+		if streamedToolCalls != nil {
+			streamed = streamedToolCalls()
+		}
 		return durableInferenceStreamResult{
 			SerializableResult: toSerializableStreamResult(res),
 			StreamEventCount:   &count,
+			StreamedToolCalls:  streamed,
 		}, nil
 	})
 	if err != nil {
@@ -190,8 +203,9 @@ func (m *AgenticModel) inferStream(
 
 	return &InferenceResponse{
 		Output: ResultToMessages(payload.SerializableResult), Raw: payload.SerializableResult,
-		streamEventCount: valueOrZero(payload.StreamEventCount),
-		trueStreaming:    payload.StreamEventCount != nil,
+		streamEventCount:  valueOrZero(payload.StreamEventCount),
+		trueStreaming:     payload.StreamEventCount != nil,
+		streamedToolCalls: payload.StreamedToolCalls,
 	}, nil
 }
 

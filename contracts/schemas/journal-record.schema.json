@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eadwinCode/agent-kit/contracts/journal-record.schema.json",
+  "title": "Event journal record",
+  "description": "One standard event as the durable replay store holds it. Appended before live fan-out, idempotent on eventId, and ordered by (streamEpoch, sequenceNumber, eventId). This is a short-lived transport journal, never conversation history.",
+  "type": "object",
+  "required": [
+    "scope",
+    "schemaVersion",
+    "eventId",
+    "event",
+    "threadId",
+    "runId",
+    "streamEpoch",
+    "sequenceNumber",
+    "timestamp",
+    "data"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "scope": {
+      "type": "string",
+      "description": "Opaque conversation-owner identity; adapters compare it but never decompose it."
+    },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "eventId": { "type": "string" },
+    "event": { "type": "string" },
+    "threadId": { "type": "string" },
+    "runId": { "type": "string" },
+    "streamEpoch": { "type": "integer", "minimum": 0 },
+    "sequenceNumber": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "integer" },
+    "data": { "description": "Opaque payload, round-tripped byte for byte." }
+  }
+}
