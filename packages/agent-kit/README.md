@@ -500,6 +500,7 @@ Try this agent network locally: [https://github.com/inngest/agent-kit/tree/main/
 
 ## Examples
 
+- [**Stateful React + Go session lab**](https://github.com/inngest/agent-kit/tree/main/examples/stateful-react-go#readme) demonstrates the new `useAgentSession` API with GPT-5.6 Luna, durable replay, pause/resume/cancel, approvals, structured progress, typed failures, canonical history, and exactly-once finalization.
 - [**The AgentKit SWE-bench example**](https://github.com/inngest/agent-kit/tree/main/examples/swebench#readme) demonstrates how to build a network of agents solving a complex SWE bench challenge.
 - [**The Simple Search Agent**](https://github.com/inngest/agent-kit/tree/main/examples/simple-search-stagehand#readme) navigates the web autonomously to answer the given question
 - [**The Support Agent**](https://github.com/inngest/agent-kit/tree/main/examples/support-agent-human-in-the-loop#readme) demonstrates how Inngest’s `waitForEvent()` enables the Agent to ask a human for help.
