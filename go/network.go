@@ -405,6 +405,14 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		// state and live drain BEFORE the terminal is published.
 		terminal := newTerminalEmitter(sc, ports, sc.journal, controller, "network", r.Name, networkRunID)
 		defer func() {
+			if p := recover(); p != nil {
+				// A ControlHijack unwind is the executor parking this
+				// invocation to run a step — the run has NOT finished, and
+				// emitting a terminal here publishes a premature
+				// run.completed/stream.ended on every step boundary. Real
+				// panics are owned by the executor's function.failed path.
+				panic(p)
+			}
 			extra := map[string]any{"messageId": networkRunID}
 			reason := ""
 			if r.StoppedBy != nil {

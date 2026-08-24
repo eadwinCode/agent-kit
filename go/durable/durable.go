@@ -39,6 +39,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
+	"strings"
 
 	"github.com/inngest/inngestgo/step"
 
@@ -68,6 +70,27 @@ type Step interface {
 // This replaces the TypeScript package's getStepTools() detection and the
 // `step ? step.run(...) : fn()` branching at every call site.
 func Inngest() Step { return InngestStep{} }
+
+// IsControlHijack reports whether a recovered panic value is inngestgo's
+// step-suspension sentinel. The sentinel's type lives in an internal SDK
+// package, so it cannot be named here; the name-plus-path check is the
+// documented shape of it.
+//
+// Deferred cleanup uses this to tell a step suspension apart from a real
+// exit: a ControlHijack unwind means the executor is parking this invocation
+// to run a step, NOT that the function finished. Terminal emitters,
+// finalizers and billing must not run on that path — they must re-panic and
+// wait for the invocation that actually completes. Deferred code that
+// recovers a hijack and does not re-panic turns the function into one that
+// silently completes instead of suspending (see the package doc).
+func IsControlHijack(recovered any) bool {
+	if recovered == nil {
+		return false
+	}
+	t := reflect.TypeOf(recovered)
+	return t.Name() == "ControlHijack" &&
+		strings.HasSuffix(t.PkgPath(), "/internal/sdkrequest")
+}
 
 // InngestStep implements Step on the Inngest Go SDK. See Inngest.
 type InngestStep struct{}
