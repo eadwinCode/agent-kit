@@ -362,8 +362,14 @@ func (a *Agent[T]) Run(ctx context.Context, input string, opts *RunOptions[T]) (
 		terminal := newTerminalEmitter(sc, ports, sc.journal, controller, "agent", a.Name, sc.MessageID)
 		defer func() {
 			// See network.go: a ControlHijack unwind is a step suspension,
-			// not the end of the run. Re-panic it un-emitted.
+			// not the end of the run. Re-panic it un-emitted. A real panic
+			// IS the end of the run — settle and publish the failed
+			// terminal, then re-panic so the executor sees the crash.
 			if p := recover(); p != nil {
+				if durable.IsControlHijack(p) {
+					panic(p)
+				}
+				terminal.Emit(ctx, fmt.Errorf("agentkit: agent run panicked: %v", p), "", nil)
 				panic(p)
 			}
 			terminal.Emit(ctx, err, "", nil)

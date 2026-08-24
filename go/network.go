@@ -409,8 +409,14 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 				// A ControlHijack unwind is the executor parking this
 				// invocation to run a step — the run has NOT finished, and
 				// emitting a terminal here publishes a premature
-				// run.completed/stream.ended on every step boundary. Real
-				// panics are owned by the executor's function.failed path.
+				// run.completed/stream.ended on every step boundary.
+				if durable.IsControlHijack(p) {
+					panic(p)
+				}
+				// A REAL panic ends the run: settle history/billing and
+				// publish the failed terminal so subscribers unstick, then
+				// re-panic so the executor still records the crash.
+				terminal.Emit(ctx, fmt.Errorf("agentkit: network run panicked: %v", p), "", map[string]any{"messageId": networkRunID})
 				panic(p)
 			}
 			extra := map[string]any{"messageId": networkRunID}
