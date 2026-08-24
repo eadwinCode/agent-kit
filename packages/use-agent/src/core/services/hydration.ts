@@ -440,6 +440,8 @@ export interface GapTrackerOptions {
    */
   timeoutMs?: number;
   now?: () => number;
+  /** Upper bound on remembered event ids used for replay dedupe. */
+  maxAppliedIds?: number;
 }
 
 /** What the caller should do about the current live stream. */
@@ -461,18 +463,29 @@ export class SequenceGapTracker {
   private runId = "";
   private pending = new Map<number, StandardEventEnvelope>();
   private gap: SequenceGap | null = null;
+  // Durable executors re-publish already-journaled events when a replay's
+  // allocation order drifts; the replayed copy then carries a FRESH sequence
+  // number and slips past the sequence checks below. The event id is the only
+  // replay-stable identity the envelope has, so steady-state dedupe keys on
+  // it. Bounded FIFO: the set only has to outlive a replay window, not the run.
+  private appliedIds = new Set<string>();
+  private appliedOrder: string[] = [];
+  private readonly maxAppliedIds: number;
   private readonly timeoutMs: number;
   private readonly now: () => number;
 
   constructor(options: GapTrackerOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? 5000;
     this.now = options.now ?? (() => Date.now());
+    this.maxAppliedIds = options.maxAppliedIds ?? 2000;
   }
 
   /** Positions the tracker after hydration. */
   reset(cursor: StreamCursor | null): void {
     this.pending.clear();
     this.gap = null;
+    this.appliedIds.clear();
+    this.appliedOrder = [];
     if (!cursor) {
       this.expected = null;
       this.epoch = 0;
@@ -490,17 +503,45 @@ export class SequenceGapTracker {
     return this.gap;
   }
 
+  private alreadyApplied(envelope: StandardEventEnvelope): boolean {
+    const id = envelope.eventId ?? envelope.id;
+    return typeof id === "string" && id !== "" && this.appliedIds.has(id);
+  }
+
+  private markApplied(events: StandardEventEnvelope[]): void {
+    for (const envelope of events) {
+      const id = envelope.eventId ?? envelope.id;
+      if (typeof id !== "string" || id === "" || this.appliedIds.has(id)) {
+        continue;
+      }
+      this.appliedIds.add(id);
+      this.appliedOrder.push(id);
+    }
+    while (this.appliedOrder.length > this.maxAppliedIds) {
+      const evicted = this.appliedOrder.shift();
+      if (evicted !== undefined) this.appliedIds.delete(evicted);
+    }
+  }
+
   /**
    * Offers one envelope. Returns what the caller should do next.
    */
   accept(envelope: StandardEventEnvelope): GapAction {
     const epoch = envelope.streamEpoch ?? 0;
 
+    if (this.alreadyApplied(envelope)) {
+      // A durable-executor replay re-published an event this client already
+      // reduced; drifted numbering means the sequence checks below cannot
+      // recognize it, but the replay-stable event id can.
+      return { type: "apply", events: [] };
+    }
+
     if (this.expected === null) {
       this.epoch = epoch;
       this.runId =
         typeof envelope.data?.runId === "string" ? envelope.data.runId : "";
       this.expected = envelope.sequenceNumber + 1;
+      this.markApplied([envelope]);
       return { type: "apply", events: [envelope] };
     }
 
@@ -510,7 +551,10 @@ export class SequenceGapTracker {
       this.epoch = epoch;
       this.pending.clear();
       this.gap = null;
+      this.appliedIds.clear();
+      this.appliedOrder = [];
       this.expected = envelope.sequenceNumber + 1;
+      this.markApplied([envelope]);
       return { type: "apply", events: [envelope] };
     }
 
@@ -535,6 +579,7 @@ export class SequenceGapTracker {
         this.expected++;
       }
       if (this.gap && this.expected > this.gap.waitingOn) this.gap = null;
+      this.markApplied(ready);
       return { type: "apply", events: ready };
     }
 
@@ -581,6 +626,7 @@ export class SequenceGapTracker {
       this.expected++;
     }
     if (this.gap && this.expected > this.gap.waitingOn) this.gap = null;
+    this.markApplied(ready);
     return ready;
   }
 

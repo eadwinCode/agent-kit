@@ -442,6 +442,37 @@ describe("SequenceGapTracker", () => {
       events: [],
     });
   });
+
+  it("drops a replayed copy whose sequence number drifted", () => {
+    // Durable executors re-publish journaled events on replay; when the
+    // replay's allocation order differs, the copy arrives with a FRESH
+    // sequence number and the sequence checks alone cannot recognize it.
+    const tracker = new SequenceGapTracker();
+    tracker.reset({ runId: "run_1", streamEpoch: 0, sequenceNumber: STREAM_START });
+
+    expect(tracker.accept(envelope(0, "run.started")).type).toBe("apply");
+    tracker.accept(envelope(1));
+    tracker.accept(envelope(2, "run.completed"));
+    tracker.accept(envelope(3, "stream.ended"));
+
+    // The replay's copy of run.started: same event id, drifted sequence.
+    const replayed = { ...envelope(7, "run.started"), eventId: "run_1:0:0" };
+    expect(tracker.accept(replayed)).toEqual({ type: "apply", events: [] });
+  });
+
+  it("forgets applied ids when a new epoch supersedes the run", () => {
+    const tracker = new SequenceGapTracker();
+    tracker.reset({ runId: "run_1", streamEpoch: 0, sequenceNumber: STREAM_START });
+    tracker.accept(envelope(0, "run.started"));
+
+    // Epoch 1 restarts the sequence at 0; its events may share the same id
+    // shape as epoch 0's and must still apply.
+    const action = tracker.accept(envelope(0, "run.started", 1));
+    expect(action).toEqual({
+      type: "apply",
+      events: [expect.objectContaining({ streamEpoch: 1 })],
+    });
+  });
 });
 
 describe("LiveEventBuffer", () => {
