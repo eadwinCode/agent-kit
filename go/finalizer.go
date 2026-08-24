@@ -135,6 +135,9 @@ func (t *terminalEmitter) Emit(ctx context.Context, runErr error, stopReason str
 	if t == nil || t.sc == nil {
 		return
 	}
+	if t.terminalAlreadyJournaled(ctx) {
+		return
+	}
 	t.once.Do(func() {
 		outcome := OutcomeCompleted
 		switch {
@@ -197,6 +200,53 @@ func (t *terminalEmitter) finalizer() Finalizer {
 		return nil
 	}
 	return t.ports.Finalizer
+}
+
+// terminalAlreadyJournaled reports whether an earlier execution of this run
+// already published its terminal sequence.
+//
+// Durable executors are re-entrant: the function body is re-invoked for every
+// step, and once the run's own work is memoized, every later invocation
+// unwinds through the deferred Emit with a FRESH terminalEmitter. The
+// process-local sync.Once above therefore cannot hold the
+// exactly-one-terminal invariant on its own — without this gate each unwind
+// re-runs the finalizer (which bills) and re-publishes run.completed /
+// stream.ended under newly allocated sequence numbers. Those copies drift
+// from the original numbering, so the client's sequence-keyed steady-state
+// tracker cannot dedupe them: a late run.started re-opens a finished turn,
+// and a colliding sequence drops the run's real content frames. The journal
+// is the only memory that spans invocations, so it owns this gate.
+func (t *terminalEmitter) terminalAlreadyJournaled(ctx context.Context) bool {
+	if t.journal == nil || !t.journal.enabled() || t.ports == nil {
+		return false
+	}
+	records, _, err := ReadJournalTail(ctx, t.journal.journal, JournalQuery{
+		Scope:    t.ports.scope(),
+		ThreadID: t.sc.ThreadID,
+		After: JournalCursor{
+			RunID:          t.sc.RunID,
+			StreamEpoch:    t.sc.streamEpoch,
+			SequenceNumber: JournalStart,
+		},
+	})
+	if err != nil {
+		// Failing closed would strand the client with no terminal at all, and
+		// a journal this sick is already latching reconcile on every append —
+		// emit and let reconciliation converge the client instead.
+		slog.WarnContext(ctx, "agentkit: terminal gate could not read the journal; emitting",
+			"runId", t.sc.RunID, "code", ErrorCode(err), "error", err)
+		return false
+	}
+	for _, record := range records {
+		if record.RunID != t.sc.RunID || record.StreamEpoch != t.sc.streamEpoch {
+			continue
+		}
+		switch record.Event {
+		case EventRunCompleted, EventRunFailed, EventStreamEnded:
+			return true
+		}
+	}
+	return false
 }
 
 func (t *terminalEmitter) publish(ctx context.Context, result FinalizeResult, runErr error, stopReason string, extra map[string]any) {
