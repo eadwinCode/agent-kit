@@ -4,7 +4,7 @@
 | ---------------- | -------------------------------------------------------------------------------------------------------- |
 | Status           | active — implementation in progress                                                                      |
 | Created          | 2026-08-22                                                                                               |
-| Updated          | 2026-08-22                                                                                               |
+| Updated          | 2026-08-24                                                                                               |
 | Author           | Codex, with Clevix engineering                                                                           |
 | Reviewers        | Web chat owner, Clevix Server owner, AgentKit/use-agent owner, Inngest workflow owner, Security, Billing |
 | Priority         | p1-high                                                                                                  |
@@ -178,6 +178,8 @@ Status meanings:
 - Replacing Inngest as the durable workflow engine or Inngest Realtime as the AI
   chat WebSocket transport.
 - Using SSE or EventSource for AI chat. Existing file/project SSE remains separate.
+  (Under re-evaluation since 2026-08-24 — see the live-delivery decision
+  section in Technical Design.)
 - Exposing hidden chain-of-thought or claiming reasoning when the provider did
   not return it.
 - Freezing and resuming a model from its exact internal mid-token state.
@@ -863,6 +865,127 @@ Retention and compaction:
 - Command rows default to 30 days and contain hashes/codes, not prompt/tool output.
 - Approval and billing retention continue under their existing policies.
 
+#### Live delivery decision under evaluation: in-process SSE vs Inngest Realtime
+
+**Status: under evaluation.** The standing decision — WebSocket (Inngest
+Realtime) plus HTTP snapshot/command/tail APIs, no AI-chat SSE — remains in
+force until the migration steps below complete and the reversal window passes.
+This section exists because the reference example
+(`examples/stateful-react-go`) streams the same envelope stream over plain SSE
+with no tokens, no extra service, and no realtime infrastructure, and the
+question "can SSE work in Clevix with auth and tenants in place" now has a
+concrete answer: yes, with two honest costs, named below.
+
+**Why the decision was reopened (evidence from 2026-08-24 live debugging):**
+
+- The realtime token mint exists only to satisfy Inngest Realtime's browser
+  grant model. Its 60-second JWT TTL forces a re-mint per tab per minute, and
+  the mint path classifies HTTP 429 as recoverable and retries indefinitely
+  (`requestAgentStreamGrant` + `retryAgentkitRealtimeToken` in
+  `apps/web/src/lib/agent-session-realtime.ts`). When the server's IP rate
+  limiter (5 req/s sustained, burst 60) trips under a client request storm,
+  the retrying mints keep the bucket drained — a self-sustaining lockout whose
+  only user-visible symptom is "rate limit exceeded" and a silently dead live
+  channel.
+- The dev Realtime pipeline delivered a large share of frames twice on the
+  wire (16 of 24 eventIds observed duplicated in probes; every step span
+  double-reported in the run trace). The client absorbs this via event-ID
+  dedupe, but it is needless load and noise.
+- Live frames are invisible to Clevix Server logs; debugging requires the
+  Inngest dev UI.
+- Clevix already operates an authenticated file/project SSE plane, so
+  cookie-authenticated SSE is a proven pattern in this codebase.
+
+**What does not change (this is why the cutover is cheap and reversible):**
+the journal (`ai_run_events`), the session snapshot, and the event tail remain
+the authority; live delivery is best-effort acceleration either way. The
+resumable synchronization algorithm above is transport-agnostic — only step
+1's "establish the project provider" and the envelope source change. The
+client already speaks a provider-neutral seam (`StatefulAgentRealtimeSource`
+in `@repo/stateful-agent`), so no package work is required.
+
+**Proposed design:**
+
+- *Worker → server hop.* Chunks are born inside Inngest function executions,
+  not in Clevix Server. The worker posts each chunk to a new internal,
+  authenticated ingest endpoint on Clevix Server (replacing the
+  `PublishAgentChunk` Realtime call); the server's in-process broker fans out
+  to SSE subscribers. Journal writes stay exactly as today (durable first,
+  live publish best-effort), so the hop adds one network call per chunk and a
+  little ordering/backpressure care, but no correctness risk — a lost or
+  reordered live frame is recovered from the journal by existing gap
+  detection.
+- *SSE endpoint.* `GET /api/ai/v3/stream` (channelKey-scoped), authorized
+  exactly like today's token mint: session cookie, project reauthorization,
+  per-user topic scoping. Cookies flow on `EventSource`; the route is a
+  read-only GET, so the CSRF posture is unchanged. 15-second heartbeat
+  comments, `X-Accel-Buffering: no`, an explicit `retry:` field, and on
+  reconnect the client runs the existing snapshot-plus-tail resync rather than
+  attempting frame-level resume (`Last-Event-ID` is accepted but not
+  authoritative).
+- *Broker.* Per-project in-memory subscriber set with bounded buffers and
+  slow-consumer drop (a dropped client resyncs via the tail), following the
+  reference broker in `examples/stateful-react-go/server/lab.go` and the
+  stream handler in `server/http.go` (`text/event-stream`, `Flusher`,
+  heartbeat loop).
+- *Multi-replica.* Clevix Server is single-instance by design today (the
+  realtime hub and cron are already in-process — the same assumption the IP
+  rate limiter documents). If replicas ever arrive, fan out over Redis pub/sub;
+  Redis already runs in the stack for Inngest.
+- *Client.* A new SSE realtime source implementing
+  `StatefulAgentRealtimeSource` (`EventSource`, or `fetch` + `ReadableStream`
+  if headers/POST ever become necessary). The swap is contained in
+  `agent-session-realtime.ts`; the token mint endpoint, the grant retry
+  wrapper, and the `@inngest/realtime` dependency are deleted once the
+  reversal window passes.
+
+**Honest costs / what is given up:**
+
+- One extra network hop per chunk (worker → server → subscriber) instead of
+  direct Realtime publish.
+- Inngest dev-UI realtime visibility, and the managed-cloud Realtime scaling
+  path if Clevix ever adopts Inngest Cloud.
+- `EventSource` constraints: no custom headers (fine — cookies suffice), the
+  HTTP/1.1 six-connections-per-origin cap (each editor tab would hold an AI
+  SSE plus the existing file/project SSE, so HTTP/2 or tab discipline
+  matters), and fixed reconnect backoff with no error surface.
+- Proxy buffering must be disabled at every hop on the route (Vite dev proxy
+  today; any prod ingress later).
+
+**Migration steps:**
+
+1. Add the internal ingest endpoint, the in-process broker, and the SSE
+   endpoint behind an env flag; keep the Realtime publish path intact
+   (optional short period of dual-publish for shadow comparison).
+2. Implement the SSE realtime source in the web app behind the existing
+   `StatefulAgentRealtimeSource` seam; select transport per environment by
+   flag.
+3. Conformance: replay the captured epoch-6 frame fixture through the SSE
+   source (the regression test already exists at
+   `apps/packages/stateful-agent/test/live-turn-regression.test.tsx`) and
+   live-verify duplicate/gap absorption in the dev stack.
+4. Cut over dev; dogfood a full day of editor use covering multi-tab, refresh,
+   cancel, and network-drop cases; watch for reconnect storms and proxy
+   buffering.
+5. After the reversal window, retire the token mint endpoint, the retry
+   wrapper, and `@inngest/realtime`; update the standing decision and the
+   Non-Goals line.
+
+**Reversal criteria (roll back to Inngest Realtime if any hold):**
+
+- Production moves to multiple Clevix Server replicas before Redis fan-out
+  ships (SSE pinned to one replica would still be *correct* via the journal,
+  but live UX degrades to refresh-grade).
+- Any proxy/ingress in the deploy path cannot disable response buffering for
+  the SSE route.
+- Reconnect behavior proves worse than Realtime in practice: reconnect storms,
+  per-origin connection exhaustion at real tab counts, or unexplained silent
+  channel death.
+- Frame duplication/loss exceeds what journal + tail absorb, observable as
+  repeated gap-recovery loops in client behavior.
+- Inngest Cloud adoption later makes managed Realtime the better operational
+  fit again.
+
 #### Security and authorization
 
 - Every snapshot, tail, command, thread, run, and approval lookup derives user and
@@ -979,6 +1102,8 @@ logs retain correlation codes, never user content.
   source of truth.
 - Keep `useAgent` as the sole standard-event reducer.
 - Use WebSocket plus HTTP snapshot/command/tail APIs; no AI chat SSE.
+  (Reopened for evaluation on 2026-08-24 — see "Live delivery decision under
+  evaluation: in-process SSE vs Inngest Realtime" in Technical Design.)
 - Implement Pause at safe durable boundaries; exact mid-token suspension is not
   promised.
 - Use correlated application events/waits for per-run pause, not operator-level
@@ -1043,40 +1168,39 @@ implementation threads, ordered by dependency rather than UI visibility.
 | R2  | Add public, storage-neutral Go `EventJournal`, `StateStore`, `RunController`/control, approval/HITL, `StructuredStream`/`StreamSink`, and `Finalizer` contracts.                                             | A2           | **Done.** All six ports ship with storage-neutral records, `PortError` typed failures, sentinel causes and `context.Context` on every method.                                                                                                                                              |
 | R3  | Make AgentKit invoke R2 at documented lifecycle/safe-boundary points with typed failures, deterministic replay, and reusable adapter conformance tests.                                                      | A2           | **Done.** Journal-before-fan-out, state CAS, six safe boundaries plus tool-declared checkpoints, the approval controller, the typed tool/router emitter, and the finalizer-gated terminal all land with lifecycle tests; `go/conformance` is the reusable suite.                           |
 | R4  | Stream real provider `tool_call.arguments.delta` chunks before inference completion and prove final parsed-input equivalence.                                                                                | A2           | **Done.** Provider argument chunks are forwarded as they arrive; the concatenated deltas are asserted equal to the parsed tool input, and the tool loop no longer republishes a part the provider already streamed.                                                                        |
-| R5  | Finish the D1 provider/application matrix and release a new exact Go module version.                                                                                                                         | A2           | Core reasoning/text streaming is on `main`, but it is not tagged after `go/v0.1.0-alpha.1`, adopted by Clevix, or proven through production provider, billing, history, terminal, and browser tests.                                                                                       |
-| R6  | Build and publish the complete maintained `@inngest/use-agent` release.                                                                                                                                      | A1           | **Source complete; publish outstanding.** The reverted prototypes are restored on `main` and extended with typed errors, hydration, epochs/gaps, recoverable token refresh, idempotent commands and `useAgentSession` (218 tests). Publishing, the exact pin and Bun-patch removal remain. |
-| R7  | Add Clevix adapters, `ai_agent_sessions`/`ai_agent_commands`, explicit current-thread CAS, scoped snapshot/tail/command APIs, private topics, and command idempotency.                                       | A3           | These application/schema changes are outside this repository and have no verified completion evidence in this audit.                                                                                                                                                                       |
-| R8  | Complete snapshot-plus-tail recovery and same-user multi-client synchronization.                                                                                                                             | A4           | **Package half done.** Hydration, buffering, epoch/gap recovery, backfill, reconnect re-hydration and accepted-user-turn publication all exist and are tested. The authenticated server adapter and browser-level multi-tab verification are Clevix Server work.                           |
-| R9  | Implement safe-boundary Pause/Play in Go AgentKit and Clevix, including durable commands/wake, tool checkpoints, HITL coexistence, cancellation precedence, races, expiry, and restart recovery.             | A5           | No public control/state/checkpoint ports exist yet, so the backend contract is not available to implement safely.                                                                                                                                                                          |
+| R5  | Finish the D1 provider/application matrix and release a new exact Go module version.                                                                                                                         | A2           | **Released and adopted.** Clevix Server exact-pins `agent-kit/go v0.2.0-alpha.0`. Remaining: the production provider/billing/browser evidence and production `SimulateChunking: false`.                                         |
+| R6  | Build and publish the complete maintained `@inngest/use-agent` release.                                                                                                                                      | A1           | **Done.** `use-agent-v0.4.0-maintained.3` is published and exact-pinned by both the web app and `@repo/stateful-agent`; no Bun patch remains.                                                                                  |
+| R7  | Add Clevix adapters, `ai_agent_sessions`/`ai_agent_commands`, explicit current-thread CAS, scoped snapshot/tail/command APIs, private topics, and command idempotency.                                       | A3           | **Done — verified 2026-08-24.** Migrations 11–12, all five conformance verifiers green, snapshot/tail/command endpoints live, `GetLatestThread` retired end-to-end. Full task record: `planning/a3-clevix-adapters-tasks.md`.   |
+| R8  | Complete snapshot-plus-tail recovery and same-user multi-client synchronization.                                                                                                                             | A4           | **Implemented end to end.** Package hydration/recovery plus the Clevix server adapter and the `apps/web` client cutover are done; browser-level multi-tab/device verification and run-retention policy remain.                 |
+| R9  | Implement safe-boundary Pause/Play in Go AgentKit and Clevix, including durable commands/wake, tool checkpoints, HITL coexistence, cancellation precedence, races, expiry, and restart recovery.             | A5           | The AgentKit contracts now exist (`ControlStore`, safe boundaries, checkpoints), A3's session/command substrate is landed, and the command types (`pause`/`resume` with `pauseEpoch`) are wired end to end. The Clevix runtime behavior — durable wait registration, checkpoint enforcement, expiry, restart recovery — is the remaining work. |
 | R10 | Implement and validate the stateful UI: Pause/Play/Cancel, approval attention, timers, orthogonal selectors, accessibility, refresh, and synchronized tabs.                                                  | A6           | UI work depends on R6–R9 and has no verified completion evidence in this audit.                                                                                                                                                                                                            |
 | R11 | Run the full conformance/E2E matrix, cut over Clevix, and remove polling, patches, side channels, manual lifecycle calls, raw-envelope interception, simulated production chunking, and dead legacy imports. | A7           | Cleanup is intentionally blocked until replacements are released, adopted, and proven.                                                                                                                                                                                                     |
 
-Recommended next separate thread: **R7 — the Clevix Server adapters and
-schema (A3)**. Everything it depends on now exists as a public contract:
-`EventJournal`, `StateStore`, `ControlStore`, `ApprovalStore`, `StreamSink` and
-`Finalizer` on the server, and `IAgentSessionTransport` on the client. The
-in-memory reference implementations in [`go/memadapter`](../go/memadapter) show
-each contract satisfied end to end, and [`go/conformance`](../go/conformance)
-is the suite the Clevix adapters should run against their own repositories from
-day one — a failing conformance test is far cheaper than a production replay
-that duplicates a side effect.
-
-Sequence it as: migrations 11–12 → session repository with revision CAS →
-`ai_run_events` journal adapter → snapshot/tail HTTP endpoints implementing
-`IAgentSessionTransport` → command idempotency → finalizer adapter. Each step
-has a contract test waiting for it.
+Recommended next separate thread: **R9 — the Pause/Play runtime behavior
+(A5)**. Its contracts and substrate are all landed: AgentKit's `ControlStore`,
+safe boundaries and tool-declared checkpoints on the runtime side, and Clevix's
+durable commands with `pauseEpoch` correlation, session CAS, the command
+outbox, and the `ai-agent-command` worker translating `send`/`edit`/`cancel`
+into the existing turn machinery on the application side. What remains is
+behavioral: durable wait registration and resume fan-out through Inngest,
+checkpoint enforcement at every safe boundary, 24-hour expiry, restart
+recovery, the terminal races with cancel/HITL, plus the three gaps the worker
+currently skips with a log — `retry` turn reconstruction from history, `edit`
+history-suffix truncation, and `approve`/`deny` durable-wait wiring. The A3
+conformance pattern applies — drive each behavior with a failing test against
+the real adapters before calling it done.
 
 ### Delivery tracker
 
-Last updated: 2026-08-22
+Last updated: 2026-08-24
 
 | Phase                                     | Status                                    | Exit condition                                                                                                                                                  |
 | ----------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A0 — Contracts and baseline               | **Complete in `agent-kit`** — 2026-08-22  | Public AgentKit port contracts/invocation timing plus current versions and live/history/error/HITL/replay fixtures are frozen and reproducible.                 |
-| A1 — Maintained use-agent release         | **Source complete; publish pending**      | Package-owned reducers, structured errors, stable actions, connection recovery, snapshot/tail APIs, and tests are released and exact-pinned; Bun patch removed. |
+| A1 — Maintained use-agent release         | **Complete** — 2026-08-24                 | Package-owned reducers, structured errors, stable actions, connection recovery, snapshot/tail APIs, and tests are released and exact-pinned; Bun patch removed. |
 | A2 — Go AgentKit ports and streaming      | **Complete in `agent-kit`** — 2026-08-22  | History/replay/state/control/HITL/stream/finalizer ports and lifecycle tests land with true provider/tool streaming and final equivalence.                      |
-| A3 — Agent-session coordinator and schema | Pending — Clevix Server work only         | Additive migrations, explicit current pointer, revision/CAS, command idempotency/audit, scoped snapshot and command APIs pass migration/authorization tests.    |
-| A4 — Snapshot-tail and multi-client sync  | **Package half complete**; server pending | Package hydration, epoch/gap recovery, accepted user message synchronization, reconnect/reload/multi-tab/device convergence, and retention behavior pass.       |
+| A3 — Agent-session coordinator and schema | **Complete in Clevix Server** — 2026-08-24 | Additive migrations, explicit current pointer, revision/CAS, command idempotency/audit, scoped snapshot and command APIs pass migration/authorization tests.    |
+| A4 — Snapshot-tail and multi-client sync  | **Implemented end to end**; browser verification pending | Package hydration, epoch/gap recovery, accepted user message synchronization, reconnect/reload/multi-tab/device convergence, and retention behavior pass.       |
 | A5 — Pause/resume backend                 | Blocked by A2/A3 contracts                | Safe-boundary Pause, durable Play, cancel precedence, HITL coexistence, expiry, restart, duplicate/race behavior pass.                                          |
 | A6 — Pause/resume and stateful UI         | Blocked by A1/A3–A5                       | Accessible controls, header attention, timers, truthful activity, connection separation, no flicker, and synchronized tabs pass browser tests.                  |
 | A7 — Stabilization and legacy cleanup     | Blocked by A1–A6                          | Full deterministic conformance and signed-in smoke suite pass; interception wrappers/polling/patches/dead legacy boundaries are removed; docs/runbooks updated. |
@@ -1242,32 +1366,49 @@ Tracker rules:
 
 ### Phase A3 — State coordinator and schema
 
-- [ ] Implement Clevix adapters for every AgentKit server port using repositories,
+- [x] Implement Clevix adapters for every AgentKit server port using repositories,
       Inngest, authorization, billing, and project policy; do not fork AgentKit's
-      lifecycle.
-- [ ] Wire the existing history repository through AgentKit's `HistoryConfig` and
+      lifecycle. → `apps/clevix-server/internal/usecase/aichat` adapters; all five
+      `go/conformance` verifiers run green against them in
+      `stateful_conformance_test.go` (verified 2026-08-24).
+- [x] Wire the existing history repository through AgentKit's `HistoryConfig` and
       remove manual runtime history calls/admitted deferral after equivalence
-      tests pass.
-- [ ] Add migrations for `ai_agent_sessions`, `ai_agent_commands`, and run-event
-      epoch/schema fields without reusing historical migration numbers.
-- [ ] Backfill deterministic explicit current pointers and verify scope on dirty,
-      fresh, and already-migrated databases.
-- [ ] Implement transactional session repository with revision CAS and ownership
-      checks.
-- [ ] Implement snapshot and scoped tail APIs with ETag/revision and pagination.
-- [ ] Extend send/cancel/HITL and add retry/edit/new-chat commands with command
-      idempotency.
-- [ ] Add private user/session AI topic authorization within the project provider.
-- [ ] Stop using `GetLatestThread` as current-thread authority.
+      tests pass. → `conformance.VerifyHistoryConfig` passes against the real
+      repository adapter.
+- [x] Add migrations for `ai_agent_sessions`, `ai_agent_commands`, and run-event
+      epoch/schema fields without reusing historical migration numbers. →
+      migrations 11–12 in `internal/adapter/libsql/migrations.go`.
+- [x] Backfill deterministic explicit current pointers and verify scope on dirty,
+      fresh, and already-migrated databases. → migration 11 backfills from
+      `ai_threads`; covered by `migrate_test.go`.
+- [x] Implement transactional session repository with revision CAS and ownership
+      checks. → `internal/adapter/repo/agentstate.go`.
+- [x] Implement snapshot and scoped tail APIs with ETag/revision and pagination.
+      → `GET /ai/agent-state` (`knownRevision`) and `GET /ai/agent-events`.
+- [x] Extend send/cancel/HITL and add retry/edit/new-chat commands with command
+      idempotency. → `POST /ai/agent-commands` with `commandId` idempotency,
+      `IDEMPOTENCY_KEY_REUSED` rejection, and a durable outbox.
+- [x] Add private user/session AI topic authorization within the project provider.
+      → per-user `user:<key>` channel with scoped JWT grants
+      (`internal/usecase/aichat/datastream.go`).
+- [x] Stop using `GetLatestThread` as current-thread authority. → removed
+      end-to-end 2026-08-24: the `/ai/threads/latest` routes (public +
+      internal), `LatestThreadUI`, the repository method, and the web client's
+      `resolveCurrentV3ThreadId` are gone; the session snapshot owns
+      current-thread selection.
 
 ### Phase A4 — Snapshot plus tail and multi-client sync
 
-- [ ] Implement the application's authenticated `AgentTransport`/`ReplayTransport`
+- [x] Implement the application's authenticated `AgentTransport`/`ReplayTransport`
       adapter over snapshot, history, event-journal, and command services; keep
       endpoint and table knowledge out of `useAgent`. The interface it
       implements is frozen —
-      [`IAgentSessionTransport`](../packages/use-agent/src/core/ports/agent-session.ts) —
-      but the implementation is Clevix Server work.
+      [`IAgentSessionTransport`](../packages/use-agent/src/core/ports/agent-session.ts). →
+      `apps/web/src/lib/agent-session-transport.ts` implements it over the
+      generated SDK, `agent-session-realtime.ts` bridges Inngest Realtime, and
+      the editor chat (`use-project-agent-chat.ts` → `@repo/stateful-agent`'s
+      `useStatefulAgent`) runs on it as of 2026-08-24. Browser-level multi-tab
+      verification still needs a signed-in smoke pass.
 - [x] Complete the S4 client integration inside the maintained package. →
       `hydrateAgentSession` plus the `useAgentSession` hook.
 - [x] Persist standard events before live fan-out through the one ordered
@@ -1698,8 +1839,16 @@ deterministic conformance matrix and signed-in browser smoke tests pass.
 
 ## Changelog
 
-| Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Date       | Change |
+| ---------- | ------ |
+| 2026-08-25 | SSE cutover migration step 1 landed, and its first live smoke exposed — then fixed — the root defect behind every live-update symptom reported this week. Server side (clevix-server): per-project in-process `realtime.AgentBroker`, cookie/project-authorized `GET /api/ai/v3/stream` SSE endpoint, and a dual-publish fan-out (`agentStreamFanout`) that mirrors chunks to the broker and Inngest Realtime behind `CLEVIX_SERVER_AI_CHAT_STREAM_SSE` (on in `compose.dev.yaml`; Realtime stays the reported path during the shadow period). The 96-frame smoke capture showed 25 unique eventIds, six sequence collisions, and five network terminal pairs for ONE turn. Root cause, confirmed in agent-kit: inngestgo suspends at each un-memoized step by panicking `sdkrequest.ControlHijack`, which unwinds defers — so the network/agent deferred terminal emitters fired on EVERY step boundary, mid-run, each copy re-numbered by that invocation's fresh sequence counter. The drifted copies bypass the client's sequence-keyed steady-state dedupe (late `run.started` re-opened finished turns — the "stuck working" bug) and collided with the agent stream's real frames, whose content the gap tracker then dropped (the "no response text" bug). Fixes: (a1) `terminalEmitter` consults the journal — the only memory spanning invocations — and skips the terminal sequence when one is already recorded for the run+epoch (`go/v0.2.0-alpha.1`); (a2) both terminal defers re-panic hijack unwinds un-emitted, with `durable.IsControlHijack` exported for consumers (`go/v0.2.0-alpha.2`); (b) `SequenceGapTracker` dedupes steady-state envelopes by the replay-stable event id via a bounded FIFO (`use-agent-v0.4.0-maintained.4` release tarball, wired into apps/web and packages/stateful-agent). Acceptance re-run on project 5c6f44e4: ZERO collisions, exactly one terminal pair at sequences 18–19, gapless 0→19, response text intact. All suites green (agent-kit go, clevix-server go, use-agent 258 tests). Remaining known inefficiency, bounded and client-absorbed: executor replays still re-publish the stable prefix live (journal append is a no-op on the duplicate eventIds), ~4× wire duplication on this turn. |
+| 2026-08-24 | Added "Live delivery decision under evaluation: in-process SSE vs Inngest Realtime" to Technical Design, reopening the standing no-AI-chat-SSE decision with a concrete cutover plan: worker → internal authenticated ingest endpoint replacing `PublishAgentChunk`, per-project in-process broker + cookie-authorized `GET /api/ai/v3/stream` (following the `examples/stateful-react-go` broker/stream pattern), client swap contained in the `StatefulAgentRealtimeSource` seam, five migration steps, and explicit reversal criteria (multi-replica before Redis fan-out, proxy buffering, reconnect behavior, gap-recovery loops, Inngest Cloud adoption). Motivating evidence recorded from the same day's live debugging: 60s token-TTL re-mint churn with 429 classified recoverable (self-sustaining under the IP rate limiter), dev Realtime frame duplication (16 of 24 eventIds), and frames invisible to server logs. Pointer notes added to the standing Decisions Made bullet and the Non-Goals line; the decision itself is unchanged until migration step 5 completes. |
+| 2026-08-24 | Fixed the UI staying "working" after a turn finished. A frame-faithful regression test (`apps/packages/stateful-agent/test/live-turn-regression.test.tsx`, replaying the real epoch-6 frames captured from the dev stack through the real session hook and transcript reducer) proved the reduction chain renders streamed text correctly, and pinned the remaining bug: live envelopes never mutate the snapshot, so after `stream.ended` the client's `snapshot.activeRun` stayed set forever and the web status mapping (`snapshot.activeRun → "streaming"`) kept the UI busy until a refresh. `@repo/stateful-agent` now rehydrates the session automatically on every terminal `stream.ended` (completed/failed/cancelled all end there), behind a configurable `settleReconcileDelayMs` (default 250ms) that lets the server's post-turn `SettleAgentRun` land before the fetch; hydration's own active-run-changed restart backstops a lost race. Package suite (13 tests) and full web suite (471 tests) green; the web app consumes the package's `src` directly, so the fix is live in the dev server. |
+
+| 2026-08-24 | Fixed live updates only appearing after a refresh. Root cause, proven end to end with a raw WebSocket probe against the dev stack: the realtime pipeline (token mint → socket → publish) was healthy, but every published chunk carried `streamEpoch: 0` because `runNetwork` built `agentkit.RuntimePorts` without `StreamEpoch` and Clevix-built `DataStream` chunks never stamped one — while command admission increments `state.StreamEpoch` per run, so the client's sequenced-event tracker (hydrated onto cursor epoch N) silently discarded every live envelope as a superseded epoch. The epoch now travels the same path as the run id: admission persists it onto the `AgentCommandDispatch`, the `ai-agent-command` worker copies it onto the turn and cancel events, `TurnRequest.StreamEpoch` feeds `RuntimePorts.StreamEpoch` (AgentKit stamps its own chunks), and `DataStream.SetStreamEpoch` stamps Clevix-origin chunks (data parts, status phases, terminal boundaries) with a `withEpoch` backfill in `Deliver`. The cancel notify's terminal `stream.ended` also carries the run's epoch. Same change repairs the event tail: journal rows were stamped epoch 0 too, so cursor-filtered tail reads always came back empty. Verified live on project 5c6f44e4: admission cursor epoch 6, all 95 streamed frames epoch 6, full turn delivered in real time. Full Go suite green. |
+| 2026-08-24 | Fixed the two cutover bugs found in first live browser testing. (1) Missing history: `ai_thread_messages.payload` stores the legacy Clevix `storedMessage` shape, but the client expects the canonical `AgentKitMessage` union, so every historical message was silently dropped on hydration — `aichat.CanonicalHistory` (`internal/usecase/aichat/canonical_history.go`) now translates payloads at the snapshot boundary (`GetAiAgentState`), user rows to `{role:"user",type:"text"}` and agent rows to their raw `output`+`toolCalls` sequences. (2) Stuck status / rejected sends: nothing ever settled the agent session after a run went terminal, so `active_run_id` with an empty outcome wedged every session after one turn and the coordinator rejected all later sends with `ACTIVE_RUN_EXISTS`. Added `aithreads.Service.SettleAgentRun` — CAS-guarded on the run id, clears the session's live-run marker (mirroring the new_chat clearing minus the thread change) AND the thread's `ai_threads.active_run` marker, which `ClaimActiveRun` consults at admission; idempotent, so the turn function, its failure handler, and the cancel worker may all settle the same run. The `ai-chat-v3` turn function now settles on every terminal exit (completed/cancelled/failed, best-effort so a settle error never misreports an unretried turn), and the `ai-agent-command` worker's cancel path reproduces the legacy HTTP cancel endpoint's effects in order — `CancelAIRun` authority mark (fatal), the `ai/chat.v3.cancel` event, thread marker + pending-usage clears (non-fatal), child-job cancellation (non-fatal), session settle (fatal; retries are safe because the cancel event id is deterministic). fx wiring: `AIChatDependencies` gains Sessions/Repository/Threads/RunJobs, fed from `inngestAppParams`. Cleared the 8 wedged dev sessions (and 265 stale thread markers, 262 of them July spam sharing one legacy run id) in the team tenant DB via offline sqlite surgery with backup. Full Go suite green. |
+| 2026-08-24 | Landed the C3 command worker in Clevix Server. The new `ai-agent-command` Inngest function consumes the `ai/agent.command` outbox that A3's command endpoints publish and translates each command into the existing turn machinery: `send`/`edit` become `ai/chat.v3.requested` (full client-state, model, image, and billing mapping onto `AIChatV3RequestedEvent`; deterministic `<command-digest>:turn` event ids make outbox redelivery dedupe at Inngest's boundary) and `cancel` becomes `ai/chat.v3.cancel` (`:cancel` ids, thread+run matched against the turn function's cancel config). This closes the cutover gap that left newly sent chats stuck: commands were recorded and published, but nothing consumed them. Registration rides the same `deps.AIChat.Runtime` gate as `ai-chat-v3`. Known follow-ups, all A5 runtime behavior: `retry` carries no client payload so the turn text is unknowable at the worker layer (skipped with a log until the runtime reconstructs it from history); `edit` runs the new text but history-suffix truncation is not yet wired; `approve`/`deny`/`pause`/`resume` still need durable-wait and pause behavior. Full Go suite green. |
+| 2026-08-24 | Verified and completed A3 and the A4 cutover in `sass_ai_builder`. Clevix Server runs all five `go/conformance` verifiers green, exact-pins `agent-kit/go v0.2.0-alpha.0`, and serves snapshot/tail/command endpoints with idempotent commands and per-user Realtime channels. The web editor now runs on `@repo/stateful-agent`'s `useStatefulAgent` over the maintained `use-agent-v0.4.0-maintained.3` release (`agent-session-transport.ts`, `agent-session-realtime.ts`, rewritten `use-project-agent-chat.ts`); the full web suite (471 tests), the package suite, and the full clevix-server Go suite pass. Retired `GetLatestThread` end to end — the `/ai/threads/latest` routes, `LatestThreadUI`, the repository method, and the web client's `resolveCurrentV3ThreadId` are gone; the session snapshot is the only current-thread authority. Remaining: browser-level multi-tab verification, run-retention policy, and the A5 Pause/Play runtime behavior. |
 | 2026-08-22 | Removed the prescribed tenancy model from the base contracts. `SessionKey{TeamID, ProjectID, UserID, AgentID}` became an opaque `SessionScope` string the runtime never parses; `projectId` left `AgentStateSnapshot`, `AgentCommand` and the snapshot/command schemas, and `agentId` became an opaque `sessionId`. Snapshot and command schemas accept adapter extensions without defining or requiring them. Added architecture guards on both sides so the leak cannot return, and added `ai_runs` to the banned-vocabulary list.                                                                                                                                                                                                                                                                  |
 | 2026-08-22 | Closed the remaining `agent-kit`-owned gaps: memoized `CreateThread`/`AppendUserMessage` so a replay cannot duplicate a thread or a user turn, published `VerifyHistoryConfig` (verified to fail both against a non-idempotent adapter and against removal of the runtime's memoization), taught the package reducer to render the accepted `user.message` event, gave hydration an explicit client-side resume cursor so a reconnect does not replay a turn already on screen, and added multi-client convergence tests over every frozen fixture.                                                                                                                                                                                                                                                   |
 | 2026-08-22 | Implemented A0, A2, A1 (source) and the package half of A4 in `agent-kit`. Added the six public Go runtime ports with lifecycle invocation, safe-boundary pause/cancel, HITL primitives, the typed structured stream, finalizer-gated terminals and true provider tool-argument streaming; added `go/memadapter` reference adapters and the `go/conformance` reusable suite. Froze `contracts/` (schemas, Go-generated fixtures, `VERSIONS.json`) with cross-runtime and negative architecture tests on both sides. Restored and extended the maintained `use-agent` work on `main`: `AgentTransportError`, snapshot-plus-tail hydration with epochs and gap backfill, recoverable token refresh, idempotent commands, and `useAgentSession`. A3 and the server half of A4 remain Clevix Server work. |
