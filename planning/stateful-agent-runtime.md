@@ -175,11 +175,13 @@ Status meanings:
 
 - Adding Cloudflare Workers, Durable Objects, Cloudflare Workflows, or another
   agent runtime. Cloudflare Agents contributes behavioral ideas only.
-- Replacing Inngest as the durable workflow engine or Inngest Realtime as the AI
-  chat WebSocket transport.
-- Using SSE or EventSource for AI chat. Existing file/project SSE remains separate.
-  (Under re-evaluation since 2026-08-24 — see the live-delivery decision
-  section in Technical Design.)
+- Replacing Inngest as the durable workflow engine. (Inngest Realtime as the AI
+  chat transport WAS replaced by in-process SSE on 2026-08-25; deployment
+  progress tokens still use it.)
+- Multi-replica live fan-out (Redis pub/sub) for the AI chat SSE plane. The
+  broker is single-instance like the cron and IP rate limiter; if replicas ever
+  arrive this becomes a goal, and the reversal criteria in the live-delivery
+  decision apply.
 - Exposing hidden chain-of-thought or claiming reasoning when the provider did
   not return it.
 - Freezing and resuming a model from its exact internal mid-token state.
@@ -865,16 +867,27 @@ Retention and compaction:
 - Command rows default to 30 days and contain hashes/codes, not prompt/tool output.
 - Approval and billing retention continue under their existing policies.
 
-#### Live delivery decision under evaluation: in-process SSE vs Inngest Realtime
+#### Live delivery decision: in-process SSE adopted over Inngest Realtime
 
-**Status: under evaluation.** The standing decision — WebSocket (Inngest
-Realtime) plus HTTP snapshot/command/tail APIs, no AI-chat SSE — remains in
-force until the migration steps below complete and the reversal window passes.
-This section exists because the reference example
-(`examples/stateful-react-go`) streams the same envelope stream over plain SSE
-with no tokens, no extra service, and no realtime infrastructure, and the
-question "can SSE work in Clevix with auth and tenants in place" now has a
-concrete answer: yes, with two honest costs, named below.
+**Status: ADOPTED (2026-08-25).** All five migration steps completed in one
+day of implementation and live verification; the standing "WebSocket (Inngest
+Realtime), no AI-chat SSE" decision is REPLACED. The AI chat live channel is
+now the server's own cookie-authorized `GET /api/ai/v3/stream` SSE endpoint fed
+by an in-process broker; the Realtime publish leg, the `/realtime/token` mint,
+the web token-refresh wrapper, and the Inngest realtime source are retired.
+The reference example (`examples/stateful-react-go`) streams the same envelope
+stream over plain SSE with no tokens, no extra service, and no realtime
+infrastructure — Clevix now does the same, with auth and tenants in place.
+
+**How the execution differed from the plan:** the planned "worker → internal
+authenticated ingest endpoint" hop turned out unnecessary — Clevix's Inngest
+functions execute IN the clevix-server process, so chunks were already
+in-process and the broker could be published to directly (`AgentBroker`
+satisfies the `AIRealtimePublisher` interface). No ingest endpoint was ever
+built. The client ended up on `fetch` + `ReadableStream` rather than
+`EventSource`, for status-aware errors (401/403 fail-fast) and controlled
+backoff. Everything else — broker shape, authorization, heartbeat, resync via
+journal on reconnect — landed as designed.
 
 **Why the decision was reopened (evidence from 2026-08-24 live debugging):**
 
@@ -952,26 +965,27 @@ in `@repo/stateful-agent`), so no package work is required.
 - Proxy buffering must be disabled at every hop on the route (Vite dev proxy
   today; any prod ingress later).
 
-**Migration steps:**
+**Migration steps (all completed 2026-08-25):**
 
-1. Add the internal ingest endpoint, the in-process broker, and the SSE
-   endpoint behind an env flag; keep the Realtime publish path intact
-   (optional short period of dual-publish for shadow comparison).
-2. Implement the SSE realtime source in the web app behind the existing
-   `StatefulAgentRealtimeSource` seam; select transport per environment by
-   flag.
-3. Conformance: replay the captured epoch-6 frame fixture through the SSE
-   source (the regression test already exists at
-   `apps/packages/stateful-agent/test/live-turn-regression.test.tsx`) and
-   live-verify duplicate/gap absorption in the dev stack.
-4. Cut over dev; dogfood a full day of editor use covering multi-tab, refresh,
-   cancel, and network-drop cases; watch for reconnect storms and proxy
-   buffering.
-5. After the reversal window, retire the token mint endpoint, the retry
-   wrapper, and `@inngest/realtime`; update the standing decision and the
-   Non-Goals line.
+1. ✅ Broker + SSE endpoint landed behind `CLEVIX_SERVER_AI_CHAT_STREAM_SSE`
+   with a dual-publish shadow (`agentStreamFanout`). The shadow's first smoke
+   exposed — and fixing it resolved — the ControlHijack terminal-emission
+   defect behind the week's live-update symptoms (`go/v0.2.0-alpha.1..3`,
+   `use-agent-v0.4.0-maintained.4`).
+2. ✅ Web SSE realtime source (`apps/web/src/lib/agent-session-sse.ts`,
+   `AgentSessionSSESource` behind the `StatefulAgentRealtimeSource` seam),
+   selected by `NEXT_PUBLIC_AI_CHAT_STREAM_SSE`; conformance covered by the
+   existing frame-replay regression test plus 8 new source tests.
+3. ✅ Broker-only publish: fan-out deleted, `AgentBroker.PublishAgentChunk`
+   satisfies `AIRealtimePublisher`, `/realtime/token` route + `realtimeToken`
+   handler + `AIChatRealtimeMinter` retired, spec updated and contract
+   regenerated, adapter's `MintAgentStreamToken`/`PublishAgentChunk` removed
+   (deployment tokens untouched), config flag removed.
+4. ✅ Web Inngest source deleted; SSE is the only live path (flag removed);
+   `retryAgentkitRealtimeToken` and its tests retired.
+5. ✅ This decision flipped to adopted.
 
-**Reversal criteria (roll back to Inngest Realtime if any hold):**
+**Reversal criteria (standing guardrails — roll back if any hold):**
 
 - Production moves to multiple Clevix Server replicas before Redis fan-out
   ships (SSE pinned to one replica would still be *correct* via the journal,
@@ -1101,9 +1115,11 @@ logs retain correlation codes, never user content.
 - Make current thread and agent state server-authoritative; localStorage is not a
   source of truth.
 - Keep `useAgent` as the sole standard-event reducer.
-- Use WebSocket plus HTTP snapshot/command/tail APIs; no AI chat SSE.
-  (Reopened for evaluation on 2026-08-24 — see "Live delivery decision under
-  evaluation: in-process SSE vs Inngest Realtime" in Technical Design.)
+- Use cookie-authorized SSE (`GET /api/ai/v3/stream`) plus HTTP
+  snapshot/command/tail APIs for the AI chat live channel; Inngest Realtime is
+  retired for AI chat (kept only for deployment progress tokens). Adopted
+  2026-08-25 — see "Live delivery decision: in-process SSE adopted over Inngest
+  Realtime" in Technical Design.
 - Implement Pause at safe durable boundaries; exact mid-token suspension is not
   promised.
 - Use correlated application events/waits for per-run pause, not operator-level
@@ -1841,6 +1857,7 @@ deterministic conformance matrix and signed-in browser smoke tests pass.
 
 | Date       | Change |
 | ---------- | ------ |
+| 2026-08-25 | SSE cutover migration steps 3–5 completed — the decision is ADOPTED and Inngest Realtime is retired for AI chat. Step 3 (server, clevix-server): `agentStreamFanout` deleted; `AgentBroker.PublishAgentChunk` now satisfies `AIRealtimePublisher` directly (the planned worker→server ingest hop was never needed — Inngest functions execute in the clevix-server process, so chunks were already in-process); `/realtime/token` route, `realtimeToken` handler, and `AIChatRealtimeMinter` retired; spec updated (`/realtime/token` out, `GET /stream` in) and `aichatcontract` regenerated; adapter `MintAgentStreamToken`/`PublishAgentChunk` removed (deployment token minting untouched — `@inngest/realtime` stays for publish progress); `CLEVIX_SERVER_AI_CHAT_STREAM_SSE` flag removed, broker now unconditional. Step 4 (web): `agent-session-realtime.ts` deleted; `agentStreamEnvelope` moved into `agent-session-sse.ts`; `use-project-agent-chat.ts` mounts `useV3AgentSSESource` unconditionally; `retryAgentkitRealtimeToken` + tests retired; `NEXT_PUBLIC_AI_CHAT_STREAM_SSE` removed. Step 5: decision section flipped to adopted with as-built deltas recorded, standing Decisions Made bullet and Non-Goals rewritten (multi-replica fan-out is now the documented non-goal). Verified live on the dev stack: retired mint answers 404, and a smoke turn streamed "mango" over broker-only SSE with exactly one client-minted user message id and one terminal pair. All suites green: clevix-server go (69 packages), web 479/479, tsc clean. Standing guardrails (reversal criteria) remain: multi-replica before Redis fan-out, proxy buffering, reconnect storms, gap-recovery loops. |
 | 2026-08-25 | SSE cutover migration step 2 landed (web client swap, behind the same seam). New `apps/web/src/lib/agent-session-sse.ts`: `AgentSessionSSESource` implements `StatefulAgentRealtimeSource` against the server's own `GET /api/ai/v3/stream` — cookie-authorized fetch + ReadableStream (no token mint, no third-party socket), a byte-boundary-safe `createSSEEnvelopeParser` that skips `: connected`/`: heartbeat` comments and reuses the existing `agentStreamEnvelope` shape check, and the project-files reconnect policy (7s→60s jittered backoff; 401/403/404 fail-fast to avoid the request-storm pattern; clean stream end = broker evict → reconnect and let the session resync from the journal, which use-agent does automatically on every return to "connected"). `use-project-agent-chat.ts` now selects between the Inngest and SSE sources on `NEXT_PUBLIC_AI_CHAT_STREAM_SSE` (on in `apps/web/.env`; both hooks stay mounted with `enabled` gating so the idle one never connects). Verified: 8 new tests green (parser boundaries, fail-fast 401, reconnect/stop semantics), full web suite 481/481 — including the previously parked `thread-fetch-loop-repro` tests, unblocked by fixing their `waitFor` to read `status` (the hook's public field) instead of the removed `sessionStatus` — tsc clean, web container restarted, and the Vite-served bundle confirmed carrying the flag with `realtimeSSE` selected. |
 | 2026-08-25 | Fixed the duplicate user message during processing (appeared 2× while the AI worked, collapsed to 1× at turn end). Three different ids existed for one user message: the web hook's optimistic bubble (`crypto.randomUUID()` in `use-project-agent-chat.ts`), the legacy transport's own minted uuid, and the server's durable id (`request.RunID + "-user"` in `runtime.go`); the transcript reducer dedupes only by exact messageId, so the optimistic bubble and the server-accepted `user.message` event coexisted until post-turn hydration collapsed them. Fix is server-side id adoption (clevix-server): `TurnRequest` gained `UserMessageID` with a `userMessageID()` fallback helper; the Inngest turn-request mapper and the legacy `/chat` handler both forward the client-minted id, and `appendDirectUser`/`runNetwork` persist it — the command path already carried `payload.MessageID` through opaquely, so no web change was needed. Same-day regression catch: alpha.2's blanket re-panic skipped the Finalizer on genuine failure unwinds (billing test `TestRuntimeFailureBillingIsEquivalentAcrossRecovery` failed on a simulated `panic(errStepAbort)`), so `go/v0.2.0-alpha.3` refines the defers — `durable.IsControlHijack(p)` re-panics un-emitted (step suspension), any other panic settles and publishes a FAILED terminal via the terminal emitter, then re-panics so the executor still records the crash. Verified: agent-kit go suite green, clevix-server full suite green (69 packages), dev container rebuilt on alpha.3, and a live smoke turn shows `user.message` carrying the client-minted `messageId` end to end. |
 | 2026-08-25 | SSE cutover migration step 1 landed, and its first live smoke exposed — then fixed — the root defect behind every live-update symptom reported this week. Server side (clevix-server): per-project in-process `realtime.AgentBroker`, cookie/project-authorized `GET /api/ai/v3/stream` SSE endpoint, and a dual-publish fan-out (`agentStreamFanout`) that mirrors chunks to the broker and Inngest Realtime behind `CLEVIX_SERVER_AI_CHAT_STREAM_SSE` (on in `compose.dev.yaml`; Realtime stays the reported path during the shadow period). The 96-frame smoke capture showed 25 unique eventIds, six sequence collisions, and five network terminal pairs for ONE turn. Root cause, confirmed in agent-kit: inngestgo suspends at each un-memoized step by panicking `sdkrequest.ControlHijack`, which unwinds defers — so the network/agent deferred terminal emitters fired on EVERY step boundary, mid-run, each copy re-numbered by that invocation's fresh sequence counter. The drifted copies bypass the client's sequence-keyed steady-state dedupe (late `run.started` re-opened finished turns — the "stuck working" bug) and collided with the agent stream's real frames, whose content the gap tracker then dropped (the "no response text" bug). Fixes: (a1) `terminalEmitter` consults the journal — the only memory spanning invocations — and skips the terminal sequence when one is already recorded for the run+epoch (`go/v0.2.0-alpha.1`); (a2) both terminal defers re-panic hijack unwinds un-emitted, with `durable.IsControlHijack` exported for consumers (`go/v0.2.0-alpha.2`); (b) `SequenceGapTracker` dedupes steady-state envelopes by the replay-stable event id via a bounded FIFO (`use-agent-v0.4.0-maintained.4` release tarball, wired into apps/web and packages/stateful-agent). Acceptance re-run on project 5c6f44e4: ZERO collisions, exactly one terminal pair at sequences 18–19, gapless 0→19, response text intact. All suites green (agent-kit go, clevix-server go, use-agent 258 tests). Remaining known inefficiency, bounded and client-absorbed: executor replays still re-publish the stable prefix live (journal append is a no-op on the duplicate eventIds), ~4× wire duplication on this turn. |
