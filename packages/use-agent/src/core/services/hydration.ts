@@ -481,11 +481,17 @@ export class SequenceGapTracker {
   }
 
   /** Positions the tracker after hydration. */
-  reset(cursor: StreamCursor | null): void {
+  reset(cursor: StreamCursor | null, applied?: StandardEventEnvelope[]): void {
     this.pending.clear();
     this.gap = null;
     this.appliedIds.clear();
     this.appliedOrder = [];
+    // Seed the replay-dedupe set with everything hydration just reduced.
+    // Without this, a durable-executor replay whose drifted allocation gives
+    // the already-journaled prefix FRESH sequence numbers slips past the
+    // sequence checks — the event id is the only replay-stable identity, and
+    // a refreshed tab has no other memory of what the tail installed.
+    if (applied) this.markApplied(applied);
     if (!cursor) {
       this.expected = null;
       this.epoch = 0;

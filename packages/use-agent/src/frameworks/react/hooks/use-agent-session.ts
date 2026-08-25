@@ -256,7 +256,7 @@ export function useAgentSession(
       if (result.messages) onMessagesRef.current?.(result.messages);
       if (result.events.length > 0) onEventsRef.current?.(result.events);
 
-      trackerRef.current.reset(result.cursor);
+      trackerRef.current.reset(result.cursor, result.events);
       appliedCursorRef.current = result.cursor;
       if (mountedRef.current) {
         setReconcileRequired(result.reconcileRequired);

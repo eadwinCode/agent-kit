@@ -473,6 +473,38 @@ describe("SequenceGapTracker", () => {
       events: [expect.objectContaining({ streamEpoch: 1 })],
     });
   });
+
+  it("drops drifted replays of events hydration installed, when seeded", () => {
+    // The refreshed-tab case: hydration reduced tail events 0..3 and reset
+    // the tracker from the cursor alone. A replay then re-published the same
+    // prefix with FRESH sequence numbers; an unseeded tracker applies the
+    // copies again and the transcript duplicates.
+    const tracker = new SequenceGapTracker();
+    const hydrated = [
+      envelope(0, "run.started"),
+      envelope(1),
+      envelope(2, "run.completed"),
+      envelope(3, "stream.ended"),
+    ];
+    tracker.reset(
+      { runId: "run_1", streamEpoch: 0, sequenceNumber: 3 },
+      hydrated
+    );
+
+    // Replayed copies: same event ids, drifted sequence numbers.
+    const replayed = [
+      { ...envelope(4, "run.started"), eventId: "run_1:0:0" },
+      { ...envelope(5), eventId: "run_1:0:1" },
+    ];
+    for (const copy of replayed) {
+      expect(tracker.accept(copy)).toEqual({ type: "apply", events: [] });
+    }
+    // Genuinely new events still apply.
+    expect(tracker.accept(envelope(4))).toEqual({
+      type: "apply",
+      events: [expect.objectContaining({ sequenceNumber: 4 })],
+    });
+  });
 });
 
 describe("LiveEventBuffer", () => {
