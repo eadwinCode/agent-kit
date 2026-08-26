@@ -122,8 +122,8 @@
 // [HistoryConfig] is the storage seam. Set it on a network or agent and
 // AgentKit creates the thread, records the user's turn before the run,
 // hydrates prior context, and saves results as they land — each inside its
-// own durable step, with the end-of-run save idempotent against the
-// incremental ones.
+// own durable step. The end-of-run backstop runs only when state changed
+// outside the proven incremental path.
 //
 // Note that an [AgentResult] carries assistant output and tool results but
 // never the user turn that prompted it. Storing only results leaves a model

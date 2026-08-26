@@ -411,9 +411,9 @@ func (c *StreamingContext) recordActivity(ctx context.Context, activity Activity
 	})
 }
 
-// GeneratePartID mints a part id ≤ 40 chars (OpenAI tool-call id limit):
-// tool_<msgid8>_<ts8>_<rand6>. Call it inside a durable step — the call
-// sites in agent.go do — so the id is replay-stable.
+// GeneratePartID mints a part id ≤ 40 chars for callers that explicitly need
+// a fresh, non-replay-derived identity. AgentKit's own streamed parts use
+// stablePartID and do not spend a durable checkpoint on id generation.
 func (c *StreamingContext) GeneratePartID() string {
 	shortMsg := strings.ReplaceAll(c.MessageID, "-", "")
 	if len(shortMsg) > 8 {
