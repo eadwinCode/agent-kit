@@ -2,6 +2,7 @@ package agentkit
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -199,6 +200,11 @@ type StopWhenArgs[T any] struct {
 
 // NetworkRunOptions configures one Network.Run.
 type NetworkRunOptions[T any] struct {
+	// RunID is an optional application-minted, replay-stable identity for this
+	// network execution. Supplying it removes the otherwise necessary durable
+	// network-id checkpoint; child agent, message and part ids are derived from
+	// it deterministically.
+	RunID string
 	// UserMessage is the rich client input; its Content wins over the
 	// plain input string when set.
 	UserMessage *UserMessage
@@ -313,13 +319,18 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		step = durable.Inngest()
 	}
 
-	// Minted inside a step for deterministic replay; the network's run id
-	// doubles as the messageId for network-scoped streaming events.
-	networkRunID, err := durable.Run(ctx, step, "generate-network-id", func(ctx context.Context) (string, error) {
-		return uuid.NewString(), nil
-	})
-	if err != nil {
-		return err
+	// Prefer the application's stable run identity. Legacy callers without one
+	// keep the durable minting checkpoint, while every child identity below is
+	// derived from this single replay-stable root.
+	networkRunID := strings.TrimSpace(opts.RunID)
+	if networkRunID == "" {
+		var err error
+		networkRunID, err = durable.Run(ctx, step, "generate-network-id", func(ctx context.Context) (string, error) {
+			return uuid.NewString(), nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	stopWhen := opts.StopWhen
@@ -355,7 +366,7 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 	// "regenerate" even when the run fails).
 	var acceptedUserMessage *UserMessageRecord
 	if r.History != nil && r.History.AppendUserMessage != nil {
-		record, err := r.buildUserMessageRecord(ctx, input, opts.UserMessage, step)
+		record, err := r.buildUserMessageRecord(input, opts.UserMessage, networkRunID)
 		if err != nil {
 			return err
 		}
@@ -437,6 +448,8 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 	}
 
 	initialResultCount := len(r.State.results)
+	incrementallyPersisted := initialResultCount
+	resultShapeExpected := true
 
 	// Run-start boundary: a pause or cancel accepted before any inference
 	// began costs nothing to honor here.
@@ -497,16 +510,10 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 			break
 		}
 
-		// Mint this iteration's ids durably (replay-stable). The message id
-		// becomes the persisted AgentResult.ID — and therefore part of the
-		// replay-stable checksum.
-		ids, err := durable.Run(ctx, step, fmt.Sprintf("generate-agent-ids-%d", r.counter),
-			func(ctx context.Context) (agentIterationIDs, error) {
-				return agentIterationIDs{RunID: generateRunID(), MessageID: uuid.NewString()}, nil
-			})
-		if err != nil {
-			return err
-		}
+		// The application/network run id is the single durable identity root.
+		// Deriving child ids removes two random values — and one replay
+		// checkpoint — per network iteration.
+		ids := deterministicAgentIterationIDs(networkRunID, r.counter)
 
 		// Child streaming context: agent-specific run/message ids, shared
 		// sequence counter so ordering holds across the whole run.
@@ -541,6 +548,11 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 			})
 		}
 
+		if len(r.State.results) != incrementallyPersisted {
+			// A lifecycle/tool inserted a result outside the network's normal
+			// append path. Keep the final history backstop in that uncommon case.
+			resultShapeExpected = false
+		}
 		r.counter++
 		r.State.AppendResult(call)
 
@@ -553,6 +565,7 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		}, []*AgentResult{call}, IncrementalAppendStepID(r.counter)); err != nil {
 			return err
 		}
+		incrementallyPersisted++
 
 		next, err := r.getNextAgents(ctx, inputContent, opts.UserMessage, r.effectiveRouter(opts), step)
 		if err != nil {
@@ -563,7 +576,12 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		}
 	}
 
-	// End-of-run backstop save (idempotent against the incremental saves).
+	// Every ordinary network result was already saved in its own incremental
+	// step. Only pay for the final backstop when state changed outside that
+	// proven append path.
+	if resultShapeExpected && len(r.State.results) == incrementallyPersisted {
+		return nil
+	}
 	return saveThreadToStorage(ctx, topCfg, initialResultCount)
 }
 
@@ -627,9 +645,9 @@ func (r *NetworkRun[T]) lastResult() *AgentResult {
 }
 
 // buildUserMessageRecord shapes the user message for persistence. When the
-// input is a plain string, the id is minted inside a durable step — the TS
-// version calls randomUUID inline, which re-mints on every replay.
-func (r *NetworkRun[T]) buildUserMessageRecord(ctx context.Context, input string, um *UserMessage, step durable.Step) (UserMessageRecord, error) {
+// client did not supply an id, derive one from the network's replay-stable
+// root rather than adding an id-only checkpoint.
+func (r *NetworkRun[T]) buildUserMessageRecord(input string, um *UserMessage, networkRunID string) (UserMessageRecord, error) {
 	if um != nil && um.ID != "" {
 		ts := jsonutil.Now()
 		if um.ClientTimestamp != "" {
@@ -640,13 +658,29 @@ func (r *NetworkRun[T]) buildUserMessageRecord(ctx context.Context, input string
 		}
 		return UserMessageRecord{ID: um.ID, Content: um.Content, Role: RoleUser, Timestamp: ts}, nil
 	}
-	id, err := durable.Run(ctx, step, "generate-user-message-id", func(ctx context.Context) (string, error) {
-		return uuid.NewString(), nil
-	})
-	if err != nil {
-		return UserMessageRecord{}, err
-	}
+	id := deterministicID(networkRunID, "user-message", 0)
 	return UserMessageRecord{ID: id, Content: input, Role: RoleUser, Timestamp: jsonutil.Now()}, nil
+}
+
+func deterministicAgentIterationIDs(networkRunID string, iteration int) agentIterationIDs {
+	return agentIterationIDs{
+		RunID:     deterministicID(networkRunID, "agent-run", iteration),
+		MessageID: deterministicID(networkRunID, "agent-message", iteration),
+	}
+}
+
+// deterministicID derives opaque replay-stable identities from one durable
+// root. Length-prefixing keeps different field boundaries unambiguous; the
+// UUID namespace and purpose keep identity classes disjoint.
+func deterministicID(root, purpose string, index int) string {
+	name := fmt.Sprintf("agentkit/v1\x00%d:%s\x00%d:%s\x00%d", len(root), root, len(purpose), purpose, index)
+	sum := sha256.Sum256(append(uuid.NameSpaceOID[:], []byte(name)...))
+	id, _ := uuid.FromBytes(sum[:16])
+	// RFC 9562 version 8 is reserved for application-defined deterministic
+	// UUIDs; preserve the standard variant bits for consumers that validate.
+	id[6] = (id[6] & 0x0f) | 0x80
+	id[8] = (id[8] & 0x3f) | 0x80
+	return id.String()
 }
 
 // getNextAgents resolves the router's verdict into agents to schedule.

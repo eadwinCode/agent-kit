@@ -164,6 +164,9 @@ content such as tool arguments and outputs.
 
 ```go
 run, err := net.Run(ctx, input, &agentkit.NetworkRunOptions[state]{
+	// Reuse the application's durable run identity when it has one. AgentKit
+	// derives child/message/part ids from it instead of checkpointing random ids.
+	RunID: applicationRunID,
 	Streaming: &agentkit.StreamingConfig{
 		Publish:         agentkit.DurablePublish(step, myPublish),
 		StreamReasoning: true, // off by default
@@ -179,8 +182,8 @@ default: thinking still runs on the model, it is simply not forwarded.
 
 `HistoryConfig` is the storage seam. Set it and AgentKit creates the thread,
 records the user's turn before the run, hydrates prior context, and saves
-results as they land — each inside its own durable step, with the
-end-of-run save idempotent against the incremental ones.
+results as they land — each inside its own durable step. The end-of-run
+backstop runs only when state changed outside the proven incremental path.
 
 ```go
 net := agentkit.NewNetwork(agentkit.NetworkConfig[state]{
@@ -242,6 +245,7 @@ ports := &agentkit.RuntimePorts{
 }
 
 run, err := net.Run(ctx, input, &agentkit.NetworkRunOptions[state]{
+	RunID:    applicationRunID,
 	Ports:     ports,
 	Streaming: &agentkit.StreamingConfig{Publish: publish},
 })

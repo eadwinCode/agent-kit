@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/eadwinCode/agent-kit/go/durable"
 	"github.com/zendev-sh/goai/provider"
 
 	"github.com/eadwinCode/agent-kit/go/internal/jsonutil"
@@ -262,13 +263,89 @@ func TestNetworkHistoryFlow(t *testing.T) {
 	if events[0] != "createThread" || events[1] != "appendUser:client_msg_1" {
 		t.Errorf("event order wrong: %v", events)
 	}
-	// Two incremental appends (one per iteration) + one final backstop with
-	// both results.
+	// Every result was covered by its incremental append, so the redundant
+	// final backstop is omitted.
 	if incrementalCounts != 2 {
 		t.Errorf("incremental appends = %d, want 2", incrementalCounts)
 	}
-	if finalCount != 2 {
-		t.Errorf("final backstop got %d results, want 2", finalCount)
+	if finalCount != 0 {
+		t.Errorf("final backstop got %d results, want none", finalCount)
+	}
+}
+
+type recordingStep struct {
+	ids []string
+}
+
+func (s *recordingStep) Run(ctx context.Context, id string, fn durable.RunFn) (json.RawMessage, error) {
+	s.ids = append(s.ids, id)
+	return fn(ctx)
+}
+
+func TestSeededNetworkDerivesReplayStableIDsWithoutIDSteps(t *testing.T) {
+	runOnce := func() (*NetworkRun[shape], []string) {
+		step := &recordingStep{}
+		a := mkAgent("a", "sys", &fakeModel{id: "m", result: stopResult("done")})
+		n := NewNetwork(NetworkConfig[shape]{
+			Name: "net", Agents: []*Agent[shape]{a}, Router: scriptRouter(RouteTo(a)),
+		})
+		run, err := n.Run(context.Background(), "hello", &NetworkRunOptions[shape]{
+			RunID: "application-run-1", Step: step,
+			UserMessage: &UserMessage{ID: "client-message-1", Content: "hello", Role: RoleUser},
+			Streaming:   &StreamingConfig{Publish: func(context.Context, AgentMessageChunk) error { return nil }},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run, step.ids
+	}
+
+	first, firstSteps := runOnce()
+	second, secondSteps := runOnce()
+	firstID := first.State.Results()[0].ID
+	secondID := second.State.Results()[0].ID
+	if firstID == "" || firstID != secondID {
+		t.Fatalf("derived message ids differ across replay: %q != %q", firstID, secondID)
+	}
+	for _, ids := range [][]string{firstSteps, secondSteps} {
+		for _, id := range ids {
+			if strings.HasPrefix(id, "generate-network-id") ||
+				strings.HasPrefix(id, "generate-agent-ids-") ||
+				strings.HasPrefix(id, "generate-user-message-id") ||
+				strings.HasPrefix(id, "generate-text-part-id-") ||
+				strings.HasPrefix(id, "generate-output-part-id-") ||
+				strings.HasPrefix(id, "generate-tool-part-id-") {
+				t.Fatalf("seeded network emitted id-only step %q; all steps=%v", id, ids)
+			}
+		}
+	}
+}
+
+func TestNetworkRetainsFinalHistoryBackstopForUnexpectedResults(t *testing.T) {
+	var batches []int
+	h := &HistoryConfig[shape]{AppendResults: func(_ context.Context, _ HistoryContext[shape], results []*AgentResult) error {
+		batches = append(batches, len(results))
+		return nil
+	}}
+	injected := false
+	a := NewAgent(AgentConfig[shape]{
+		Name: "a", System: "sys", Model: &fakeModel{id: "m", result: stopResult("done")},
+		Lifecycle: &Lifecycle[shape]{OnStart: func(_ context.Context, before LifecycleBefore[shape]) (LifecycleStartResult, error) {
+			if !injected {
+				injected = true
+				before.Network.State.AppendResult(resultWith("external", "inserted"))
+			}
+			return LifecycleStartResult{Prompt: before.Prompt, History: before.History}, nil
+		}},
+	})
+	n := NewNetwork(NetworkConfig[shape]{
+		Name: "net", Agents: []*Agent[shape]{a}, Router: scriptRouter(RouteTo(a)), History: h,
+	})
+	if _, err := n.Run(context.Background(), "hello", &NetworkRunOptions[shape]{RunID: "run-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 2 || batches[0] != 1 || batches[1] != 2 {
+		t.Fatalf("history batches = %v, want incremental [1] plus backstop [2]", batches)
 	}
 }
 

@@ -890,12 +890,11 @@ func (a *Agent[T]) streamLegacyCompletedInference(
 	return nil
 }
 
-// streamPartID mints a streaming part id inside a durable step so it is
-// replay-stable (a re-minted id would re-publish the part's deltas).
-func (a *Agent[T]) streamPartID(ctx context.Context, sc *StreamingContext, step durable.Step, stepID string) (string, error) {
-	return durable.Run(ctx, step, stepID, func(ctx context.Context) (string, error) {
-		return sc.GeneratePartID(), nil
-	})
+// streamPartID derives a streaming part id from replay-stable run/message
+// identities and the deterministic call-site key. It needs no checkpoint of
+// its own: the same replay reaches the same call site with the same inputs.
+func (a *Agent[T]) streamPartID(_ context.Context, sc *StreamingContext, _ durable.Step, stepID string) (string, error) {
+	return sc.stablePartID("legacy:"+stepID, 0, 0), nil
 }
 
 // invokeTools executes every tool call in the inference output, in order,
