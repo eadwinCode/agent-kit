@@ -15,18 +15,19 @@ import (
 )
 
 // ReplayPolicy is the public AgentKit replay contract. The zero value is
-// ReplayMemoized; applications opt into ReplayRecompute only for reviewed,
+// ReplayMemoized; applications opt into a recompute policy only for reviewed,
 // side-effect-free operations.
 type ReplayPolicy = durable.ReplayPolicy
 
 const (
-	ReplayMemoized  = durable.ReplayMemoized
-	ReplayRecompute = durable.ReplayRecompute
+	ReplayMemoized          = durable.ReplayMemoized
+	ReplayRecompute         = durable.ReplayRecompute
+	ReplayRecomputeOversize = durable.ReplayRecomputeOversize
 )
 
-// MaxDurableStepResultBytes is the hard uncompressed result limit. AgentKit
-// neither compresses an oversize payload nor silently changes its replay
-// policy; a memoized result above this limit fails closed.
+// MaxDurableStepResultBytes is the hard uncompressed storage limit. A
+// ReplayRecomputeOversize operation stores a bounded marker instead of an
+// oversize payload; every other memoized operation fails closed.
 const MaxDurableStepResultBytes int64 = 2 << 20
 
 const stepResultReferenceVersion = 1
@@ -132,6 +133,13 @@ type stepResultStep struct {
 }
 
 func (s *stepResultStep) Run(ctx context.Context, id string, fn durable.RunFn) (json.RawMessage, error) {
+	return s.RunWithOptions(ctx, id, durable.RunOptions{}, fn)
+}
+
+func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts durable.RunOptions, fn durable.RunFn) (json.RawMessage, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
 	// The enclosing durable result already covers nested work. Persisting a row
 	// for every collapsed nested Run would add unused references and DB writes.
 	if durable.IsWithinStep(ctx) {
@@ -142,6 +150,7 @@ func (s *stepResultStep) Run(ctx context.Context, id string, fn durable.RunFn) (
 		SchemaVersion: s.cfg.SchemaVersion,
 	}
 	var local *StoredStepResult
+	var localOversize json.RawMessage
 	raw, err := s.inner.Run(ctx, id, func(stepCtx context.Context) (json.RawMessage, error) {
 		stored, lookupErr := s.store.Lookup(stepCtx, locator)
 		switch {
@@ -158,6 +167,13 @@ func (s *stepResultStep) Run(ctx context.Context, id string, fn durable.RunFn) (
 		payload, runErr := fn(stepCtx)
 		if runErr != nil {
 			return nil, runErr
+		}
+		if !json.Valid(payload) {
+			return nil, fmt.Errorf("%w: durable step %q result is invalid JSON", ErrStepResultCorrupt, id)
+		}
+		if int64(len(payload)) > MaxDurableStepResultBytes && opts.ReplayPolicy == ReplayRecomputeOversize {
+			localOversize = append(json.RawMessage(nil), payload...)
+			return marshalOversizeRecomputeEnvelope(int64(len(payload)), locator.SchemaVersion)
 		}
 		if err := validateStepResultPayload(id, payload); err != nil {
 			return nil, err
@@ -178,6 +194,23 @@ func (s *stepResultStep) Run(ctx context.Context, id string, fn durable.RunFn) (
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	if _, recompute := unmarshalOversizeRecomputeEnvelope(raw, locator.SchemaVersion); recompute {
+		if opts.ReplayPolicy != ReplayRecomputeOversize {
+			return nil, fmt.Errorf("%w: durable step %q has an unexpected recompute marker", ErrStepResultCorrupt, id)
+		}
+		if localOversize != nil {
+			return append(json.RawMessage(nil), localOversize...), nil
+		}
+		payload, runErr := fn(ctx)
+		if runErr != nil {
+			return nil, runErr
+		}
+		if !json.Valid(payload) {
+			return nil, fmt.Errorf("%w: recomputed durable step %q result is invalid JSON", ErrStepResultCorrupt, id)
+		}
+		return append(json.RawMessage(nil), payload...), nil
 	}
 
 	ref, referenced := unmarshalStepResultEnvelope(raw)
@@ -220,6 +253,34 @@ func marshalStepResultEnvelope(ref StepResultRef) (json.RawMessage, error) {
 		Ref: ref.Ref, SHA256: ref.SHA256, SizeBytes: ref.SizeBytes,
 		PayloadSchemaVersion: ref.SchemaVersion,
 	}})
+}
+
+func marshalOversizeRecomputeEnvelope(sizeBytes int64, schemaVersion int) (json.RawMessage, error) {
+	return json.Marshal(stepResultEnvelope{Result: stepResultEnvelopeBody{
+		Mode: "recompute_oversize", ReferenceVersion: stepResultReferenceVersion,
+		SizeBytes: sizeBytes, PayloadSchemaVersion: schemaVersion,
+	}})
+}
+
+func unmarshalOversizeRecomputeEnvelope(raw json.RawMessage, schemaVersion int) (int64, bool) {
+	var outer map[string]json.RawMessage
+	if json.Unmarshal(raw, &outer) != nil || len(outer) != 1 {
+		return 0, false
+	}
+	body, ok := outer["_agentkitStepResult"]
+	if !ok {
+		return 0, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var envelope stepResultEnvelopeBody
+	if decoder.Decode(&envelope) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		envelope.Mode != "recompute_oversize" || envelope.ReferenceVersion != stepResultReferenceVersion ||
+		envelope.Ref != "" || envelope.SHA256 != "" || envelope.SizeBytes <= MaxDurableStepResultBytes ||
+		envelope.PayloadSchemaVersion != schemaVersion {
+		return 0, false
+	}
+	return envelope.SizeBytes, true
 }
 
 // unmarshalStepResultEnvelope treats an incomplete/unknown marker as ordinary

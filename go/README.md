@@ -147,23 +147,26 @@ and out of Inngest — a value that cannot survive serialization fails in
 tests rather than first in a production replay.
 
 Every operation defaults to `agentkit.ReplayMemoized`. A reviewed, read-only
-tool may opt into recomputation when rereading the current snapshot is safe:
+tool whose large result is safe to reread may opt into oversize-only
+recomputation:
 
 ```go
 read := agentkit.NewTool[state]("read_file", "Read one file.", handler,
-	agentkit.WithReplayPolicy[state](agentkit.ReplayRecompute))
+	agentkit.WithReplayPolicy[state](agentkit.ReplayRecomputeOversize))
 ```
 
-`ReplayRecompute` bypasses Inngest memoization and runs once per driver replay.
-It must never be used for inference, billing, external calls with a charge,
-state mutations, or another side effect. The policy is semantic; AgentKit does
-not switch policies based on payload size.
+With `ReplayRecomputeOversize`, results up to 2 MiB use the normal exact result
+store. A larger result is never stored: Inngest receives a bounded marker and
+AgentKit reruns the handler when the driver replays that step. `ReplayRecompute`
+remains available for operations that should rerun on every driver replay.
+Neither policy may be used for inference, billing, charged external calls,
+state mutations, or another side effect.
 
 Applications can set `RuntimePorts.StepResults` to keep exact memoized results
 outside Inngest. AgentKit stores uncompressed JSON through the application port
-and memoizes only a checksum-verified reference. The hard result limit is 2 MiB;
-an oversize memoized result returns `ErrStepResultTooLarge` and is not silently
-recomputed. Existing inline Inngest values remain replay-compatible.
+and memoizes only a checksum-verified reference. The hard storage limit is
+2 MiB. An oversize result fails closed unless its operation explicitly uses
+`ReplayRecomputeOversize`. Existing inline Inngest values remain replay-compatible.
 
 > [!IMPORTANT]
 > inngestgo suspends a function by **panicking** with an internal control
