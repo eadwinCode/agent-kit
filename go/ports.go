@@ -91,6 +91,12 @@ type RuntimePorts struct {
 	// application's durable facts have settled.
 	Finalizer Finalizer
 
+	// StepResults stores exact memoized durable-step results outside the
+	// workflow engine. Network runs with a stable RunID wrap their Step so
+	// Inngest receives only a bounded reference. Nil keeps legacy inline step
+	// results.
+	StepResults StepResultStore
+
 	// Sink receives every standard envelope. When set it replaces
 	// StreamingConfig.Publish as the delivery path, so an adapter can own
 	// ordering, batching and backpressure.

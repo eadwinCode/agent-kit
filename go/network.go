@@ -343,6 +343,15 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		ports = r.Network.Ports
 	}
 	r.ports = ports
+	if ports != nil && ports.StepResults != nil {
+		var wrapErr error
+		step, wrapErr = NewStepResultStep(step, ports.StepResults, StepResultStepConfig{
+			Scope: ports.Scope, RunID: networkRunID, SchemaVersion: ContractSchemaVersion,
+		})
+		if wrapErr != nil {
+			return wrapErr
+		}
+	}
 	controller := newRunController(ports, nil, nil)
 	approvals := newApprovalController(ports, nil)
 	r.controller = controller

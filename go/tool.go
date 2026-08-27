@@ -27,6 +27,12 @@ type Tool[T any] struct {
 	// jsonschema struct tags). Nil means the tool takes no parameters.
 	InputSchema json.RawMessage
 
+	// ReplayPolicy declares whether AgentKit memoizes the complete tool result
+	// and state patch or may execute the handler again during driver replay.
+	// Empty means ReplayMemoized. ReplayRecompute is restricted to reviewed,
+	// side-effect-free operations whose reread semantics are acceptable.
+	ReplayPolicy ReplayPolicy
+
 	// ManualStep opts this tool OUT of AgentKit's automatic durable-step
 	// wrapping.
 	//
@@ -39,10 +45,7 @@ type Tool[T any] struct {
 	//   - it drives step tooling itself — step.WaitForEvent
 	//     (human-in-the-loop), step.Invoke (sub-functions), or its own
 	//     multi-checkpoint durable.Run loop (a long subagent) — wrapping it
-	//     would nest steps, which Inngest forbids; or
-	//   - it is an idempotent large-output read (e.g. a screenshot) whose
-	//     result must not occupy step state (step outputs share a per-run
-	//     ~4MB budget) — re-running a read on replay wastes only latency.
+	//     would nest steps, which Inngest forbids.
 	//
 	// Tools whose primary effect is mutating State.Data do NOT need this:
 	// AgentKit re-applies their state delta across replays automatically.
@@ -177,6 +180,13 @@ type ToolOption[T any] func(*Tool[T])
 // Tool.ManualStep.
 func WithManualStep[T any]() ToolOption[T] {
 	return func(t *Tool[T]) { t.ManualStep = true }
+}
+
+// WithReplayPolicy explicitly classifies the tool's replay behavior. Most
+// tools should omit it and retain ReplayMemoized. It cannot be combined with
+// WithManualStep because a manual tool owns its own durability boundaries.
+func WithReplayPolicy[T any](policy ReplayPolicy) ToolOption[T] {
+	return func(t *Tool[T]) { t.ReplayPolicy = policy }
 }
 
 // WithStrict requests strict schema validation.

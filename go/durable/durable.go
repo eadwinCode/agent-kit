@@ -58,6 +58,40 @@ type Step interface {
 	Run(ctx context.Context, id string, fn RunFn) (json.RawMessage, error)
 }
 
+// ReplayPolicy declares whether a completed operation must replay its exact
+// result or may be executed again when the workflow driver replays.
+//
+// The zero value is ReplayMemoized. Recomputability is a semantic promise made
+// by trusted application code; it is never inferred from the result size.
+type ReplayPolicy string
+
+const (
+	// ReplayMemoized preserves the completed result across driver replays. Use
+	// it for inference, side effects, state mutations and non-repeatable reads.
+	ReplayMemoized ReplayPolicy = "memoized"
+
+	// ReplayRecompute executes the operation inline on every driver replay and
+	// does not ask Step to memoize the result. It is safe only for reviewed,
+	// repeatable, side-effect-free work.
+	ReplayRecompute ReplayPolicy = "recompute"
+)
+
+// RunOptions configures one typed durable operation.
+type RunOptions struct {
+	ReplayPolicy ReplayPolicy
+}
+
+// Validate rejects policy values that AgentKit does not understand. An empty
+// policy is the backward-compatible ReplayMemoized default.
+func (o RunOptions) Validate() error {
+	switch o.ReplayPolicy {
+	case "", ReplayMemoized, ReplayRecompute:
+		return nil
+	default:
+		return fmt.Errorf("agentkit: unknown durable replay policy %q", o.ReplayPolicy)
+	}
+}
+
 // Inngest returns the default Step. It behaves correctly in all three
 // execution contexts without caller-side detection:
 //
@@ -92,6 +126,10 @@ func IsControlHijack(recovered any) bool {
 		strings.HasSuffix(t.PkgPath(), "/internal/sdkrequest")
 }
 
+// IsWithinStep reports whether ctx belongs to a live Inngest step body. Step
+// wrappers use it to preserve nested-step collapse without importing the SDK.
+func IsWithinStep(ctx context.Context) bool { return step.IsWithinStep(ctx) }
+
 // InngestStep implements Step on the Inngest Go SDK. See Inngest.
 type InngestStep struct{}
 
@@ -120,14 +158,35 @@ func (Inline) Run(ctx context.Context, id string, fn RunFn) (json.RawMessage, er
 // so T must survive a JSON round-trip — the same constraint Inngest itself
 // imposes on memoized values.
 func Run[T any](ctx context.Context, s Step, id string, fn func(ctx context.Context) (T, error)) (T, error) {
+	return RunWithOptions(ctx, s, id, RunOptions{}, fn)
+}
+
+// RunWithOptions executes fn with an explicit replay policy. ReplayRecompute
+// deliberately bypasses Step.Run: the driver calls it again whenever it walks
+// the function from the top, and no durable result is created. Both paths keep
+// the same JSON parity round-trip.
+func RunWithOptions[T any](ctx context.Context, s Step, id string, opts RunOptions, fn func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
-	raw, err := s.Run(ctx, id, func(ctx context.Context) (json.RawMessage, error) {
+	if err := opts.Validate(); err != nil {
+		return zero, err
+	}
+	if s == nil {
+		s = Inngest()
+	}
+	encoded := func(ctx context.Context) (json.RawMessage, error) {
 		v, err := fn(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return jsonutil.Marshal(v)
-	})
+	}
+	var raw json.RawMessage
+	var err error
+	if opts.ReplayPolicy == ReplayRecompute {
+		raw, err = encoded(ctx)
+	} else {
+		raw, err = s.Run(ctx, id, encoded)
+	}
 	if err != nil {
 		return zero, err
 	}

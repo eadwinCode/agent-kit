@@ -1141,6 +1141,12 @@ func (a *Agent[T]) runToolHandler(ctx context.Context, tool Tool[T], call ToolMe
 	}
 
 	if tool.ManualStep {
+		if tool.ReplayPolicy != "" {
+			return errResult(fmt.Errorf(
+				"agentkit: tool %q cannot combine ManualStep with replay policy %q",
+				tool.Name, tool.ReplayPolicy,
+			))
+		}
 		return invoke(ctx)
 	}
 
@@ -1154,10 +1160,29 @@ func (a *Agent[T]) runToolHandler(ctx context.Context, tool Tool[T], call ToolMe
 	index := run.State.nextDurableToolCallIndex()
 	stepID := fmt.Sprintf("%s/tool/%s/%d", a.Name, call.Name, index)
 
-	m, err := durable.Run(ctx, step, stepID, func(ctx context.Context) (memoized, error) {
+	m, err := durable.RunWithOptions(ctx, step, stepID, durable.RunOptions{
+		ReplayPolicy: tool.ReplayPolicy,
+	}, func(ctx context.Context) (memoized, error) {
 		before, beforeErr := jsonutil.Marshal(run.State.Data)
 		result := invoke(ctx)
 		after, afterErr := jsonutil.Marshal(run.State.Data)
+		if tool.ReplayPolicy == ReplayRecompute {
+			if beforeErr != nil || afterErr != nil {
+				return memoized{}, fmt.Errorf(
+					"agentkit: recomputable tool %q state could not be verified as unchanged",
+					tool.Name,
+				)
+			}
+			if !bytes.Equal(before, after) {
+				var original T
+				if restoreErr := json.Unmarshal(before, &original); restoreErr == nil {
+					run.State.ImportData(original)
+				}
+				return memoized{}, fmt.Errorf(
+					"agentkit: recomputable tool %q mutated state", tool.Name,
+				)
+			}
+		}
 		var patch json.RawMessage
 		if afterErr == nil && (beforeErr != nil || !bytes.Equal(before, after)) {
 			patch = after

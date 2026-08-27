@@ -146,6 +146,25 @@ Values round-trip through JSON on every path, so behaviour is identical in
 and out of Inngest — a value that cannot survive serialization fails in
 tests rather than first in a production replay.
 
+Every operation defaults to `agentkit.ReplayMemoized`. A reviewed, read-only
+tool may opt into recomputation when rereading the current snapshot is safe:
+
+```go
+read := agentkit.NewTool[state]("read_file", "Read one file.", handler,
+	agentkit.WithReplayPolicy[state](agentkit.ReplayRecompute))
+```
+
+`ReplayRecompute` bypasses Inngest memoization and runs once per driver replay.
+It must never be used for inference, billing, external calls with a charge,
+state mutations, or another side effect. The policy is semantic; AgentKit does
+not switch policies based on payload size.
+
+Applications can set `RuntimePorts.StepResults` to keep exact memoized results
+outside Inngest. AgentKit stores uncompressed JSON through the application port
+and memoizes only a checksum-verified reference. The hard result limit is 2 MiB;
+an oversize memoized result returns `ErrStepResultTooLarge` and is not silently
+recomputed. Existing inline Inngest values remain replay-compatible.
+
 > [!IMPORTANT]
 > inngestgo suspends a function by **panicking** with an internal control
 > value. So: never wrap a step call in `recover()` — not in a tool handler,
@@ -226,6 +245,7 @@ capability.
 | `ApprovalStore`    | Issue → wait → resolve once → consume once, replay-safe at each step.                                  |
 | `StreamSink`       | Outbound delivery, when the application owns transport and backpressure.                               |
 | `Finalizer`        | Holds the terminal until the application's durable facts have settled.                                 |
+| `StepResultStore`  | Stores exact uncompressed memoized step results while Inngest keeps a bounded reference.                |
 
 ```go
 ports := &agentkit.RuntimePorts{
@@ -234,6 +254,7 @@ ports := &agentkit.RuntimePorts{
 	Control:   myControl,   // agentkit.ControlStore
 	Approvals: myApprovals, // agentkit.ApprovalStore
 	Finalizer: myFinalizer, // agentkit.Finalizer
+	StepResults: myResults, // agentkit.StepResultStore
 	// Scope is an OPAQUE owner token. AgentKit never parses it and assumes
 	// no tenancy model: compose whatever identifies the conversation owner
 	// in yours — a composite key, a UUID, an opaque handle. Structured
