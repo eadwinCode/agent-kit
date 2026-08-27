@@ -104,10 +104,11 @@ type StepResultRunQuery struct {
 
 // StepResultRunLoader is the optional bulk-read extension to StepResultStore.
 // Implementations should fetch the run in one storage operation. The map is
-// keyed by StepResultLocator.StepID. AgentKit then resolves every reference in
-// the current workflow callback from memory. A missing key always falls back to
-// a fresh StepResultStore lookup, so bounded/partial snapshots and concurrent
-// lost-ack recovery remain safe.
+// keyed by StepResultLocator.StepID and ownership of the returned map and its
+// payloads transfers to AgentKit. AgentKit resolves snapshot hits from memory
+// but does not retain point-read misses or new writes. A missing key always
+// falls back to a fresh StepResultStore lookup, so bounded/partial snapshots and
+// concurrent lost-ack recovery remain safe without unbounded cache growth.
 type StepResultRunLoader interface {
 	LoadRun(ctx context.Context, query StepResultRunQuery) (map[string]StoredStepResult, error)
 }
@@ -219,7 +220,6 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 			return nil, fmt.Errorf("%w: durable step %q store changed payload", ErrStepResultConflict, id)
 		}
 		local = &stored
-		s.cache(locator.StepID, stored)
 		return marshalStepResultEnvelope(stored.Ref)
 	})
 	if err != nil {
@@ -280,7 +280,6 @@ func (s *stepResultStep) loadRun(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("agentkit: load durable results for run %q: %w", s.cfg.RunID, err)
 	}
-	loaded := make(map[string]StoredStepResult, len(rows))
 	for stepID, stored := range rows {
 		if strings.TrimSpace(stepID) == "" {
 			return fmt.Errorf("%w: run %q returned an empty durable step id", ErrStepResultCorrupt, s.cfg.RunID)
@@ -292,9 +291,10 @@ func (s *stepResultStep) loadRun(ctx context.Context) error {
 		if err := validateStoredStepResult(stepID, locator, stored); err != nil {
 			return err
 		}
-		loaded[stepID] = cloneStepResultValue(stored)
 	}
-	s.loadedRows, s.loaded = loaded, true
+	// LoadRun transfers ownership of its map to AgentKit, so retaining it does
+	// not require a second full-payload clone.
+	s.loadedRows, s.loaded = rows, true
 	return nil
 }
 
@@ -314,13 +314,12 @@ func (s *stepResultStep) lookup(ctx context.Context, logicalID string, locator S
 		if err := validateStoredStepResult(logicalID, locator, stored); err != nil {
 			return StoredStepResult{}, err
 		}
-		s.cache(locator.StepID, stored)
-		return cloneStepResultValue(stored), nil
+		return stored, nil
 	}
 	if err := validateStoredStepResult(logicalID, locator, stored); err != nil {
 		return StoredStepResult{}, err
 	}
-	return cloneStepResultValue(stored), nil
+	return stored, nil
 }
 
 func (s *stepResultStep) resolve(ctx context.Context, logicalID string, locator StepResultLocator, ref StepResultRef) (json.RawMessage, error) {
@@ -348,18 +347,6 @@ func (s *stepResultStep) resolveLocator(ctx context.Context, logicalID string, l
 		return nil, ErrStepResultUnauthorized
 	}
 	return append(json.RawMessage(nil), stored.Payload...), nil
-}
-
-func (s *stepResultStep) cache(stepID string, stored StoredStepResult) {
-	if _, ok := s.store.(StepResultRunLoader); !ok || !s.loaded {
-		return
-	}
-	s.loadedRows[stepID] = cloneStepResultValue(stored)
-}
-
-func cloneStepResultValue(stored StoredStepResult) StoredStepResult {
-	stored.Payload = append(json.RawMessage(nil), stored.Payload...)
-	return stored
 }
 
 type stepResultEnvelope struct {
