@@ -94,20 +94,6 @@ func TestRunWithOptionsRejectsUnknownPolicyBeforeWork(t *testing.T) {
 	}
 }
 
-func TestRunWithOptionsOversizePolicyRequiresOptionsAwareStep(t *testing.T) {
-	step := &countingStep{}
-	ran := false
-	_, err := RunWithOptions(context.Background(), step, "read", RunOptions{
-		ReplayPolicy: ReplayRecomputeOversize,
-	}, func(context.Context) (bool, error) {
-		ran = true
-		return true, nil
-	})
-	if err == nil || ran || step.calls != 0 {
-		t.Fatalf("err=%v ran=%v step calls=%d", err, ran, step.calls)
-	}
-}
-
 // TestInngestStepOutsideFunction: with no Inngest manager in ctx, the SDK
 // executes the function directly — so the default Step is safe everywhere
 // and callers never do context detection.

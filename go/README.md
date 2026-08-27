@@ -146,27 +146,18 @@ Values round-trip through JSON on every path, so behaviour is identical in
 and out of Inngest — a value that cannot survive serialization fails in
 tests rather than first in a production replay.
 
-Every operation defaults to `agentkit.ReplayMemoized`. A reviewed, read-only
-tool whose large result is safe to reread may opt into oversize-only
-recomputation:
-
-```go
-read := agentkit.NewTool[state]("read_file", "Read one file.", handler,
-	agentkit.WithReplayPolicy[state](agentkit.ReplayRecomputeOversize))
-```
-
-With `ReplayRecomputeOversize`, results up to 2 MiB use the normal exact result
-store. A larger result is never stored: Inngest receives a bounded marker and
-AgentKit reruns the handler when the driver replays that step. `ReplayRecompute`
-remains available for operations that should rerun on every driver replay.
-Neither policy may be used for inference, billing, charged external calls,
-state mutations, or another side effect.
+Every operation defaults to `agentkit.ReplayMemoized`. Results up to 2 MiB use
+the normal exact result store. A larger serialized result is never stored:
+Inngest receives a bounded marker and AgentKit reruns the durable operation when
+the driver replays that step. This is calculated from the encoded byte size and
+does not require a tool-level replay policy. `ReplayRecompute` remains available
+for operations that intentionally rerun on every driver replay.
 
 Applications can set `RuntimePorts.StepResults` to keep exact memoized results
 outside Inngest. AgentKit stores uncompressed JSON through the application port
 and memoizes only a checksum-verified reference. The hard storage limit is
-2 MiB. An oversize result fails closed unless its operation explicitly uses
-`ReplayRecomputeOversize`. Existing inline Inngest values remain replay-compatible.
+2 MiB; oversized results use the automatic bounded-marker path. Existing inline
+Inngest values and previously written oversize markers remain replay-compatible.
 
 > [!IMPORTANT]
 > inngestgo suspends a function by **panicking** with an internal control

@@ -1166,7 +1166,7 @@ func (a *Agent[T]) runToolHandler(ctx context.Context, tool Tool[T], call ToolMe
 		before, beforeErr := jsonutil.Marshal(run.State.Data)
 		result := invoke(ctx)
 		after, afterErr := jsonutil.Marshal(run.State.Data)
-		if tool.ReplayPolicy == ReplayRecompute || tool.ReplayPolicy == ReplayRecomputeOversize {
+		if tool.ReplayPolicy == ReplayRecompute {
 			if beforeErr != nil || afterErr != nil {
 				return memoized{}, fmt.Errorf(
 					"agentkit: recomputable tool %q state could not be verified as unchanged",
