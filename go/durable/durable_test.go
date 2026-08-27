@@ -2,6 +2,7 @@ package durable
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -12,6 +13,13 @@ type payload struct {
 	Name  string         `json:"name"`
 	Count int            `json:"count"`
 	When  *jsonutil.Time `json:"when,omitempty"`
+}
+
+type countingStep struct{ calls int }
+
+func (s *countingStep) Run(ctx context.Context, _ string, fn RunFn) (json.RawMessage, error) {
+	s.calls++
+	return fn(ctx)
 }
 
 // TestRunRoundTripsOnInlinePath verifies decision 2: the non-durable path
@@ -47,6 +55,42 @@ func TestRunPropagatesError(t *testing.T) {
 	})
 	if !errors.Is(err, sentinel) {
 		t.Errorf("want sentinel error, got %v", err)
+	}
+}
+
+func TestRunWithOptionsRecomputeBypassesStep(t *testing.T) {
+	step := &countingStep{}
+	runs := 0
+	for range 2 {
+		got, err := RunWithOptions(context.Background(), step, "read", RunOptions{
+			ReplayPolicy: ReplayRecompute,
+		}, func(context.Context) (int, error) {
+			runs++
+			return runs, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != runs {
+			t.Fatalf("got %d, run %d", got, runs)
+		}
+	}
+	if step.calls != 0 || runs != 2 {
+		t.Fatalf("step calls=%d work runs=%d", step.calls, runs)
+	}
+}
+
+func TestRunWithOptionsRejectsUnknownPolicyBeforeWork(t *testing.T) {
+	step := &countingStep{}
+	ran := false
+	_, err := RunWithOptions(context.Background(), step, "bad", RunOptions{
+		ReplayPolicy: "sometimes",
+	}, func(context.Context) (bool, error) {
+		ran = true
+		return true, nil
+	})
+	if err == nil || ran || step.calls != 0 {
+		t.Fatalf("err=%v ran=%v step calls=%d", err, ran, step.calls)
 	}
 }
 
