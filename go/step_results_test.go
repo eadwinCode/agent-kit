@@ -282,6 +282,26 @@ func TestStepResultStepBulkSnapshotMissFallsBackToFreshLookup(t *testing.T) {
 	if store.loads != 1 || store.lookups != 1 || store.puts != 1 {
 		t.Fatalf("loads=%d lookups=%d puts=%d", store.loads, store.lookups, store.puts)
 	}
+	if len(wrapped.loadedRows) != 0 {
+		t.Fatalf("point-read result grew bounded snapshot cache: rows=%d", len(wrapped.loadedRows))
+	}
+}
+
+func TestStepResultStepBulkCacheDoesNotRetainNewWrites(t *testing.T) {
+	inner := newPositionalResultMemoStep()
+	store := newBatchResultStoreFake()
+	step := newStoredTestStep(t, inner, store)
+	wrapped := step.(*stepResultStep)
+
+	got, err := durable.Run(t.Context(), step, "new", func(context.Context) (string, error) {
+		return "written", nil
+	})
+	if err != nil || got != "written" {
+		t.Fatalf("result=%q err=%v", got, err)
+	}
+	if !wrapped.loaded || len(wrapped.loadedRows) != 0 {
+		t.Fatalf("new write grew bounded snapshot cache: loaded=%t rows=%d", wrapped.loaded, len(wrapped.loadedRows))
+	}
 }
 
 func TestStepResultStepResolvesLegacyBareStepReference(t *testing.T) {
