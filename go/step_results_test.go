@@ -236,7 +236,7 @@ func TestStepResultStepBulkLoadsRunOncePerWorkflowCallback(t *testing.T) {
 			t.Fatalf("initial result=%q want=%q err=%v", got, want, err)
 		}
 	}
-	if store.loads != 1 || store.lookups != 0 || store.resolves != 0 || store.puts != 2 {
+	if store.loads != 1 || store.lookups != 2 || store.resolves != 0 || store.puts != 2 {
 		t.Fatalf("initial loads=%d lookups=%d resolves=%d puts=%d", store.loads, store.lookups, store.resolves, store.puts)
 	}
 
@@ -251,8 +251,65 @@ func TestStepResultStepBulkLoadsRunOncePerWorkflowCallback(t *testing.T) {
 			t.Fatalf("replayed result=%q want=%q err=%v", got, want, err)
 		}
 	}
-	if store.loads != 2 || store.lookups != 0 || store.resolves != 0 || store.puts != 2 {
+	if store.loads != 2 || store.lookups != 2 || store.resolves != 0 || store.puts != 2 {
 		t.Fatalf("replay loads=%d lookups=%d resolves=%d puts=%d", store.loads, store.lookups, store.resolves, store.puts)
+	}
+}
+
+func TestStepResultStepBulkSnapshotMissFallsBackToFreshLookup(t *testing.T) {
+	inner := newPositionalResultMemoStep()
+	store := newBatchResultStoreFake()
+	step := newStoredTestStep(t, inner, store)
+	wrapped := step.(*stepResultStep)
+	if err := wrapped.loadRun(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	locator := StepResultLocator{
+		Scope: "scope-1", RunID: "run-1",
+		StepID: qualifiedStepResultID("late", 0), SchemaVersion: 1,
+	}
+	if _, err := store.Put(t.Context(), locator, json.RawMessage(`"from-concurrent-attempt"`)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := durable.Run(t.Context(), step, "late", func(context.Context) (string, error) {
+		t.Fatal("work ran despite a fresh point lookup finding the durable result")
+		return "", nil
+	})
+	if err != nil || got != "from-concurrent-attempt" {
+		t.Fatalf("result=%q err=%v", got, err)
+	}
+	if store.loads != 1 || store.lookups != 1 || store.puts != 1 {
+		t.Fatalf("loads=%d lookups=%d puts=%d", store.loads, store.lookups, store.puts)
+	}
+}
+
+func TestStepResultStepResolvesLegacyBareStepReference(t *testing.T) {
+	inner := newPositionalResultMemoStep()
+	store := newResultStoreFake()
+	legacy := StepResultLocator{
+		Scope: "scope-1", RunID: "run-1", StepID: "inference-1", SchemaVersion: 1,
+	}
+	stored, err := store.Put(t.Context(), legacy, json.RawMessage(`{"answer":"legacy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := marshalStepResultEnvelope(stored.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner.cache[positionalStepKey("inference-1", 0)] = envelope
+
+	step := newStoredTestStep(t, inner, store)
+	got, err := durable.Run(t.Context(), step, "inference-1", func(context.Context) (map[string]string, error) {
+		t.Fatal("legacy memoized inference body ran")
+		return nil, nil
+	})
+	if err != nil || got["answer"] != "legacy" {
+		t.Fatalf("result=%v err=%v", got, err)
+	}
+	if store.resolves != 2 {
+		t.Fatalf("resolve calls=%d, want qualified miss plus legacy resolve", store.resolves)
 	}
 }
 

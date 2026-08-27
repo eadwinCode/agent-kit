@@ -162,7 +162,10 @@ Repeated logical step ids are qualified with their deterministic occurrence
 before they reach the store, matching Inngest's positional memoization. A store
 may additionally implement `StepResultRunLoader`; AgentKit then loads one scoped
 run snapshot per workflow callback and resolves historical references in memory
-instead of performing one point read per replayed step.
+instead of performing one point read per replayed step. Snapshots may be bounded:
+a missing key falls back to a fresh point lookup, preserving concurrent lost-ack
+recovery. Reference envelopes written before occurrence-qualified locators remain
+resolvable through their legacy bare step ID.
 
 > [!IMPORTANT]
 > inngestgo suspends a function by **panicking** with an internal control

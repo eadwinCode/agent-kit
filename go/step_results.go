@@ -105,8 +105,9 @@ type StepResultRunQuery struct {
 // StepResultRunLoader is the optional bulk-read extension to StepResultStore.
 // Implementations should fetch the run in one storage operation. The map is
 // keyed by StepResultLocator.StepID. AgentKit then resolves every reference in
-// the current workflow callback from memory instead of issuing one point read
-// per replayed step.
+// the current workflow callback from memory. A missing key always falls back to
+// a fresh StepResultStore lookup, so bounded/partial snapshots and concurrent
+// lost-ack recovery remain safe.
 type StepResultRunLoader interface {
 	LoadRun(ctx context.Context, query StepResultRunQuery) (map[string]StoredStepResult, error)
 }
@@ -306,7 +307,15 @@ func (s *stepResultStep) lookup(ctx context.Context, logicalID string, locator S
 	}
 	stored, ok := s.loadedRows[locator.StepID]
 	if !ok {
-		return StoredStepResult{}, ErrStepResultNotFound
+		stored, err := s.store.Lookup(ctx, locator)
+		if err != nil {
+			return StoredStepResult{}, err
+		}
+		if err := validateStoredStepResult(logicalID, locator, stored); err != nil {
+			return StoredStepResult{}, err
+		}
+		s.cache(locator.StepID, stored)
+		return cloneStepResultValue(stored), nil
 	}
 	if err := validateStoredStepResult(logicalID, locator, stored); err != nil {
 		return StoredStepResult{}, err
@@ -315,6 +324,19 @@ func (s *stepResultStep) lookup(ctx context.Context, logicalID string, locator S
 }
 
 func (s *stepResultStep) resolve(ctx context.Context, logicalID string, locator StepResultLocator, ref StepResultRef) (json.RawMessage, error) {
+	payload, err := s.resolveLocator(ctx, logicalID, locator, ref)
+	if err == nil || !errors.Is(err, ErrStepResultNotFound) {
+		return payload, err
+	}
+	// Reference envelopes memoized before occurrence-qualified locators shipped
+	// still point at the legacy bare logical step id. Resolve that exact reference
+	// without using the legacy row for new lookup-before-work decisions.
+	legacy := locator
+	legacy.StepID = logicalID
+	return s.store.Resolve(ctx, legacy, ref)
+}
+
+func (s *stepResultStep) resolveLocator(ctx context.Context, logicalID string, locator StepResultLocator, ref StepResultRef) (json.RawMessage, error) {
 	if _, ok := s.store.(StepResultRunLoader); !ok {
 		return s.store.Resolve(ctx, locator, ref)
 	}
