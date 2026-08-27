@@ -20,14 +20,13 @@ import (
 type ReplayPolicy = durable.ReplayPolicy
 
 const (
-	ReplayMemoized          = durable.ReplayMemoized
-	ReplayRecompute         = durable.ReplayRecompute
-	ReplayRecomputeOversize = durable.ReplayRecomputeOversize
+	ReplayMemoized  = durable.ReplayMemoized
+	ReplayRecompute = durable.ReplayRecompute
 )
 
-// MaxDurableStepResultBytes is the hard uncompressed storage limit. A
-// ReplayRecomputeOversize operation stores a bounded marker instead of an
-// oversize payload; every other memoized operation fails closed.
+// MaxDurableStepResultBytes is the hard uncompressed storage limit. Results
+// above the limit are never stored: AgentKit memoizes a bounded marker and
+// recomputes the durable operation when the workflow driver replays it.
 const MaxDurableStepResultBytes int64 = 2 << 20
 
 const stepResultReferenceVersion = 1
@@ -171,7 +170,7 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 		if !json.Valid(payload) {
 			return nil, fmt.Errorf("%w: durable step %q result is invalid JSON", ErrStepResultCorrupt, id)
 		}
-		if int64(len(payload)) > MaxDurableStepResultBytes && opts.ReplayPolicy == ReplayRecomputeOversize {
+		if int64(len(payload)) > MaxDurableStepResultBytes {
 			localOversize = append(json.RawMessage(nil), payload...)
 			return marshalOversizeRecomputeEnvelope(int64(len(payload)), locator.SchemaVersion)
 		}
@@ -197,9 +196,6 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 	}
 
 	if _, recompute := unmarshalOversizeRecomputeEnvelope(raw, locator.SchemaVersion); recompute {
-		if opts.ReplayPolicy != ReplayRecomputeOversize {
-			return nil, fmt.Errorf("%w: durable step %q has an unexpected recompute marker", ErrStepResultCorrupt, id)
-		}
 		if localOversize != nil {
 			return append(json.RawMessage(nil), localOversize...), nil
 		}

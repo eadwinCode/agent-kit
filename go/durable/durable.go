@@ -58,9 +58,8 @@ type Step interface {
 	Run(ctx context.Context, id string, fn RunFn) (json.RawMessage, error)
 }
 
-// OptionsStep is implemented by durability wrappers that need the replay
-// policy while deciding how to persist a result. Ordinary Step implementations
-// do not need to implement it.
+// OptionsStep is implemented by durability wrappers that need explicit run
+// options. Ordinary Step implementations do not need to implement it.
 type OptionsStep interface {
 	RunWithOptions(ctx context.Context, id string, opts RunOptions, fn RunFn) (json.RawMessage, error)
 }
@@ -68,8 +67,9 @@ type OptionsStep interface {
 // ReplayPolicy declares whether a completed operation must replay its exact
 // result or may be executed again when the workflow driver replays.
 //
-// The zero value is ReplayMemoized. Recomputability is a semantic promise made
-// by trusted application code; it is never inferred from the result size.
+// The zero value is ReplayMemoized. ReplayRecompute is a semantic promise made
+// by trusted application code. Oversized-result handling is independent of
+// this policy and is decided by the configured Step after serialization.
 type ReplayPolicy string
 
 const (
@@ -81,12 +81,6 @@ const (
 	// does not ask Step to memoize the result. It is safe only for reviewed,
 	// repeatable, side-effect-free work.
 	ReplayRecompute ReplayPolicy = "recompute"
-
-	// ReplayRecomputeOversize memoizes a result normally when it fits the
-	// configured durable store limit. An options-aware step may instead memoize
-	// a bounded marker and recompute only when the result exceeds that limit.
-	// It is safe only for reviewed, repeatable, side-effect-free work.
-	ReplayRecomputeOversize ReplayPolicy = "recompute_oversize"
 )
 
 // RunOptions configures one typed durable operation.
@@ -98,7 +92,7 @@ type RunOptions struct {
 // policy is the backward-compatible ReplayMemoized default.
 func (o RunOptions) Validate() error {
 	switch o.ReplayPolicy {
-	case "", ReplayMemoized, ReplayRecompute, ReplayRecomputeOversize:
+	case "", ReplayMemoized, ReplayRecompute:
 		return nil
 	default:
 		return fmt.Errorf("agentkit: unknown durable replay policy %q", o.ReplayPolicy)
@@ -175,9 +169,9 @@ func Run[T any](ctx context.Context, s Step, id string, fn func(ctx context.Cont
 }
 
 // RunWithOptions executes fn with an explicit replay policy. ReplayRecompute
-// deliberately bypasses Step.Run. ReplayRecomputeOversize delegates to an
-// OptionsStep so it can decide after execution whether to persist a reference
-// or a bounded recompute marker. Every path keeps the same JSON round-trip.
+// deliberately bypasses Step.Run. Every other policy delegates to Step, which
+// may apply storage rules after the result has been serialized. Every path
+// keeps the same JSON round-trip.
 func RunWithOptions[T any](ctx context.Context, s Step, id string, opts RunOptions, fn func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
 	if err := opts.Validate(); err != nil {
@@ -199,8 +193,6 @@ func RunWithOptions[T any](ctx context.Context, s Step, id string, opts RunOptio
 		raw, err = encoded(ctx)
 	} else if optionStep, ok := s.(OptionsStep); ok {
 		raw, err = optionStep.RunWithOptions(ctx, id, opts, encoded)
-	} else if opts.ReplayPolicy == ReplayRecomputeOversize {
-		return zero, fmt.Errorf("agentkit: replay policy %q requires an options-aware durable step", opts.ReplayPolicy)
 	} else {
 		raw, err = s.Run(ctx, id, encoded)
 	}
