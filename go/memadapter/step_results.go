@@ -17,12 +17,17 @@ import (
 // safe for concurrent tests and local examples.
 type StepResults struct {
 	mu   sync.RWMutex
-	rows map[string]agentkit.StoredStepResult
+	rows map[string]stepResultRow
+}
+
+type stepResultRow struct {
+	locator agentkit.StepResultLocator
+	stored  agentkit.StoredStepResult
 }
 
 // NewStepResults creates an empty result store.
 func NewStepResults() *StepResults {
-	return &StepResults{rows: map[string]agentkit.StoredStepResult{}}
+	return &StepResults{rows: map[string]stepResultRow{}}
 }
 
 func stepResultKey(locator agentkit.StepResultLocator) string {
@@ -42,11 +47,11 @@ func cloneStepResult(stored agentkit.StoredStepResult) agentkit.StoredStepResult
 func (s *StepResults) Lookup(_ context.Context, locator agentkit.StepResultLocator) (agentkit.StoredStepResult, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	stored, ok := s.rows[stepResultKey(locator)]
+	row, ok := s.rows[stepResultKey(locator)]
 	if !ok {
 		return agentkit.StoredStepResult{}, agentkit.ErrStepResultNotFound
 	}
-	return cloneStepResult(stored), nil
+	return cloneStepResult(row.stored), nil
 }
 
 func (s *StepResults) Put(_ context.Context, locator agentkit.StepResultLocator, payload json.RawMessage) (agentkit.StoredStepResult, error) {
@@ -65,7 +70,8 @@ func (s *StepResults) Put(_ context.Context, locator agentkit.StepResultLocator,
 	checksum := stepResultChecksum(payload)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.rows[key]; ok {
+	if row, ok := s.rows[key]; ok {
+		existing := row.stored
 		if existing.Ref.SHA256 != checksum || !bytes.Equal(existing.Payload, payload) {
 			return agentkit.StoredStepResult{}, agentkit.ErrStepResultConflict
 		}
@@ -79,21 +85,42 @@ func (s *StepResults) Put(_ context.Context, locator agentkit.StepResultLocator,
 		},
 		Payload: append(json.RawMessage(nil), payload...),
 	}
-	s.rows[key] = stored
+	s.rows[key] = stepResultRow{locator: locator, stored: stored}
 	return cloneStepResult(stored), nil
 }
 
 func (s *StepResults) Resolve(_ context.Context, locator agentkit.StepResultLocator, ref agentkit.StepResultRef) (json.RawMessage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	stored, ok := s.rows[stepResultKey(locator)]
+	row, ok := s.rows[stepResultKey(locator)]
 	if !ok {
 		return nil, agentkit.ErrStepResultNotFound
 	}
+	stored := row.stored
 	if stored.Ref != ref {
 		return nil, agentkit.ErrStepResultUnauthorized
 	}
 	return append(json.RawMessage(nil), stored.Payload...), nil
 }
 
+// LoadRun implements AgentKit's optional bulk replay path. It returns a cloned
+// snapshot so callers cannot mutate the authoritative in-memory rows.
+func (s *StepResults) LoadRun(_ context.Context, query agentkit.StepResultRunQuery) (map[string]agentkit.StoredStepResult, error) {
+	if query.Scope.IsZero() || query.RunID == "" || query.SchemaVersion <= 0 {
+		return nil, fmt.Errorf("%w: incomplete run query", agentkit.ErrStepResultUnauthorized)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	results := make(map[string]agentkit.StoredStepResult)
+	for _, row := range s.rows {
+		if row.locator.Scope != query.Scope || row.locator.RunID != query.RunID ||
+			row.locator.SchemaVersion != query.SchemaVersion {
+			continue
+		}
+		results[row.locator.StepID] = cloneStepResult(row.stored)
+	}
+	return results, nil
+}
+
 var _ agentkit.StepResultStore = (*StepResults)(nil)
+var _ agentkit.StepResultRunLoader = (*StepResults)(nil)

@@ -15,13 +15,16 @@ import (
 type resultStoreFake struct {
 	mu       sync.Mutex
 	rows     map[string]StoredStepResult
+	locators map[string]StepResultLocator
 	lookups  int
 	puts     int
 	resolves int
 }
 
 func newResultStoreFake() *resultStoreFake {
-	return &resultStoreFake{rows: map[string]StoredStepResult{}}
+	return &resultStoreFake{
+		rows: map[string]StoredStepResult{}, locators: map[string]StepResultLocator{},
+	}
 }
 
 func resultLocatorKey(locator StepResultLocator) string {
@@ -64,6 +67,7 @@ func (s *resultStoreFake) Put(_ context.Context, locator StepResultLocator, payl
 		Payload: append(json.RawMessage(nil), payload...),
 	}
 	s.rows[key] = stored
+	s.locators[key] = locator
 	return cloneStoredResult(stored), nil
 }
 
@@ -78,19 +82,60 @@ func (s *resultStoreFake) Resolve(_ context.Context, locator StepResultLocator, 
 	return append(json.RawMessage(nil), stored.Payload...), nil
 }
 
-type resultMemoStep struct {
-	cache map[string]json.RawMessage
+type batchResultStoreFake struct {
+	*resultStoreFake
+	loads int
 }
 
-func (s *resultMemoStep) Run(ctx context.Context, id string, fn durable.RunFn) (json.RawMessage, error) {
-	if raw, ok := s.cache[id]; ok {
+func newBatchResultStoreFake() *batchResultStoreFake {
+	return &batchResultStoreFake{resultStoreFake: newResultStoreFake()}
+}
+
+func (s *batchResultStoreFake) LoadRun(_ context.Context, query StepResultRunQuery) (map[string]StoredStepResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loads++
+	rows := make(map[string]StoredStepResult)
+	for key, locator := range s.locators {
+		if locator.Scope != query.Scope || locator.RunID != query.RunID ||
+			locator.SchemaVersion != query.SchemaVersion {
+			continue
+		}
+		rows[locator.StepID] = cloneStoredResult(s.rows[key])
+	}
+	return rows, nil
+}
+
+type positionalResultMemoStep struct {
+	cache       map[string]json.RawMessage
+	occurrences map[string]int
+}
+
+func newPositionalResultMemoStep() *positionalResultMemoStep {
+	return &positionalResultMemoStep{
+		cache: map[string]json.RawMessage{}, occurrences: map[string]int{},
+	}
+}
+
+func positionalStepKey(id string, occurrence int) string {
+	return fmt.Sprintf("%s#%d", id, occurrence)
+}
+
+func (s *positionalResultMemoStep) Run(ctx context.Context, id string, fn durable.RunFn) (json.RawMessage, error) {
+	key := positionalStepKey(id, s.occurrences[id])
+	s.occurrences[id]++
+	if raw, ok := s.cache[key]; ok {
 		return append(json.RawMessage(nil), raw...), nil
 	}
 	raw, err := fn(ctx)
 	if err == nil {
-		s.cache[id] = append(json.RawMessage(nil), raw...)
+		s.cache[key] = append(json.RawMessage(nil), raw...)
 	}
 	return raw, err
+}
+
+func (s *positionalResultMemoStep) replay() {
+	s.occurrences = map[string]int{}
 }
 
 type lostAcknowledgementStep struct{}
@@ -111,38 +156,111 @@ func newStoredTestStep(t *testing.T, inner durable.Step, store StepResultStore) 
 }
 
 func TestStepResultStepMemoizesReferenceAndResolvesReplay(t *testing.T) {
-	inner := &resultMemoStep{cache: map[string]json.RawMessage{}}
+	inner := newPositionalResultMemoStep()
 	store := newResultStoreFake()
 	step := newStoredTestStep(t, inner, store)
 	work := 0
 
-	for range 2 {
-		got, err := durable.Run(t.Context(), step, "inference-1", func(context.Context) (map[string]string, error) {
-			work++
-			return map[string]string{"answer": "hello"}, nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got["answer"] != "hello" {
-			t.Fatalf("result=%v", got)
-		}
+	got, err := durable.Run(t.Context(), step, "inference-1", func(context.Context) (map[string]string, error) {
+		work++
+		return map[string]string{"answer": "hello"}, nil
+	})
+	if err != nil || got["answer"] != "hello" {
+		t.Fatalf("result=%v err=%v", got, err)
+	}
+
+	inner.replay()
+	step = newStoredTestStep(t, inner, store)
+	got, err = durable.Run(t.Context(), step, "inference-1", func(context.Context) (map[string]string, error) {
+		t.Fatal("memoized inference body ran on replay")
+		return nil, nil
+	})
+	if err != nil || got["answer"] != "hello" {
+		t.Fatalf("replay result=%v err=%v", got, err)
 	}
 
 	if work != 1 || store.puts != 1 || store.resolves != 1 || len(store.rows) != 1 {
 		t.Fatalf("work=%d puts=%d resolves=%d rows=%d", work, store.puts, store.resolves, len(store.rows))
 	}
-	if !strings.Contains(string(inner.cache["inference-1"]), `"_agentkitStepResult"`) ||
-		strings.Contains(string(inner.cache["inference-1"]), "hello") {
-		t.Fatalf("Inngest cache contains the wrong value: %s", inner.cache["inference-1"])
+	cached := inner.cache[positionalStepKey("inference-1", 0)]
+	if !strings.Contains(string(cached), `"_agentkitStepResult"`) || strings.Contains(string(cached), "hello") {
+		t.Fatalf("Inngest cache contains the wrong value: %s", cached)
+	}
+}
+
+func TestStepResultStepDisambiguatesRepeatedIDsAndReplaysPositionally(t *testing.T) {
+	inner := newPositionalResultMemoStep()
+	store := newResultStoreFake()
+	step := newStoredTestStep(t, inner, store)
+	wants := []string{"first", "second"}
+	work := 0
+	for _, want := range wants {
+		got, err := durable.Run(t.Context(), step, "clevix-designer/infer/0", func(context.Context) (string, error) {
+			work++
+			return want, nil
+		})
+		if err != nil || got != want {
+			t.Fatalf("initial occurrence result=%q want=%q err=%v", got, want, err)
+		}
+	}
+	if len(store.rows) != 2 {
+		t.Fatalf("stored rows=%d, want 2", len(store.rows))
+	}
+
+	inner.replay()
+	step = newStoredTestStep(t, inner, store)
+	for _, want := range wants {
+		got, err := durable.Run(t.Context(), step, "clevix-designer/infer/0", func(context.Context) (string, error) {
+			t.Fatal("provider body ran for a positionally memoized inference")
+			return "", nil
+		})
+		if err != nil || got != want {
+			t.Fatalf("replayed occurrence result=%q want=%q err=%v", got, want, err)
+		}
+	}
+	if work != 2 || store.puts != 2 || store.resolves != 2 {
+		t.Fatalf("work=%d puts=%d resolves=%d", work, store.puts, store.resolves)
+	}
+}
+
+func TestStepResultStepBulkLoadsRunOncePerWorkflowCallback(t *testing.T) {
+	inner := newPositionalResultMemoStep()
+	store := newBatchResultStoreFake()
+	step := newStoredTestStep(t, inner, store)
+	wants := []string{"first", "second"}
+	for _, want := range wants {
+		got, err := durable.Run(t.Context(), step, "clevix-designer/infer/0", func(context.Context) (string, error) {
+			return want, nil
+		})
+		if err != nil || got != want {
+			t.Fatalf("initial result=%q want=%q err=%v", got, want, err)
+		}
+	}
+	if store.loads != 1 || store.lookups != 0 || store.resolves != 0 || store.puts != 2 {
+		t.Fatalf("initial loads=%d lookups=%d resolves=%d puts=%d", store.loads, store.lookups, store.resolves, store.puts)
+	}
+
+	inner.replay()
+	step = newStoredTestStep(t, inner, store)
+	for _, want := range wants {
+		got, err := durable.Run(t.Context(), step, "clevix-designer/infer/0", func(context.Context) (string, error) {
+			t.Fatal("provider body ran during bulk-loaded replay")
+			return "", nil
+		})
+		if err != nil || got != want {
+			t.Fatalf("replayed result=%q want=%q err=%v", got, want, err)
+		}
+	}
+	if store.loads != 2 || store.lookups != 0 || store.resolves != 0 || store.puts != 2 {
+		t.Fatalf("replay loads=%d lookups=%d resolves=%d puts=%d", store.loads, store.lookups, store.resolves, store.puts)
 	}
 }
 
 func TestStepResultStepLookupClosesLostAcknowledgementGap(t *testing.T) {
 	store := newResultStoreFake()
-	step := newStoredTestStep(t, lostAcknowledgementStep{}, store)
 	work := 0
 	for range 2 {
+		step := newStoredTestStep(t, lostAcknowledgementStep{}, store)
 		got, err := durable.Run(t.Context(), step, "tool-1", func(context.Context) (string, error) {
 			work++
 			return "edited", nil
@@ -157,9 +275,8 @@ func TestStepResultStepLookupClosesLostAcknowledgementGap(t *testing.T) {
 }
 
 func TestStepResultStepReadsLegacyInlineMemoizedValue(t *testing.T) {
-	inner := &resultMemoStep{cache: map[string]json.RawMessage{
-		"legacy": json.RawMessage(`{"answer":"inline"}`),
-	}}
+	inner := newPositionalResultMemoStep()
+	inner.cache[positionalStepKey("legacy", 0)] = json.RawMessage(`{"answer":"inline"}`)
 	store := newResultStoreFake()
 	step := newStoredTestStep(t, inner, store)
 	got, err := durable.Run(t.Context(), step, "legacy", func(context.Context) (map[string]string, error) {
@@ -189,36 +306,49 @@ func TestStepResultPayloadLimitIsExactAndFailClosed(t *testing.T) {
 }
 
 func TestStepResultStepAutomaticallyRecomputesOnlyOversizeResults(t *testing.T) {
-	inner := &resultMemoStep{cache: map[string]json.RawMessage{}}
+	inner := newPositionalResultMemoStep()
 	store := newResultStoreFake()
 	step := newStoredTestStep(t, inner, store)
 
 	smallRuns := 0
-	for range 2 {
-		got, err := durable.Run(t.Context(), step, "small-result", func(context.Context) (string, error) {
-			smallRuns++
-			return "small", nil
-		})
-		if err != nil || got != "small" {
-			t.Fatalf("small result=%q err=%v", got, err)
-		}
+	got, err := durable.Run(t.Context(), step, "small-result", func(context.Context) (string, error) {
+		smallRuns++
+		return "small", nil
+	})
+	if err != nil || got != "small" {
+		t.Fatalf("small result=%q err=%v", got, err)
 	}
 
 	largeRuns := 0
-	for wantRun := 1; wantRun <= 2; wantRun++ {
-		got, err := durable.Run(t.Context(), step, "large-result", func(context.Context) (string, error) {
-			largeRuns++
-			return fmt.Sprintf("%d:%s", largeRuns, strings.Repeat("x", int(MaxDurableStepResultBytes))), nil
-		})
-		if err != nil || !strings.HasPrefix(got, fmt.Sprintf("%d:", wantRun)) {
-			t.Fatalf("large result prefix=%q err=%v", got[:min(len(got), 8)], err)
-		}
+	got, err = durable.Run(t.Context(), step, "large-result", func(context.Context) (string, error) {
+		largeRuns++
+		return fmt.Sprintf("%d:%s", largeRuns, strings.Repeat("x", int(MaxDurableStepResultBytes))), nil
+	})
+	if err != nil || !strings.HasPrefix(got, "1:") {
+		t.Fatalf("initial large result prefix=%q err=%v", got[:min(len(got), 8)], err)
+	}
+
+	inner.replay()
+	step = newStoredTestStep(t, inner, store)
+	got, err = durable.Run(t.Context(), step, "small-result", func(context.Context) (string, error) {
+		t.Fatal("small memoized body ran on replay")
+		return "", nil
+	})
+	if err != nil || got != "small" {
+		t.Fatalf("replayed small result=%q err=%v", got, err)
+	}
+	got, err = durable.Run(t.Context(), step, "large-result", func(context.Context) (string, error) {
+		largeRuns++
+		return fmt.Sprintf("%d:%s", largeRuns, strings.Repeat("x", int(MaxDurableStepResultBytes))), nil
+	})
+	if err != nil || !strings.HasPrefix(got, "2:") {
+		t.Fatalf("replayed large result prefix=%q err=%v", got[:min(len(got), 8)], err)
 	}
 
 	if smallRuns != 1 || largeRuns != 2 || store.puts != 1 || len(store.rows) != 1 {
 		t.Fatalf("small=%d large=%d puts=%d rows=%d", smallRuns, largeRuns, store.puts, len(store.rows))
 	}
-	marker := inner.cache["large-result"]
+	marker := inner.cache[positionalStepKey("large-result", 0)]
 	if !strings.Contains(string(marker), `"mode":"recompute_oversize"`) ||
 		len(marker) >= 512 || strings.Contains(string(marker), strings.Repeat("x", 32)) {
 		t.Fatalf("oversize marker is not bounded: bytes=%d body=%s", len(marker), marker)

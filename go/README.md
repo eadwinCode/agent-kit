@@ -158,6 +158,11 @@ outside Inngest. AgentKit stores uncompressed JSON through the application port
 and memoizes only a checksum-verified reference. The hard storage limit is
 2 MiB; oversized results use the automatic bounded-marker path. Existing inline
 Inngest values and previously written oversize markers remain replay-compatible.
+Repeated logical step ids are qualified with their deterministic occurrence
+before they reach the store, matching Inngest's positional memoization. A store
+may additionally implement `StepResultRunLoader`; AgentKit then loads one scoped
+run snapshot per workflow callback and resolves historical references in memory
+instead of performing one point read per replayed step.
 
 > [!IMPORTANT]
 > inngestgo suspends a function by **panicking** with an internal control
@@ -239,7 +244,7 @@ capability.
 | `ApprovalStore`    | Issue → wait → resolve once → consume once, replay-safe at each step.                                  |
 | `StreamSink`       | Outbound delivery, when the application owns transport and backpressure.                               |
 | `Finalizer`        | Holds the terminal until the application's durable facts have settled.                                 |
-| `StepResultStore`  | Stores exact uncompressed memoized step results while Inngest keeps a bounded reference.                |
+| `StepResultStore`  | Stores exact uncompressed memoized step results while Inngest keeps a bounded reference; optionally bulk-loads a run snapshot. |
 
 ```go
 ports := &agentkit.RuntimePorts{
