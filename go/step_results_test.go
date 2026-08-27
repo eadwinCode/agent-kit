@@ -201,6 +201,47 @@ func TestStepResultStepRejectsOversizeWithoutPersistingOrRecomputing(t *testing.
 	}
 }
 
+func TestStepResultStepRecomputesOnlyOversizeResults(t *testing.T) {
+	inner := &resultMemoStep{cache: map[string]json.RawMessage{}}
+	store := newResultStoreFake()
+	step := newStoredTestStep(t, inner, store)
+
+	smallRuns := 0
+	for range 2 {
+		got, err := durable.RunWithOptions(t.Context(), step, "small-read", durable.RunOptions{
+			ReplayPolicy: ReplayRecomputeOversize,
+		}, func(context.Context) (string, error) {
+			smallRuns++
+			return "small", nil
+		})
+		if err != nil || got != "small" {
+			t.Fatalf("small result=%q err=%v", got, err)
+		}
+	}
+
+	largeRuns := 0
+	for wantRun := 1; wantRun <= 2; wantRun++ {
+		got, err := durable.RunWithOptions(t.Context(), step, "large-read", durable.RunOptions{
+			ReplayPolicy: ReplayRecomputeOversize,
+		}, func(context.Context) (string, error) {
+			largeRuns++
+			return fmt.Sprintf("%d:%s", largeRuns, strings.Repeat("x", int(MaxDurableStepResultBytes))), nil
+		})
+		if err != nil || !strings.HasPrefix(got, fmt.Sprintf("%d:", wantRun)) {
+			t.Fatalf("large result prefix=%q err=%v", got[:min(len(got), 8)], err)
+		}
+	}
+
+	if smallRuns != 1 || largeRuns != 2 || store.puts != 1 || len(store.rows) != 1 {
+		t.Fatalf("small=%d large=%d puts=%d rows=%d", smallRuns, largeRuns, store.puts, len(store.rows))
+	}
+	marker := inner.cache["large-read"]
+	if !strings.Contains(string(marker), `"mode":"recompute_oversize"`) ||
+		len(marker) >= 512 || strings.Contains(string(marker), strings.Repeat("x", 32)) {
+		t.Fatalf("oversize marker is not bounded: bytes=%d body=%s", len(marker), marker)
+	}
+}
+
 func TestRecomputeToolBypassesDurableStep(t *testing.T) {
 	state := NewState(StateConfig[map[string]int]{Data: map[string]int{}})
 	network := newNetworkRun(NewNetwork(NetworkConfig[map[string]int]{Name: "test"}), state)
@@ -226,19 +267,27 @@ func TestRecomputeToolBypassesDurableStep(t *testing.T) {
 }
 
 func TestRecomputeToolRejectsAndRestoresStateMutation(t *testing.T) {
-	state := NewState(StateConfig[map[string]int]{Data: map[string]int{"count": 1}})
-	network := newNetworkRun(NewNetwork(NetworkConfig[map[string]int]{Name: "test"}), state)
-	agent := NewAgent(AgentConfig[map[string]int]{Name: "reader"})
-	tool := Tool[map[string]int]{
-		Name: "bad_read", ReplayPolicy: ReplayRecompute,
-		Handler: func(_ context.Context, _ json.RawMessage, opts ToolOptions[map[string]int]) (any, error) {
-			opts.State.Data["count"] = 2
-			return map[string]bool{"ok": true}, nil
-		},
-	}
-	result := agent.runToolHandler(t.Context(), tool, NewToolMessage("call", "bad_read", nil), network, nil, &countingAgentStep{})
-	if !result.IsError() || state.Data["count"] != 1 {
-		t.Fatalf("result error=%v state=%v", result.IsError(), state.Data)
+	for _, policy := range []ReplayPolicy{ReplayRecompute, ReplayRecomputeOversize} {
+		t.Run(string(policy), func(t *testing.T) {
+			state := NewState(StateConfig[map[string]int]{Data: map[string]int{"count": 1}})
+			network := newNetworkRun(NewNetwork(NetworkConfig[map[string]int]{Name: "test"}), state)
+			agent := NewAgent(AgentConfig[map[string]int]{Name: "reader"})
+			step := durable.Step(&countingAgentStep{})
+			if policy == ReplayRecomputeOversize {
+				step = newStoredTestStep(t, durable.Inline{}, newResultStoreFake())
+			}
+			tool := Tool[map[string]int]{
+				Name: "bad_read", ReplayPolicy: policy,
+				Handler: func(_ context.Context, _ json.RawMessage, opts ToolOptions[map[string]int]) (any, error) {
+					opts.State.Data["count"] = 2
+					return map[string]bool{"ok": true}, nil
+				},
+			}
+			result := agent.runToolHandler(t.Context(), tool, NewToolMessage("call", "bad_read", nil), network, nil, step)
+			if !result.IsError() || state.Data["count"] != 1 {
+				t.Fatalf("result error=%v state=%v", result.IsError(), state.Data)
+			}
+		})
 	}
 }
 

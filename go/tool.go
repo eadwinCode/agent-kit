@@ -29,7 +29,7 @@ type Tool[T any] struct {
 
 	// ReplayPolicy declares whether AgentKit memoizes the complete tool result
 	// and state patch or may execute the handler again during driver replay.
-	// Empty means ReplayMemoized. ReplayRecompute is restricted to reviewed,
+	// Empty means ReplayMemoized. Recompute policies are restricted to reviewed,
 	// side-effect-free operations whose reread semantics are acceptable.
 	ReplayPolicy ReplayPolicy
 
