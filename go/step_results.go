@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/eadwinCode/agent-kit/go/durable"
@@ -91,6 +93,24 @@ type StepResultStore interface {
 	Resolve(ctx context.Context, locator StepResultLocator, ref StepResultRef) (json.RawMessage, error)
 }
 
+// StepResultRunQuery authenticates one complete run snapshot. A loader must
+// return only results matching every field; AgentKit validates each returned
+// result before making it available to replayed steps.
+type StepResultRunQuery struct {
+	Scope         SessionScope
+	RunID         string
+	SchemaVersion int
+}
+
+// StepResultRunLoader is the optional bulk-read extension to StepResultStore.
+// Implementations should fetch the run in one storage operation. The map is
+// keyed by StepResultLocator.StepID. AgentKit then resolves every reference in
+// the current workflow callback from memory instead of issuing one point read
+// per replayed step.
+type StepResultRunLoader interface {
+	LoadRun(ctx context.Context, query StepResultRunQuery) (map[string]StoredStepResult, error)
+}
+
 // StepResultStepConfig binds a storage adapter to one replay-stable run.
 type StepResultStepConfig struct {
 	Scope         SessionScope
@@ -122,13 +142,19 @@ func NewStepResultStep(inner durable.Step, store StepResultStore, cfg StepResult
 	if cfg.SchemaVersion < 0 {
 		return nil, fmt.Errorf("agentkit: step result schema version must be positive")
 	}
-	return &stepResultStep{inner: inner, store: store, cfg: cfg}, nil
+	return &stepResultStep{
+		inner: inner, store: store, cfg: cfg,
+		occurrences: map[string]uint64{},
+	}, nil
 }
 
 type stepResultStep struct {
-	inner durable.Step
-	store StepResultStore
-	cfg   StepResultStepConfig
+	inner       durable.Step
+	store       StepResultStore
+	cfg         StepResultStepConfig
+	occurrences map[string]uint64
+	loaded      bool
+	loadedRows  map[string]StoredStepResult
 }
 
 func (s *stepResultStep) Run(ctx context.Context, id string, fn durable.RunFn) (json.RawMessage, error) {
@@ -144,14 +170,17 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 	if durable.IsWithinStep(ctx) {
 		return fn(ctx)
 	}
+	occurrence := s.occurrences[id]
+	s.occurrences[id] = occurrence + 1
 	locator := StepResultLocator{
-		Scope: s.cfg.Scope, RunID: s.cfg.RunID, StepID: id,
+		Scope: s.cfg.Scope, RunID: s.cfg.RunID,
+		StepID:        qualifiedStepResultID(id, occurrence),
 		SchemaVersion: s.cfg.SchemaVersion,
 	}
 	var local *StoredStepResult
 	var localOversize json.RawMessage
 	raw, err := s.inner.Run(ctx, id, func(stepCtx context.Context) (json.RawMessage, error) {
-		stored, lookupErr := s.store.Lookup(stepCtx, locator)
+		stored, lookupErr := s.lookup(stepCtx, id, locator)
 		switch {
 		case lookupErr == nil:
 			if err := validateStoredStepResult(id, locator, stored); err != nil {
@@ -189,6 +218,7 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 			return nil, fmt.Errorf("%w: durable step %q store changed payload", ErrStepResultConflict, id)
 		}
 		local = &stored
+		s.cache(locator.StepID, stored)
 		return marshalStepResultEnvelope(stored.Ref)
 	})
 	if err != nil {
@@ -217,7 +247,7 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 	if local != nil && local.Ref == ref {
 		return append(json.RawMessage(nil), local.Payload...), nil
 	}
-	payload, resolveErr := s.store.Resolve(ctx, locator, ref)
+	payload, resolveErr := s.resolve(ctx, id, locator, ref)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, ErrStepResultNotFound) {
 			return nil, fmt.Errorf("%w: durable step %q reference is missing", ErrStepResultCorrupt, id)
@@ -228,6 +258,86 @@ func (s *stepResultStep) RunWithOptions(ctx context.Context, id string, opts dur
 		return nil, err
 	}
 	return append(json.RawMessage(nil), payload...), nil
+}
+
+// qualifiedStepResultID mirrors Inngest's positional step identity without
+// changing the public step id passed to the workflow driver. Encoding the
+// logical id makes the storage key unambiguous even when ids contain separators.
+func qualifiedStepResultID(id string, occurrence uint64) string {
+	return "v2:" + base64.RawURLEncoding.EncodeToString([]byte(id)) + ":" +
+		strconv.FormatUint(occurrence, 10)
+}
+
+func (s *stepResultStep) loadRun(ctx context.Context) error {
+	loader, ok := s.store.(StepResultRunLoader)
+	if !ok || s.loaded {
+		return nil
+	}
+	rows, err := loader.LoadRun(ctx, StepResultRunQuery{
+		Scope: s.cfg.Scope, RunID: s.cfg.RunID, SchemaVersion: s.cfg.SchemaVersion,
+	})
+	if err != nil {
+		return fmt.Errorf("agentkit: load durable results for run %q: %w", s.cfg.RunID, err)
+	}
+	loaded := make(map[string]StoredStepResult, len(rows))
+	for stepID, stored := range rows {
+		if strings.TrimSpace(stepID) == "" {
+			return fmt.Errorf("%w: run %q returned an empty durable step id", ErrStepResultCorrupt, s.cfg.RunID)
+		}
+		locator := StepResultLocator{
+			Scope: s.cfg.Scope, RunID: s.cfg.RunID, StepID: stepID,
+			SchemaVersion: s.cfg.SchemaVersion,
+		}
+		if err := validateStoredStepResult(stepID, locator, stored); err != nil {
+			return err
+		}
+		loaded[stepID] = cloneStepResultValue(stored)
+	}
+	s.loadedRows, s.loaded = loaded, true
+	return nil
+}
+
+func (s *stepResultStep) lookup(ctx context.Context, logicalID string, locator StepResultLocator) (StoredStepResult, error) {
+	if _, ok := s.store.(StepResultRunLoader); !ok {
+		return s.store.Lookup(ctx, locator)
+	}
+	if err := s.loadRun(ctx); err != nil {
+		return StoredStepResult{}, err
+	}
+	stored, ok := s.loadedRows[locator.StepID]
+	if !ok {
+		return StoredStepResult{}, ErrStepResultNotFound
+	}
+	if err := validateStoredStepResult(logicalID, locator, stored); err != nil {
+		return StoredStepResult{}, err
+	}
+	return cloneStepResultValue(stored), nil
+}
+
+func (s *stepResultStep) resolve(ctx context.Context, logicalID string, locator StepResultLocator, ref StepResultRef) (json.RawMessage, error) {
+	if _, ok := s.store.(StepResultRunLoader); !ok {
+		return s.store.Resolve(ctx, locator, ref)
+	}
+	stored, err := s.lookup(ctx, logicalID, locator)
+	if err != nil {
+		return nil, err
+	}
+	if stored.Ref != ref {
+		return nil, ErrStepResultUnauthorized
+	}
+	return append(json.RawMessage(nil), stored.Payload...), nil
+}
+
+func (s *stepResultStep) cache(stepID string, stored StoredStepResult) {
+	if _, ok := s.store.(StepResultRunLoader); !ok || !s.loaded {
+		return
+	}
+	s.loadedRows[stepID] = cloneStepResultValue(stored)
+}
+
+func cloneStepResultValue(stored StoredStepResult) StoredStepResult {
+	stored.Payload = append(json.RawMessage(nil), stored.Payload...)
+	return stored
 }
 
 type stepResultEnvelope struct {
