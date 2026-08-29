@@ -22,6 +22,7 @@ package agentkit
 
 import (
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -472,24 +473,43 @@ func reasoningDetailsFromResponseMessages(messages []provider.Message) []Reasoni
 }
 
 // reasoningDetailsFromMetadata extracts thinking blocks (with signatures)
-// from provider metadata. Handles both the in-process shape the Anthropic
-// provider constructs ([]map[string]any) and a JSON-round-tripped []any.
+// from provider metadata. Handles both the in-process shape a provider
+// constructs ([]map[string]any) and a JSON-round-tripped []any.
+//
+// The namespace is NOT hard-coded to one provider. goai files this under the
+// answering provider's own name while writing the same "reasoning" key in the
+// same shape: Anthropic emits {"type":"thinking","text":…,"signature":…} under
+// "anthropic", and the OpenAI Responses API emits {"type":…,"text":…} under
+// "openai". Reading only one namespace silently discarded the other's
+// reasoning, and any future provider's with it.
+//
+// Namespaces are visited in sorted order so the result does not depend on Go's
+// randomised map iteration. In practice one call is answered by one provider,
+// so at most one namespace carries reasoning.
 func reasoningDetailsFromMetadata(meta map[string]map[string]any) []ReasoningDetail {
-	am, ok := meta["anthropic"]
-	if !ok {
-		return nil
+	namespaces := make([]string, 0, len(meta))
+	for namespace := range meta {
+		namespaces = append(namespaces, namespace)
 	}
+	sort.Strings(namespaces)
+
 	var entries []map[string]any
-	switch v := am["reasoning"].(type) {
-	case []map[string]any:
-		entries = v
-	case []any:
-		for _, e := range v {
-			if m, ok := e.(map[string]any); ok {
-				entries = append(entries, m)
+	for _, namespace := range namespaces {
+		switch v := meta[namespace]["reasoning"].(type) {
+		case []map[string]any:
+			entries = v
+		case []any:
+			for _, e := range v {
+				if m, ok := e.(map[string]any); ok {
+					entries = append(entries, m)
+				}
 			}
 		}
-	default:
+		if len(entries) > 0 {
+			break
+		}
+	}
+	if len(entries) == 0 {
 		return nil
 	}
 

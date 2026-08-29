@@ -421,3 +421,73 @@ func TestGatewayCostSurvivesADurableReplay(t *testing.T) {
 		t.Errorf("replayed cost = %q, want 0.0891031", got)
 	}
 }
+
+func TestReasoningIsReadFromWhicheverProviderAnswered(t *testing.T) {
+	// goai files reasoning under the answering provider's own name while
+	// writing the same "reasoning" key in the same shape. Reading only
+	// "anthropic" discarded the OpenAI Responses API's reasoning entirely —
+	// and that is the default model for at least one consumer.
+	cases := map[string]map[string]map[string]any{
+		"anthropic": {"anthropic": {"reasoning": []map[string]any{
+			{"type": "thinking", "text": "weighing it up", "signature": "sig_1"},
+		}}},
+		"openai responses": {"openai": {"reasoning": []map[string]any{
+			{"type": "summary_text", "text": "weighing it up"},
+		}}},
+	}
+	for name, meta := range cases {
+		sr := ToSerializableResult(&goai.TextResult{
+			FinishReason: provider.FinishStop, ProviderMetadata: meta,
+		})
+		if len(sr.ReasoningDetails) != 1 {
+			t.Fatalf("%s: reasoning details = %d, want 1", name, len(sr.ReasoningDetails))
+		}
+		if sr.ReasoningDetails[0].Text != "weighing it up" {
+			t.Errorf("%s: text = %q", name, sr.ReasoningDetails[0].Text)
+		}
+	}
+
+	// Anthropic keeps its signature, which it must to be replayed.
+	sr := ToSerializableResult(&goai.TextResult{
+		FinishReason:     provider.FinishStop,
+		ProviderMetadata: cases["anthropic"],
+	})
+	if sr.ReasoningDetails[0].Signature != "sig_1" {
+		t.Errorf("signature dropped: %+v", sr.ReasoningDetails[0])
+	}
+}
+
+func TestReasoningLookupIgnoresNamespacesWithoutIt(t *testing.T) {
+	// The gateway namespace sits alongside the provider's and carries no
+	// reasoning; a scan must step over it rather than stop there. Sorted
+	// order puts "gateway" first, so this is the real ordering case.
+	sr := ToSerializableResult(&goai.TextResult{
+		FinishReason: provider.FinishStop,
+		ProviderMetadata: map[string]map[string]any{
+			"gateway": {"cost": "0.001"},
+			"openai":  {"reasoning": []map[string]any{{"type": "summary_text", "text": "thought"}}},
+		},
+	})
+	if len(sr.ReasoningDetails) != 1 || sr.ReasoningDetails[0].Text != "thought" {
+		t.Fatalf("reasoning lost behind an earlier namespace: %+v", sr.ReasoningDetails)
+	}
+	// And the gateway cost still came through on the same result.
+	if sr.ProviderMetadata == nil || sr.ProviderMetadata.Gateway.Cost != "0.001" {
+		t.Errorf("gateway cost lost: %+v", sr.ProviderMetadata)
+	}
+}
+
+func TestReasoningSurvivesAJSONRoundTrip(t *testing.T) {
+	// After a durable replay the in-process []map[string]any has become []any.
+	sr := ToSerializableResult(&goai.TextResult{
+		FinishReason: provider.FinishStop,
+		ProviderMetadata: map[string]map[string]any{
+			"openai": {"reasoning": []any{
+				map[string]any{"type": "summary_text", "text": "replayed"},
+			}},
+		},
+	})
+	if len(sr.ReasoningDetails) != 1 || sr.ReasoningDetails[0].Text != "replayed" {
+		t.Fatalf("round-tripped reasoning was dropped: %+v", sr.ReasoningDetails)
+	}
+}
