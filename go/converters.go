@@ -22,6 +22,7 @@ package agentkit
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/zendev-sh/goai"
@@ -262,6 +263,42 @@ type SerializableResult struct {
 	// ReasoningDetails preserves structured blocks and signatures for
 	// provider round-tripping.
 	ReasoningDetails []ReasoningDetail `json:"reasoningDetails,omitempty"`
+	// ProviderMetadata is nil unless the provider reported something this
+	// struct models. A deployment with no gateway in front of it adds no bytes.
+	ProviderMetadata *SerializableProviderMetadata `json:"providerMetadata,omitempty"`
+}
+
+// SerializableProviderMetadata is the provider-reported detail about a
+// response that is worth carrying past the durable boundary.
+//
+// Deliberately a CLOSED shape rather than goai's open
+// map[string]map[string]any. This struct is memoized for every inference and
+// re-read on every replay, so anything added here is paid for repeatedly and
+// silently. An open map invites a caller to attach a provider's whole metadata
+// block — for one AI gateway that is ~1KB per call, almost all of it routing
+// prose — without anyone noticing the cost.
+type SerializableProviderMetadata struct {
+	Gateway *SerializableGatewayMetadata `json:"gateway,omitempty"`
+}
+
+// SerializableGatewayMetadata is what a gateway in front of a provider reports
+// about what a call actually cost, as opposed to what its token counts imply.
+//
+// The two differ, and only the gateway knows by how much: it may route to
+// different upstream providers at different prices, and it may add surcharges
+// for capabilities like web search. A consumer billing from token counts alone
+// cannot reconstruct either.
+type SerializableGatewayMetadata struct {
+	// Cost is the total charge for this call, as a decimal string.
+	//
+	// A STRING, not a float, because it is money: it is carried and compared
+	// exactly as the gateway reported it, without a binary rounding step in
+	// the middle. It already includes any surcharge, so it is a total and is
+	// never summed with one.
+	Cost string `json:"cost,omitempty"`
+	// GenerationID identifies this call in the gateway's own records, so a
+	// charge can be reconciled against the bill the gateway later issues.
+	GenerationID string `json:"generationId,omitempty"`
 }
 
 // SerializableToolCall mirrors the TS shape ({toolCallId, toolName, args}).
@@ -322,7 +359,52 @@ func ToSerializableResult(res *goai.TextResult) SerializableResult {
 		out.Reasoning = res.Reasoning
 	}
 	out.ReasoningDetails = reasoningDetailsFromMetadata(res.ProviderMetadata)
+	out.ProviderMetadata = providerMetadataFrom(res.ProviderMetadata)
 	return out
+}
+
+// providerMetadataFrom narrows goai's open metadata map to the closed shape
+// above. This is where everything else is dropped: a caller that attaches a
+// provider's entire metadata block still only pays for the fields modelled
+// here.
+func providerMetadataFrom(meta map[string]map[string]any) *SerializableProviderMetadata {
+	gateway, ok := meta["gateway"]
+	if !ok {
+		return nil
+	}
+	carried := SerializableGatewayMetadata{
+		Cost:         decimalString(gateway["cost"]),
+		GenerationID: stringValue(gateway["generationId"]),
+	}
+	if carried == (SerializableGatewayMetadata{}) {
+		return nil
+	}
+	return &SerializableProviderMetadata{Gateway: &carried}
+}
+
+// decimalString reads a money value that may arrive as either a JSON string or
+// a JSON number, because gateways report it both ways — sometimes across two
+// endpoints of the same vendor. Typing it to one shape would mean a gateway
+// that switched silently stopped reporting its cost, which is the least
+// visible way for billing to break.
+func decimalString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case float64:
+		// 'f' with -1 precision is the shortest form that round-trips, and
+		// never uses exponent notation, which a decimal parser would reject.
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 // toSerializableStreamResult projects a completed StreamText result without
