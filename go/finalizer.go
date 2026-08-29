@@ -52,7 +52,9 @@ type FinalizeRequest struct {
 	// ReconcileRequired reports that at least one journal append failed, so
 	// the durable tail has holes.
 	ReconcileRequired bool `json:"reconcileRequired"`
-	// PausedTotalMs is the wall-clock time this execution spent paused.
+	// PausedTotalMs is the wall-clock time this SESSION spent paused,
+	// carried across replays by persisted state rather than tallied per
+	// execution.
 	PausedTotalMs int64 `json:"pausedTotalMs"`
 }
 
@@ -165,7 +167,7 @@ func (t *terminalEmitter) Emit(ctx context.Context, runErr error, stopReason str
 				StopReason:        stopReason,
 				LastCursor:        t.sc.Cursor(),
 				ReconcileRequired: t.journal.ReconcileRequired(),
-				PausedTotalMs:     t.controller.PausedTotal().Milliseconds(),
+				PausedTotalMs:     t.controller.PausedTotal(ctx).Milliseconds(),
 			}
 			out, err := fin.Finalize(ctx, req)
 			switch {

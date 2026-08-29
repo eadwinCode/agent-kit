@@ -262,3 +262,232 @@ func TestToSerializableResult(t *testing.T) {
 		t.Errorf("zero usage should be omitted, got %+v", got.Usage)
 	}
 }
+
+func TestSerializableResultCarriesTheGatewayCost(t *testing.T) {
+	// A gateway in front of the provider knows what a call actually cost;
+	// token counts alone cannot reconstruct it, because the gateway may route
+	// to different upstream providers at different prices and may add
+	// surcharges. Carrying it here is what makes it survive a durable replay.
+	res := &goai.TextResult{
+		Text:         "ok",
+		FinishReason: provider.FinishStop,
+		TotalUsage:   provider.Usage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+		ProviderMetadata: map[string]map[string]any{
+			"gateway": {
+				"cost":         "0.00434166",
+				"generationId": "gen_01M14YC4JFBAYRHBGKHFC5KP5A",
+			},
+		},
+	}
+	sr := ToSerializableResult(res)
+
+	if sr.ProviderMetadata == nil || sr.ProviderMetadata.Gateway == nil {
+		t.Fatalf("gateway metadata was dropped: %+v", sr.ProviderMetadata)
+	}
+	if got := sr.ProviderMetadata.Gateway.Cost; got != "0.00434166" {
+		t.Errorf("cost = %q, want the value carried through verbatim", got)
+	}
+	if got := sr.ProviderMetadata.Gateway.GenerationID; got != "gen_01M14YC4JFBAYRHBGKHFC5KP5A" {
+		t.Errorf("generation id = %q, want it carried", got)
+	}
+
+	// The consumer reads this off raw JSON, so the shape is the contract.
+	rawJSON, err := jsonutil.Marshal(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		ProviderMetadata struct {
+			Gateway struct {
+				Cost         string `json:"cost"`
+				GenerationID string `json:"generationId"`
+			} `json:"gateway"`
+		} `json:"providerMetadata"`
+	}
+	if err := json.Unmarshal(rawJSON, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ProviderMetadata.Gateway.Cost != "0.00434166" {
+		t.Errorf("raw JSON shape wrong: %s", rawJSON)
+	}
+}
+
+func TestSerializableResultDropsMetadataItDoesNotModel(t *testing.T) {
+	// The point of a closed struct. This value is memoized for every
+	// inference and re-read on every replay, so an open map would let a
+	// caller attach a provider's whole block — routing prose included —
+	// and have it paid for repeatedly without anyone noticing.
+	res := &goai.TextResult{
+		FinishReason: provider.FinishStop,
+		ProviderMetadata: map[string]map[string]any{
+			"gateway": {
+				"cost":          "0.001",
+				"generationId":  "gen_1",
+				"surchargeCost": "0",
+				"marketCost":    "0.002",
+				"routing": map[string]any{
+					"resolvedProvider":  "openai",
+					"planningReasoning": strings.Repeat("prose ", 200),
+				},
+			},
+		},
+	}
+	rawJSON, err := jsonutil.Marshal(ToSerializableResult(res))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unwanted := range []string{"routing", "planningReasoning", "marketCost", "surchargeCost"} {
+		if strings.Contains(string(rawJSON), unwanted) {
+			t.Errorf("%q survived serialization; the struct must be closed:\n%s", unwanted, rawJSON)
+		}
+	}
+	// surchargeCost is deliberately absent: it is a COMPONENT of cost, not an
+	// addition to it, so carrying it invites a consumer to add it twice.
+	if len(rawJSON) > 400 {
+		t.Errorf("serialized result is %d bytes; the narrowing is not working", len(rawJSON))
+	}
+}
+
+func TestGatewayCostAcceptsAStringOrANumber(t *testing.T) {
+	// Gateways report money both ways, sometimes across two endpoints of the
+	// same vendor. Typing it to one shape would mean a gateway that switched
+	// silently stopped reporting cost — the least visible way to break billing.
+	for name, value := range map[string]any{
+		"string": "0.000137544",
+		"float":  0.000137544,
+		"number": json.Number("0.000137544"),
+	} {
+		res := &goai.TextResult{
+			FinishReason:     provider.FinishStop,
+			ProviderMetadata: map[string]map[string]any{"gateway": {"cost": value}},
+		}
+		sr := ToSerializableResult(res)
+		if sr.ProviderMetadata == nil || sr.ProviderMetadata.Gateway == nil {
+			t.Fatalf("%s: gateway metadata dropped", name)
+		}
+		// Never exponent notation: a decimal parser downstream would reject it.
+		if got := sr.ProviderMetadata.Gateway.Cost; got != "0.000137544" {
+			t.Errorf("%s: cost = %q, want 0.000137544", name, got)
+		}
+	}
+}
+
+func TestSerializableResultOmitsMetadataEntirelyWithoutAGateway(t *testing.T) {
+	// A deployment talking straight to a provider must pay nothing for a
+	// field it never populates.
+	res := &goai.TextResult{
+		FinishReason: provider.FinishStop,
+		ProviderMetadata: map[string]map[string]any{
+			"anthropic": {"reasoning": []map[string]any{}},
+		},
+	}
+	sr := ToSerializableResult(res)
+	if sr.ProviderMetadata != nil {
+		t.Fatalf("provider metadata = %+v, want nil without a gateway", sr.ProviderMetadata)
+	}
+	rawJSON, err := jsonutil.Marshal(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawJSON), "providerMetadata") {
+		t.Errorf("empty metadata still emitted a key: %s", rawJSON)
+	}
+}
+
+func TestGatewayCostSurvivesADurableReplay(t *testing.T) {
+	// The whole reason this field exists. durable.Run memoizes the marshalled
+	// SerializableResult and, on replay, unmarshals it back into the same
+	// struct without calling the provider — so a field the struct does not
+	// declare is silently dropped by encoding/json and the cost is lost.
+	original := ToSerializableResult(&goai.TextResult{
+		FinishReason: provider.FinishStop,
+		TotalUsage:   provider.Usage{InputTokens: 10, OutputTokens: 2},
+		ProviderMetadata: map[string]map[string]any{
+			"gateway": {"cost": "0.0891031", "generationId": "gen_replay"},
+		},
+	})
+	memoized, err := jsonutil.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed SerializableResult
+	if err := json.Unmarshal(memoized, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ProviderMetadata == nil || replayed.ProviderMetadata.Gateway == nil {
+		t.Fatal("the cost did not survive the memoize/replay round trip")
+	}
+	if got := replayed.ProviderMetadata.Gateway.Cost; got != "0.0891031" {
+		t.Errorf("replayed cost = %q, want 0.0891031", got)
+	}
+}
+
+func TestReasoningIsReadFromWhicheverProviderAnswered(t *testing.T) {
+	// goai files reasoning under the answering provider's own name while
+	// writing the same "reasoning" key in the same shape. Reading only
+	// "anthropic" discarded the OpenAI Responses API's reasoning entirely —
+	// and that is the default model for at least one consumer.
+	cases := map[string]map[string]map[string]any{
+		"anthropic": {"anthropic": {"reasoning": []map[string]any{
+			{"type": "thinking", "text": "weighing it up", "signature": "sig_1"},
+		}}},
+		"openai responses": {"openai": {"reasoning": []map[string]any{
+			{"type": "summary_text", "text": "weighing it up"},
+		}}},
+	}
+	for name, meta := range cases {
+		sr := ToSerializableResult(&goai.TextResult{
+			FinishReason: provider.FinishStop, ProviderMetadata: meta,
+		})
+		if len(sr.ReasoningDetails) != 1 {
+			t.Fatalf("%s: reasoning details = %d, want 1", name, len(sr.ReasoningDetails))
+		}
+		if sr.ReasoningDetails[0].Text != "weighing it up" {
+			t.Errorf("%s: text = %q", name, sr.ReasoningDetails[0].Text)
+		}
+	}
+
+	// Anthropic keeps its signature, which it must to be replayed.
+	sr := ToSerializableResult(&goai.TextResult{
+		FinishReason:     provider.FinishStop,
+		ProviderMetadata: cases["anthropic"],
+	})
+	if sr.ReasoningDetails[0].Signature != "sig_1" {
+		t.Errorf("signature dropped: %+v", sr.ReasoningDetails[0])
+	}
+}
+
+func TestReasoningLookupIgnoresNamespacesWithoutIt(t *testing.T) {
+	// The gateway namespace sits alongside the provider's and carries no
+	// reasoning; a scan must step over it rather than stop there. Sorted
+	// order puts "gateway" first, so this is the real ordering case.
+	sr := ToSerializableResult(&goai.TextResult{
+		FinishReason: provider.FinishStop,
+		ProviderMetadata: map[string]map[string]any{
+			"gateway": {"cost": "0.001"},
+			"openai":  {"reasoning": []map[string]any{{"type": "summary_text", "text": "thought"}}},
+		},
+	})
+	if len(sr.ReasoningDetails) != 1 || sr.ReasoningDetails[0].Text != "thought" {
+		t.Fatalf("reasoning lost behind an earlier namespace: %+v", sr.ReasoningDetails)
+	}
+	// And the gateway cost still came through on the same result.
+	if sr.ProviderMetadata == nil || sr.ProviderMetadata.Gateway.Cost != "0.001" {
+		t.Errorf("gateway cost lost: %+v", sr.ProviderMetadata)
+	}
+}
+
+func TestReasoningSurvivesAJSONRoundTrip(t *testing.T) {
+	// After a durable replay the in-process []map[string]any has become []any.
+	sr := ToSerializableResult(&goai.TextResult{
+		FinishReason: provider.FinishStop,
+		ProviderMetadata: map[string]map[string]any{
+			"openai": {"reasoning": []any{
+				map[string]any{"type": "summary_text", "text": "replayed"},
+			}},
+		},
+	})
+	if len(sr.ReasoningDetails) != 1 || sr.ReasoningDetails[0].Text != "replayed" {
+		t.Fatalf("round-tripped reasoning was dropped: %+v", sr.ReasoningDetails)
+	}
+}

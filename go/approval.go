@@ -104,6 +104,18 @@ type ApprovalController struct {
 	now    func() time.Time
 }
 
+// NewApprovalController builds a controller over one ApprovalStore, for
+// applications that need to exercise a gated tool handler directly.
+//
+// A production run never calls this: AgentKit builds the controller from
+// RuntimePorts and supplies it as ToolOptions.Approvals. It exists because
+// ToolOptions.Approvals is a concrete type, so without an exported
+// constructor a tool's approve/deny behaviour cannot be tested at all
+// without standing up a whole network run.
+func NewApprovalController(store ApprovalStore, scope SessionScope) *ApprovalController {
+	return &ApprovalController{store: store, scope: scope, now: time.Now}
+}
+
 func newApprovalController(ports *RuntimePorts, sc *StreamingContext) *ApprovalController {
 	c := &ApprovalController{stream: sc, now: time.Now}
 	if ports != nil {

@@ -607,6 +607,14 @@ func (r *NetworkRun[T]) structuredStream(toolName string) StructuredStream {
 // a client should tail from. Observation writes degrade: a state store that
 // is briefly unreachable must not fail a run.
 func (r *NetworkRun[T]) markRunning(ctx context.Context, ports *RuntimePorts, runID string) {
+	markRunExecuting(ctx, ports, runID, r.State.ThreadID)
+}
+
+// markRunExecuting records that a run is executing, together with the cursor a
+// client should tail from. Shared by network and direct runs: both open a run
+// the same way, so both must report it the same way. Observation writes
+// degrade — a state store that is briefly unreachable must not fail a run.
+func markRunExecuting(ctx context.Context, ports *RuntimePorts, runID, threadID string) {
 	if ports == nil || ports.State == nil {
 		return
 	}
@@ -615,8 +623,8 @@ func (r *NetworkRun[T]) markRunning(ctx context.Context, ports *RuntimePorts, ru
 	_, _ = mutateState(ctx, ports.State, ports.Scope, "run.executing", func(s *SessionState) {
 		s.SchemaVersion = ContractSchemaVersion
 		s.Scope = ports.Scope
-		if r.State.ThreadID != "" {
-			s.CurrentThreadID = r.State.ThreadID
+		if threadID != "" {
+			s.CurrentThreadID = threadID
 		}
 		if s.ActiveRun == nil || s.ActiveRun.RunID != runID {
 			s.ActiveRun = &ActiveRun{RunID: runID, AcceptedAt: now}
