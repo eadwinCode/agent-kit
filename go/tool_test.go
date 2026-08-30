@@ -48,17 +48,21 @@ func TestNewToolSchemaFromStructTags(t *testing.T) {
 	if string(sku.Type) != `"integer"` || sku.Description != "The SKU to set" {
 		t.Errorf("sku property = %+v", sku)
 	}
-	if reason := schema.Properties["reason"]; string(reason.Type) != `["string","null"]` {
-		t.Errorf("pointer field should be nullable, got type %s", reason.Type)
+	// Pointer fields are OPTIONAL: the sanitizer flattens goai's nullable type
+	// array to the base type (Gemini rejects array types) and expresses
+	// optionality by omitting the field from required.
+	if reason := schema.Properties["reason"]; string(reason.Type) != `"string"` {
+		t.Errorf("pointer field should flatten to its base type, got %s", reason.Type)
 	}
-	// Strict-mode contract: every property is listed as required; optional
-	// params are pointers, which become nullable rather than omitted.
 	joined := strings.Join(schema.Required, ",")
-	if !strings.Contains(joined, "sku") || !strings.Contains(joined, "reason") {
-		t.Errorf("strict-mode schema should require all properties, got %v", schema.Required)
+	if !strings.Contains(joined, "sku") {
+		t.Errorf("strict-mode schema should require non-pointer properties, got %v", schema.Required)
 	}
-	if !strings.Contains(string(tool.InputSchema), "null") {
-		t.Errorf("pointer field should be nullable: %s", tool.InputSchema)
+	if strings.Contains(joined, "reason") {
+		t.Errorf("pointer field must not be required, got %v", schema.Required)
+	}
+	if strings.Contains(string(tool.InputSchema), "null") {
+		t.Errorf("nullable type arrays must be resolved away: %s", tool.InputSchema)
 	}
 }
 
