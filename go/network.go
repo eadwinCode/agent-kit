@@ -538,9 +538,13 @@ func (r *NetworkRun[T]) execute(ctx context.Context, input string, opts *Network
 		// The network is the iteration authority: the agent does exactly ONE
 		// inference per call (MaxIterPerRun 1) and the router decides whether
 		// to call again — total inferences stay ≤ MaxIter, not MaxIter².
+		// StepIndexBase is this cycle's counter, so cycle k mints
+		// `agent/infer/k` instead of every cycle colliding on
+		// `agent/infer/0` and living on auto-suffixes.
 		call, err := agent.Run(ctx, inputContent, &RunOptions[T]{
 			Network:          r,
 			MaxIterPerRun:    1,
+			StepIndexBase:    r.counter,
 			Step:             step,
 			streamingContext: agentSC,
 		})

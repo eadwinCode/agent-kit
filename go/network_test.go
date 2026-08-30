@@ -321,6 +321,37 @@ func TestSeededNetworkDerivesReplayStableIDsWithoutIDSteps(t *testing.T) {
 	}
 }
 
+func TestNetworkInferStepIDsAreUniqueAcrossCycles(t *testing.T) {
+	step := &recordingStep{}
+	a := mkAgent("a", "sys", &fakeModel{id: "m", result: stopResult("done")})
+	n := NewNetwork(NetworkConfig[shape]{
+		Name: "net", Agents: []*Agent[shape]{a},
+		Router: scriptRouter(RouteTo(a), RouteTo(a)),
+	})
+	run, err := n.Run(context.Background(), "hello", &NetworkRunOptions[shape]{
+		RunID: "run-1", Step: step,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.CallCount() != 2 {
+		t.Fatalf("CallCount = %d, want 2", run.CallCount())
+	}
+	// The network drives one Run per cycle, so the internal counter restarts
+	// at 0 every time. The step id must come from the network's counter: two
+	// cycles minting the same `a/infer/0` survive only on runtime
+	// auto-suffixes and display as one repeated step in every trace.
+	var inferIDs []string
+	for _, id := range step.ids {
+		if strings.HasPrefix(id, "a/infer/") {
+			inferIDs = append(inferIDs, id)
+		}
+	}
+	if len(inferIDs) != 2 || inferIDs[0] != "a/infer/0" || inferIDs[1] != "a/infer/1" {
+		t.Fatalf("infer step ids = %v, want [a/infer/0 a/infer/1]", inferIDs)
+	}
+}
+
 func TestNetworkRetainsFinalHistoryBackstopForUnexpectedResults(t *testing.T) {
 	var batches []int
 	h := &HistoryConfig[shape]{AppendResults: func(_ context.Context, _ HistoryContext[shape], results []*AgentResult) error {
