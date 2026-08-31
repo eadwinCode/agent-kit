@@ -242,6 +242,17 @@ type RunOptions[T any] struct {
 	// MaxIterPerRun caps this run's internal tool-round loop.
 	MaxIterPerRun int
 
+	// StepIndexBase is added to this run's internal iteration counter when
+	// minting durable ids (the infer step id, stream part ids). It exists for
+	// callers that drive ONE inference per Run across many Run calls — the
+	// network loop — whose internal counter would otherwise restart at 0 every
+	// cycle and mint the same `agent/infer/0` step id each time. Duplicate
+	// step ids only stay out of trouble because the runtime auto-suffixes
+	// them, which the trace UI does not show: every cycle displays as the
+	// same step. The base must be replay-stable (a deterministic counter, not
+	// a timestamp), because a replay re-mints every id.
+	StepIndexBase int
+
 	// Step overrides the durability seam (tests use durable.Inline).
 	Step durable.Step
 
@@ -431,7 +442,7 @@ func (a *Agent[T]) Run(ctx context.Context, input string, opts *RunOptions[T]) (
 			return nil, err
 		}
 
-		inference, err := a.performInference(ctx, model, iter, prompt, history, run, sc, step)
+		inference, err := a.performInference(ctx, model, iter+opts.StepIndexBase, prompt, history, run, sc, step)
 		if err != nil {
 			return nil, err
 		}
@@ -498,11 +509,14 @@ func (a *Agent[T]) performInference(
 		toolChoice = "auto"
 	}
 
-	// Step id includes the iteration index: the TS version reuses the bare
-	// agent name and relies on the runtime auto-suffixing duplicate ids;
-	// an explicit index is deterministic without that behavior. (Step ids
-	// only need consistency within a runtime — in-flight runs never
-	// migrate between the TS and Go implementations.)
+	// Step id includes the caller-supplied index (internal rounds + the
+	// network's cycle counter via StepIndexBase). The index must come from
+	// the caller for network runs: the internal counter restarts at 0 for
+	// every Run, and the network drives one Run per cycle, which used to
+	// mint the identical `agent/infer/0` id every cycle and rely on the
+	// runtime auto-suffixing duplicates to survive — unique only in state,
+	// never in any trace. (Step ids only need consistency within a runtime —
+	// in-flight runs never migrate between the TS and Go implementations.)
 	stepID := fmt.Sprintf("%s/infer/%d", a.Name, iter)
 
 	input := append(append([]Message(nil), prompt...), history...)

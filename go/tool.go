@@ -119,10 +119,11 @@ type ToolOptions[T any] struct {
 // as the tool's error, which flows back to the model as the tool result —
 // mirroring how zod validation failures behave in TS.
 //
-// Schemas are OpenAI-strict-mode style (goai.SchemaFrom): every property is
-// required; make a parameter optional by declaring it a POINTER field,
-// which renders as nullable. `omitempty` affects only JSON encoding, not
-// the schema.
+// Schemas are OpenAI-strict-mode style (goai.SchemaFrom): declaring a
+// parameter as a POINTER field makes it OPTIONAL — the sanitizer resolves
+// goai's nullable type array to the base type and omits the field from
+// required, which is the shape strict providers (Gemini) accept. `omitempty`
+// affects only JSON encoding, not the schema.
 //
 //	agentkit.NewTool[MyState]("set_sku", "Sets the SKU.",
 //		func(ctx context.Context, in struct {
@@ -135,7 +136,7 @@ func NewTool[T, In any](name, description string, handler func(ctx context.Conte
 	t := Tool[T]{
 		Name:        name,
 		Description: description,
-		InputSchema: json.RawMessage(goai.SchemaFrom[In]()),
+		InputSchema: sanitizeInputSchema(json.RawMessage(goai.SchemaFrom[In]())),
 		Handler: func(ctx context.Context, input json.RawMessage, topts ToolOptions[T]) (any, error) {
 			var in In
 			if len(input) > 0 {
